@@ -103,6 +103,24 @@ export function derivedFlags(opp: Opportunity, hist: History, cfg: RouterConfig,
   return flags;
 }
 
+/** Finite values of `metric` recorded for an opportunity since `sinceMs`, oldest first. */
+export function recentMetricValues(hist: History | undefined, oppId: string, metric: string, sinceMs: number): number[] {
+  if (!hist) return [];
+  const out: number[] = [];
+  for (const s of hist.opps[oppId] ?? []) {
+    const v = s.metrics[metric];
+    if (s.t >= sinceMs && v !== undefined && Number.isFinite(v)) out.push(v);
+  }
+  return out;
+}
+
+export function median(xs: number[]): number {
+  if (!xs.length) return NaN;
+  const a = [...xs].sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m]! : (a[m - 1]! + a[m]!) / 2;
+}
+
 export function recordOpp(hist: History, opp: Opportunity, now: number, keepMs: number) {
   const arr = hist.opps[opp.id] ?? [];
   arr.push({

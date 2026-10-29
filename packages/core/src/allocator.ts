@@ -82,7 +82,10 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
         exposure = withAddition(exposure, o, r);
       }
     }
-  let left = deployable;
+  // Optional absolute ceiling (canary runs): deployed + already in flight + this cycle <= max_total_deployed_usd.
+  const ceiling = cfg.caps.max_total_deployed_usd;
+  const inFlightUsd = funding ? funding.inFlightUsd : 0;
+  let left = ceiling === undefined ? deployable : Math.max(0, Math.min(deployable, ceiling - ctx.exposure.totalDeployedUsd - inFlightUsd));
   let newPositions = 0;
   const maxIter = 10_000;
 
@@ -151,6 +154,11 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
         continue;
       }
       let step = Math.min(left, isNew ? Math.max(chunk, cfg.caps.min_position_usd) : chunk);
+      // never ask for more than the per-position caps leave room for: with small
+      // caps (canary) a 2%-of-equity chunk would otherwise be refused forever
+      const room =
+        Math.min(cfg.caps.max_position_usd, cfg.caps.per_opportunity_frac * ctx.totalEquityUsd, o.maxEquityUsd ?? Infinity) - from;
+      if (room < step) step = room;
       if (funding) {
         // use what is already on the right chain before paying to bring more
         const local = funding.available(assetKey(fundingTarget(o)));
@@ -228,5 +236,5 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
     }
   }
   entries.sort((a, b) => b.marginalApr - a.marginalApr);
-  return { entries, rejected, deployableUsd: deployable };
+  return { entries, rejected, deployableUsd: ceiling === undefined ? deployable : Math.min(deployable, Math.max(0, ceiling - ctx.exposure.totalDeployedUsd - inFlightUsd)) };
 }

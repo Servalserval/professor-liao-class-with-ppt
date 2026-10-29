@@ -33,14 +33,21 @@ export function signalLevel(s: StressSignal): "ok" | "warn" | "exit" {
   return "ok";
 }
 
-export function effectiveCapacity(cfg: RouterConfig, opp: Opportunity): number {
+/**
+ * Capacity used by the gates. Estimated capacity is haircut — except on the
+ * exit side when the estimate only reuses a recent quote (a failed probe must
+ * not turn into a liquidity exit by itself).
+ */
+export function effectiveCapacity(cfg: RouterConfig, opp: Opportunity, forExit = false): number {
   const c = opp.liquidity.exitCapacityUsd;
-  return opp.liquidity.estimated ? c * cfg.liquidity.estimated_capacity_haircut : c;
+  if (!opp.liquidity.estimated) return c;
+  if (forExit && opp.liquidity.reusedQuote) return c;
+  return c * cfg.liquidity.estimated_capacity_haircut;
 }
 
 /** Share of the exit capacity my position would need to get out. */
-export function liquidityUsage(cfg: RouterConfig, opp: Opportunity, equityUsd: number): number {
-  const cap = effectiveCapacity(cfg, opp);
+export function liquidityUsage(cfg: RouterConfig, opp: Opportunity, equityUsd: number, forExit = false): number {
+  const cap = effectiveCapacity(cfg, opp, forExit);
   if (cap <= 0) return Infinity;
   return (equityUsd * opp.liquidity.footprintPerEquity) / cap;
 }

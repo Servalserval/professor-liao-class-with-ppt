@@ -106,6 +106,8 @@ export interface RouterConfig {
     min_idle_frac: number;
     reentry_cooldown_hours: number;
     urgent_reentry_cooldown_hours: number;
+    /** Optional absolute ceiling on deployed + in-flight USD (canary / small-cap runs). */
+    max_total_deployed_usd?: number;
   };
 
   allocator: {
@@ -117,7 +119,10 @@ export interface RouterConfig {
 
   exit_probe: {
     max_age_minutes: number;
+    /** Simulations that returned false (path broken) before an urgent exit. */
     max_consecutive_failures: number;
+    /** Simulations that could not run (RPC error) before a warning; they never cause an exit. */
+    error_alert_after: number;
   };
 
   portfolio: {
@@ -131,6 +136,8 @@ export interface RouterConfig {
     max_data_age_minutes: number;
     /** Held leveraged position (loop / perp hedge) whose source reports no health metric. */
     health_missing: "warn" | "exit";
+    /** The drawdown must be seen on this many consecutive cycles before the kill switch fires. */
+    kill_confirm_cycles: number;
   };
 
   tiers: {
@@ -159,6 +166,8 @@ export interface RouterConfig {
       /** Stable-pair loops: |price(debt)/price(collateral) - 1| warn / exit levels. */
       depeg_warn: number;
       depeg_exit: number;
+      /** Swap cost assumed when the adapter's probe failed (NaN) and no recent quote exists. */
+      unknown_swap_cost_frac: number;
     };
     discovery: {
       min_tvl_usd: number;
@@ -255,7 +264,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
     max_new_positions_per_cycle: 2,
     min_rebalance_usd: 1_000,
   },
-  exit_probe: { max_age_minutes: 30, max_consecutive_failures: 2 },
+  exit_probe: { max_age_minutes: 30, max_consecutive_failures: 2, error_alert_after: 3 },
   portfolio: {
     kill_drawdown_frac: 0.05,
     kill_window_hours: 24,
@@ -264,6 +273,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
     alert_repeat_hours: 6,
     max_data_age_minutes: 10,
     health_missing: "warn",
+    kill_confirm_cycles: 2,
   },
   tiers: { tier1_min_score: 7, tier2_min_score: 4 },
   gas_usd: { default: 0.5, ethereum: 8, sui: 0.05, arbitrum: 0.1, base: 0.05 },
@@ -282,6 +292,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
       txs_per_exit: 1,
       depeg_warn: 0.003,
       depeg_exit: 0.01,
+      unknown_swap_cost_frac: 0.003,
     },
     discovery: {
       min_tvl_usd: 1_000_000,
@@ -345,6 +356,10 @@ export function validateConfig(c: RouterConfig): string[] {
   if (!(ll.target_ltv > 0 && ll.target_ltv < 1)) e.push("sources.lending_loop.target_ltv must be in (0,1)");
   if (ll.deleverage_at_ltv <= ll.target_ltv) e.push("sources.lending_loop.deleverage_at_ltv must be > target_ltv");
   if (ll.utilization_exit <= ll.utilization_warn) e.push("sources.lending_loop.utilization_exit must be > utilization_warn");
+  if (!(Number.isInteger(c.portfolio.kill_confirm_cycles) && c.portfolio.kill_confirm_cycles >= 1))
+    e.push("portfolio.kill_confirm_cycles must be an integer >= 1");
+  if (c.caps.max_total_deployed_usd !== undefined && !(c.caps.max_total_deployed_usd >= 0))
+    e.push("caps.max_total_deployed_usd must be >= 0");
   if (c.portfolio.blind_exit_cycles < c.portfolio.blind_alert_cycles)
     e.push("portfolio.blind_exit_cycles must be >= blind_alert_cycles");
   return e;

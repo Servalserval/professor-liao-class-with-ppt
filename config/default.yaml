@@ -69,6 +69,7 @@ caps:
   min_idle_frac: 0.05
   reentry_cooldown_hours: 6
   urgent_reentry_cooldown_hours: 48   # after a liquidity / stress exit
+  # max_total_deployed_usd: 5000      # optional hard ceiling on deployed + in-flight USD (canary runs)
 
 allocator:
   chunk_frac: 0.02            # water-fill in 2%-of-equity chunks
@@ -78,7 +79,8 @@ allocator:
 
 exit_probe:                   # devInspect / eth_call of the full unwind
   max_age_minutes: 30
-  max_consecutive_failures: 2
+  max_consecutive_failures: 2   # simulations that returned "cannot exit"
+  error_alert_after: 3          # simulations that could not run (RPC error): warn only, never an exit
 
 portfolio:
   kill_drawdown_frac: 0.05    # equity -5% within the window -> exit all, pause
@@ -88,6 +90,7 @@ portfolio:
   alert_repeat_hours: 6       # status alerts are deduped per (opportunity, rule) within this window
   max_data_age_minutes: 10    # adapters set dataAsOfMs; older data = blind
   health_missing: warn        # held loop / perp hedge without a health metric: warn | exit
+  kill_confirm_cycles: 2      # the drawdown must be seen on this many consecutive cycles before the kill switch fires
 
 tiers:                        # see src/tiers.ts for the score
   tier1_min_score: 7
@@ -115,6 +118,7 @@ sources:
     rate_uncertainty_mult: 1.30
     txs_per_entry: 1
     txs_per_exit: 1
+    unknown_swap_cost_frac: 0.003   # assumed when every swap probe failed (NaN) and no recent quote exists; entries are blocked meanwhile
   discovery:
     min_tvl_usd: 1000000
     chains: []

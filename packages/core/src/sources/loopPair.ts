@@ -7,7 +7,8 @@
  * (packages/live-*) and the core. The math lives in `loopPairOpportunity`.
  */
 import { gasUsd } from "../config.js";
-import type { Opportunity, StressSignal, YieldStream } from "../types.js";
+import { median, recentMetricValues } from "../signals.js";
+import type { Flag, Opportunity, StressSignal, YieldStream } from "../types.js";
 import { proRataStream } from "../valuation.js";
 import { interpIrm, type IrmModel, type RewardRate } from "./loopLending.js";
 import type { Source, SourceContext } from "./types.js";
@@ -42,9 +43,19 @@ export interface LoopPair {
   /** Max LTV for opening, liquidation LTV — pair-specific (e-mode / Morpho LLTV). */
   maxLtv: number;
   liqLtv: number;
-  /** Cost of converting debt -> collateral (and back on exit), fraction of the amount. 0 for same asset. */
+  /**
+   * Cost of converting debt -> collateral (and back on exit), fraction of the amount. 0 for same asset.
+   * NaN = UNKNOWN (every probe failed): the core reuses the last recent quote or
+   * `unknown_swap_cost_frac`, and blocks entries.
+   */
   swapCostFrac: number;
-  /** USD of debt->collateral (and reverse) that can be swapped within the slippage budget. Infinity for same asset. */
+  /**
+   * USD of debt->collateral (and reverse) that can be swapped within the slippage budget. Infinity for same asset.
+   * NaN = UNKNOWN (quote failed). Never report 0 for a failed quote: 0 means "no
+   * depth at all" and makes the position exit. Unknown reuses the recent depth
+   * (within portfolio.max_data_age_minutes) or, without one, the pair is not
+   * reported this cycle (blind; no exit on one cycle alone).
+   */
   swapDepthUsd: number;
   flashloanFeeFrac?: number;
   paused?: boolean;
@@ -132,7 +143,11 @@ export function loopPairOpportunity(
   // NaN only surfaces later (e.g. a NaN liqLtv would be invisible until a
   // position is open and health is computed).
   if (!fin(pair.maxLtv) || !fin(pair.liqLtv)) return null;
-  if (!fin(pair.swapCostFrac) || pair.swapCostFrac < 0 || !(pair.swapDepthUsd >= 0)) return null; // swapDepthUsd may be Infinity
+  // NaN swap numbers mean UNKNOWN (a failed probe), handled below; anything else invalid is rejected.
+  const costUnknown = Number.isNaN(pair.swapCostFrac);
+  const depthUnknown = Number.isNaN(pair.swapDepthUsd);
+  if (!costUnknown && (!fin(pair.swapCostFrac) || pair.swapCostFrac < 0)) return null;
+  if (!depthUnknown && !(pair.swapDepthUsd >= 0)) return null; // swapDepthUsd may be Infinity
   const optOk = (x: number | undefined) => x === undefined || fin(x);
   if (!optOk(pair.flashloanFeeFrac) || !optOk(D.borrowFeeFrac)) return null;
   const marketOk = (leg: LoopLeg) => fin(leg.totalSupplyUsd) && leg.totalSupplyUsd > 0 && fin(leg.totalBorrowUsd) && leg.totalBorrowUsd >= 0;
@@ -150,6 +165,38 @@ export function loopPairOpportunity(
   const L = 1 / (1 - ltv);
   const id = `${sourceId}:${pair.protocol}:${pair.pairId}`;
   const myE = ctx.myEquityByOpp[id] ?? 0;
+
+  // --- swap quote: unknown -> recent history / fallback; depth smoothed -------------
+  // History holds the RAW quotes of previous cycles (metrics swap_depth_usd /
+  // swap_cost_frac), so a reused value is never re-recorded as a fresh one.
+  const since = ctx.nowMs - ctx.cfg.portfolio.max_data_age_minutes * 60_000;
+  let swapCostFrac = pair.swapCostFrac;
+  let swapDepthUsd = pair.swapDepthUsd;
+  let reusedQuote = false;
+  const quoteNotes: string[] = [];
+  if (same) {
+    // no swap in a same-asset loop: the numbers do not matter
+    if (costUnknown) swapCostFrac = 0;
+    if (depthUnknown) swapDepthUsd = Infinity;
+  } else {
+    if (costUnknown) {
+      const prev = recentMetricValues(ctx.history, id, "swap_cost_frac", since);
+      swapCostFrac = prev.length ? prev[prev.length - 1]! : ll.unknown_swap_cost_frac;
+      reusedQuote = true;
+      quoteNotes.push(prev.length ? "swap cost reused from the last quote" : `swap cost unknown, assumed ${ll.unknown_swap_cost_frac}`);
+    }
+    const prevDepth = recentMetricValues(ctx.history, id, "swap_depth_usd", since);
+    if (depthUnknown) {
+      // no recent depth: do not report the pair (blind), never a 0-capacity exit
+      if (!prevDepth.length) return null;
+      swapDepthUsd = median(prevDepth.slice(-3));
+      reusedQuote = true;
+      quoteNotes.push("swap depth reused from recent quotes");
+    } else if (Number.isFinite(swapDepthUsd) && prevDepth.length) {
+      // median of the last 3 observations: one bad quote cannot drain the capacity
+      swapDepthUsd = median([...prevDepth.slice(-2), swapDepthUsd]);
+    }
+  }
 
   const S_c = C.totalSupplyUsd;
   const B_c = C.totalBorrowUsd;
@@ -254,11 +301,10 @@ export function loopPairOpportunity(
   // `footprintPerEquity` so the router's E*footprint/capacity check binds on
   // whichever is tighter. With the default gross footprint this is
   // min(S_c - B_c, swapDepth * L/(L-1)).
-  const exitCapacityUsd = same
-    ? cm.available
-    : ll.footprint === "gross"
-      ? Math.min(cm.available, (pair.swapDepthUsd * L) / (L - 1))
-      : Math.min(cm.available / L, pair.swapDepthUsd / (L - 1));
+  const poolCapacity = same ? cm.available : ll.footprint === "gross" ? cm.available : cm.available / L;
+  const swapCapacity = same ? Infinity : ll.footprint === "gross" ? (swapDepthUsd * L) / (L - 1) : swapDepthUsd / (L - 1);
+  const exitCapacityUsd = Math.min(poolCapacity, swapCapacity);
+  const binding: "pool" | "swap" = swapCapacity < poolCapacity ? "swap" : "pool";
 
   const caps: number[] = [];
   if (C.supplyCapRemainingUsd !== undefined && C.supplyCapRemainingUsd !== null) caps.push(myE + C.supplyCapRemainingUsd / L);
@@ -274,6 +320,12 @@ export function loopPairOpportunity(
         tvl_usd: S_c,
         depeg,
       };
+  // raw fresh quotes only (the fallback above reads these back)
+  if (!same && !depthUnknown && Number.isFinite(pair.swapDepthUsd)) metrics.swap_depth_usd = pair.swapDepthUsd;
+  if (!same && !costUnknown) metrics.swap_cost_frac = pair.swapCostFrac;
+  const flags: Flag[] = pair.paused ? [{ name: "market_paused", severity: "exit" }] : [];
+  // warn severity: blocks entries and top-ups, never exits a held position
+  if (reusedQuote) flags.push({ name: "swap_quote_unknown", severity: "warn", detail: quoteNotes.join("; ") });
 
   const o: Opportunity = {
     id,
@@ -285,8 +337,8 @@ export function loopPairOpportunity(
     legs: [{ venue: pair.protocol, chain: pair.chain, token: C.symbol, equityFrac: 1 }],
     streams,
     costs: {
-      entryFrac: (L - 1) * ((D.borrowFeeFrac ?? 0) + pair.swapCostFrac),
-      exitFrac: (L - 1) * pair.swapCostFrac + (ll.footprint === "net" ? (L - 1) * (pair.flashloanFeeFrac ?? 0) : 0),
+      entryFrac: (L - 1) * ((D.borrowFeeFrac ?? 0) + swapCostFrac),
+      exitFrac: (L - 1) * swapCostFrac + (ll.footprint === "net" ? (L - 1) * (pair.flashloanFeeFrac ?? 0) : 0),
       fixedEntryUsd: gas * ll.txs_per_entry,
       fixedExitUsd: gas * ll.txs_per_exit,
       ongoingApr: 0,
@@ -294,11 +346,14 @@ export function loopPairOpportunity(
     liquidity: {
       exitCapacityUsd,
       footprintPerEquity,
-      estimated: opts.estimated,
+      estimated: opts.estimated || reusedQuote || undefined,
+      // same asset: pool liquidity is the only limit (undefined = pool-driven)
+      ...(same ? {} : { binding }),
+      ...(reusedQuote ? { reusedQuote: true } : {}),
     },
     signals: signalsAt(cm.uNow, dm.uNow),
     projectedSignals: (E) => signalsAt(cm.uAt(E), dm.uAt(E)),
-    flags: pair.paused ? [{ name: "market_paused", severity: "exit" }] : [],
+    flags,
     metrics,
     health:
       myE > 0 && pair.myLtv !== undefined

@@ -190,8 +190,10 @@ describe("router: cross-chain transfer lifecycle", () => {
     assert.equal(st.transfers.length, 0);
     assert.equal(st.idle[ARB], 70_000);
     assert.equal(st.idle[SUI] ?? 0, 0);
-    // the books lost $30k of $100k: the drawdown kill switch sees it
-    assert.equal(c1.killed, true);
+    // the books lost $30k of $100k: the kill switch sees it and fires once confirmed
+    assert.equal(c1.killed, false);
+    r.tick();
+    assert.equal((await r.cycle()).killed, true);
   });
 
   it("failed with refund: the refunded USD goes back to the source bucket", async () => {
@@ -385,11 +387,14 @@ describe("router: live wallet balances", () => {
     assert.equal(fake.sends, 1);
   });
 
-  it("a wallet read that omits a bucket means it is empty (bucket mode stays on)", async () => {
-    const r = xrig({ specs: [], idle: { [ARB]: 5_000, [SUI]: 1_000 }, idleBalances: async () => ({}) });
+  it("a partial wallet read updates only the buckets it contains", async () => {
+    const r = xrig({ specs: [], idle: { [ARB]: 5_000, [SUI]: 1_000 }, idleBalances: async () => ({ [SUI]: 1_200 }) });
     const c = await r.cycle();
-    assert.deepEqual(r.store.load().idle, { [ARB]: 0, [SUI]: 0 });
-    assert.deepEqual(c.idle, { [ARB]: 0, [SUI]: 0 });
+    assert.deepEqual(r.store.load().idle, { [ARB]: 5_000, [SUI]: 1_200 });
+    assert.deepEqual(c.idle, { [ARB]: 5_000, [SUI]: 1_200 });
+    const empty = xrig({ specs: [], idle: { [ARB]: 5_000 }, idleBalances: async () => ({}) });
+    await empty.cycle();
+    assert.deepEqual(empty.store.load().idle, { [ARB]: 5_000 }, "an empty read changes nothing");
   });
 
   it("an invalid wallet read keeps the last buckets", async () => {

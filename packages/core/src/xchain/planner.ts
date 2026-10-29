@@ -44,6 +44,8 @@ export interface PlannerInputs {
   bookYieldPerYearUsd: number;
   /** Route ids not to plan over (cooling down after a failed / stuck transfer). */
   pausedRouteIds?: string[];
+  /** USD already deployed in positions (for caps.max_total_deployed_usd). */
+  deployedUsd?: number;
 }
 
 /** One planned cross-chain move (aggregated over the allocator's chunks). */
@@ -123,6 +125,15 @@ export class FundingPlanner {
     return s;
   }
 
+  /** USD on bridges right now (non-final transfers, as counted in equity). */
+  get inFlightUsd(): number {
+    return this.inFlightBaseUsd;
+  }
+
+  private plannedLocalUsd(): number {
+    return Object.values(this.local).reduce((a, v) => a + v, 0);
+  }
+
   private plannedMoveUsd(): number {
     let s = 0;
     for (const m of this.moves.values()) s += m.amountUsd ?? 0;
@@ -152,6 +163,13 @@ export class FundingPlanner {
     if (!cfg.xchain.enabled)
       return this.fail(`funding: only ${usd0(local)} idle at ${tk}; cross-chain moves disabled (xchain.enabled=false)`, target, deltaUsd);
     if (!Number.isFinite(marginalNetApr)) return this.fail("funding: marginal APR not finite", target, deltaUsd);
+    // never pay to bridge money the total-deployed ceiling would refuse to enter
+    const ceiling = cfg.caps.max_total_deployed_usd;
+    if (ceiling !== undefined) {
+      const after = (this.i.deployedUsd ?? 0) + this.inFlightBaseUsd + this.plannedMoveUsd() + this.plannedLocalUsd() + deltaUsd;
+      if (after > ceiling + SLACK)
+        return this.fail(`funding: max_total_deployed: ${usd0(after)} deployed + in flight > max_total_deployed_usd ${usd0(ceiling)}`, target, deltaUsd);
+    }
 
     const sources = Object.keys(this.remaining)
       .filter((k) => k !== tk && this.available(k) + SLACK >= deltaUsd)

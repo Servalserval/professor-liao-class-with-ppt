@@ -185,7 +185,7 @@ describe("loopPair: two-asset math", () => {
     // a pair loop always pushes debt utilization up and collateral utilization down
     assert.ok(signal(o, "utilization:debt", E).value > 0.8);
     assert.ok(signal(o, "utilization:collateral", E).value < 0.5);
-    assert.deepEqual(Object.keys(o.metrics).sort(), ["borrow_apr", "depeg", "supply_apr", "tvl_usd", "utilization_c", "utilization_d"]);
+    assert.deepEqual(Object.keys(o.metrics).sort(), ["borrow_apr", "depeg", "supply_apr", "swap_cost_frac", "swap_depth_usd", "tvl_usd", "utilization_c", "utilization_d"]);
     assert.equal(o.metrics.utilization_c, 0.5);
     assert.equal(o.metrics.utilization_d, 0.8);
     assert.equal(o.metrics.tvl_usd, 60e6);
@@ -363,7 +363,7 @@ describe("loopPair: two-asset math", () => {
       { maxLtv: NaN },
       { maxLtv: 0 },
       { liqLtv: NaN },
-      { swapCostFrac: NaN },
+      // NaN swap cost = unknown -> fallback cost (see test/review-fixes.test.ts); NaN depth without history -> null
       { swapDepthUsd: NaN },
       { swapDepthUsd: -1 },
       { flashloanFeeFrac: NaN },

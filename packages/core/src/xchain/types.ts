@@ -90,6 +90,15 @@ export interface InFlightTransfer {
    * drawdown to the kill switch).
    */
   walletSeenAtMs?: number;
+  /** USD of this transfer included in the idle buckets by the wallet read that set walletSeenAtMs. */
+  walletSeenUsd?: number;
+  /**
+   * The hop's send threw, or the hop was persisted but its send was never
+   * confirmed (crash / restart): the outcome is unknown. The transfer stays
+   * stuck (still counted as in flight) until resolved with
+   * `/transfer <id> arrived|failed|refunded [usd]`; it is never sent again.
+   */
+  sendUnknownAtMs?: number;
 }
 
 export interface BridgePollResult {
@@ -116,8 +125,9 @@ export interface BridgeExecutor {
   send(t: InFlightTransfer): Promise<{ ok: boolean; ref?: string; detail?: string }>;
   /**
    * Poll; may complete a "claimable" hop (e.g. CCTP receiveMessage on the
-   * destination). Report "completed" as soon as the destination wallet holds
-   * the funds: the router reads wallet balances right after polling.
+   * destination). The router reads wallet balances BEFORE polling: funds the
+   * wallet already shows while the hop is still in flight are de-duplicated
+   * (wallet-seen), so reporting "completed" a cycle late is safe.
    */
   poll(t: InFlightTransfer): Promise<BridgePollResult>;
 }

@@ -19,8 +19,8 @@
  * USD numbers — and quotes above `maxCostBps` are rejected.
  */
 import { getAddress, isAddress, zeroAddress } from "viem";
-import { fromUnits, minusBps, type AssetRef, type LiveContext, type LiveResult, type SwapAdapter, type SwapQuote, type TxRecord } from "@incentive-router/live-common";
-import { assertChainId, ensureAllowance, erc20Balance, sendTx, SimulationError, type Address, type EvmEnv } from "@incentive-router/live-evm-base";
+import { BroadcastUnconfirmedError, fromUnits, minusBps, type AssetRef, type LiveContext, type LiveResult, type SwapAdapter, type SwapQuote, type TxRecord } from "@incentive-router/live-common";
+import { assertChainId, call, ensureAllowance, erc20Abi, erc20Balance, sendTx, SimulationError, type Address, type EvmEnv } from "@incentive-router/live-evm-base";
 import { kyberswapRouters, odosRouters } from "./addresses.js";
 import { defaultFetch, lc, sameAddr, type HttpFetch } from "./http.js";
 import { KyberSwapClient, type KyberSwapOptions } from "./kyberswap.js";
@@ -202,16 +202,33 @@ export class AggregatorSwapAdapter implements SwapAdapter {
       const tokenIn = getAddress(from.address) as Address;
       const tokenOut = getAddress(to.address) as Address;
 
-      txs.push(...(await ensureAllowance(this.env, ctx, tokenIn, router, q.amountIn)));
+      const approvals = await ensureAllowance(this.env, ctx, tokenIn, router, q.amountIn);
+      txs.push(...approvals);
       const before = ctx.dryRun ? 0n : await erc20Balance(this.env, tokenOut);
       const desc = `${q.aggregator} swap ${q.amountIn} ${from.symbol} -> >=${minOut} ${to.symbol} via ${router} (${d.fn})`;
       try {
         txs.push(await sendTx(this.env, ctx, { to: router, data: built.data, value: 0n, description: desc }));
       } catch (e) {
+        if (e instanceof BroadcastUnconfirmedError) {
+          // The swap may still land: keep the allowance, report the hash; the runner re-reads balances.
+          txs.push({ chain: this.chain, id: e.id, description: desc, simulated: false, unconfirmed: true, nonce: e.nonce });
+          const msg = `${this.id}: swap broadcast unconfirmed (may have landed) hash=${e.id}: ${e.message}`;
+          ctx.log("error", msg);
+          return { ok: false, txs, detail: msg };
+        }
         if (ctx.dryRun && txs.length && e instanceof SimulationError) {
           // eth_call cannot see an approval that was only simulated; everything else was verified.
           ctx.log("warn", `[dry-run] ${this.id}: swap simulation reverted with the approval pending — calldata verified, not simulated`, { reason: e.message });
           return { ok: true, txs, detail: `dry-run: calldata verified (router allowlisted, recipient, min-out ${minOut}); swap simulation needs the approval mined first`, amountUsd: fromUnits(q.amountOut, to.decimals) * (await ctx.priceUsd(to)) };
+        }
+        if (!ctx.dryRun && approvals.length) {
+          // We granted an allowance for a swap that did not happen: take it back.
+          try {
+            txs.push(await sendTx(this.env, ctx, { to: tokenIn, data: call(erc20Abi, "approve", [router, 0n]), description: `reset allowance ${tokenIn} -> ${router} after failed swap` }));
+          } catch (re) {
+            ctx.log("error", `${this.id}: allowance reset to ${router} failed: ${(re as Error).message}`);
+            throw new Error(`${(e as Error).message}; allowance reset FAILED: ${(re as Error).message}`);
+          }
         }
         throw e;
       }
@@ -221,6 +238,13 @@ export class AggregatorSwapAdapter implements SwapAdapter {
       if (received < minOut) ctx.log("error", `${this.id}: received ${received} < min-out ${minOut} (balance diff)`, {});
       return { ok: received >= minOut, txs, detail: `received ${received} (min ${minOut})`, amountUsd: fromUnits(received, to.decimals) * pOut };
     } catch (e) {
+      if (e instanceof BroadcastUnconfirmedError) {
+        // e.g. the approval: it may have landed; nothing else was sent after it
+        txs.push({ chain: this.chain, id: e.id, description: e.description, simulated: false, unconfirmed: true, nonce: e.nonce });
+        const msg = `${this.id}: broadcast unconfirmed (may have landed) hash=${e.id}: ${e.message}`;
+        ctx.log("error", msg);
+        return { ok: false, txs, detail: msg };
+      }
       const msg = `${this.id}: swap rejected: ${(e as Error).message}`;
       ctx.log("error", msg);
       return { ok: false, txs, detail: msg };

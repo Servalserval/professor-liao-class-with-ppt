@@ -23,7 +23,7 @@
  * and (3) refuse tokens whose claim recipient was redirected away from us.
  */
 import { concat, encodeAbiParameters, encodeFunctionData, getAddress, isAddress, keccak256, parseAbi, zeroAddress, type Hex } from "viem";
-import { chainInfo, fromUnits, type AssetRef, type LiveContext, type LiveResult, type RewardClaimer, type TxRecord } from "@incentive-router/live-common";
+import { BroadcastUnconfirmedError, chainInfo, fromUnits, type AssetRef, type LiveContext, type LiveResult, type RewardClaimer, type TxRecord } from "@incentive-router/live-common";
 import { assertChainId, sendTx, type Address, type EvmEnv } from "@incentive-router/live-evm-base";
 import { arr, big, defaultFetch, httpJson, lc, num, obj, sameAddr, str, type HttpFetch } from "../swap/http.js";
 import { merklDistributor } from "./addresses.js";
@@ -232,7 +232,18 @@ export class MerklClaimer implements RewardClaimer {
         pick.map((p) => p.e.amount),
         pick.map((p) => p.e.proofs)
       );
-      txs.push(await sendTx(this.env, ctx, { to: this.distributor, data, description: `merkl claim ${pick.map((p) => `${p.toSend} ${p.e.token.symbol}`).join(", ")}` }));
+      const description = `merkl claim ${pick.map((p) => `${p.toSend} ${p.e.token.symbol}`).join(", ")}`;
+      try {
+        txs.push(await sendTx(this.env, ctx, { to: this.distributor, data, description }));
+      } catch (e) {
+        if (!(e instanceof BroadcastUnconfirmedError)) throw e;
+        // May have landed: start the interval anyway so the same claim is not re-sent immediately.
+        this.lastClaimAtMs = this.now();
+        txs.push({ chain: this.chain, id: e.id, description, simulated: false, unconfirmed: true, nonce: e.nonce });
+        const msg = `${this.id}: claim broadcast unconfirmed (may have landed) hash=${e.id}: ${e.message}`;
+        ctx.log("error", msg);
+        return { ok: false, txs, claimed: [], detail: msg };
+      }
       if (!ctx.dryRun) this.lastClaimAtMs = this.now();
       return {
         ok: true,

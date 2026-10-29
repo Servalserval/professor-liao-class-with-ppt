@@ -69,6 +69,11 @@ describe("router", () => {
     st.positions[0]!.equityUsd *= 0.8;
     r.store.save(st);
     r.tick();
+    // first cycle that sees the drawdown: warned, not fired (portfolio.kill_confirm_cycles = 2)
+    const first = await r.router.cycle();
+    assert.equal(first.killed, false);
+    assert.ok(r.notifier.messages.some((m) => m.level === "critical" && m.text.includes("(1/2)")));
+    r.tick();
     const rep = await r.router.cycle();
     assert.equal(rep.killed, true);
     assert.ok(rep.executed.some((x) => x.action.type === "exit" && x.action.reason === "kill switch"));

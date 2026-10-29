@@ -59,6 +59,32 @@ function mockEnv(opts: { allowance?: bigint; revertTo?: Address } = {}) {
   return { env, sent };
 }
 
+/**
+ * Give a mock env a signer matching live-evm-base sendTx:
+ * prepareTransactionRequest -> signTransaction -> sendRawTransaction -> waitForTransactionReceipt.
+ * `submitFails(req)` makes sendRawTransaction time out (getTransaction finds nothing -> BroadcastUnconfirmedError).
+ */
+function withSigner(env: EvmEnv, submitFails: (req: Sent) => boolean = () => false) {
+  const broadcast: Sent[] = [];
+  const prepared: Sent[] = [];
+  env.walletClient = {
+    account: { address: ME },
+    prepareTransactionRequest: async (r: Sent) => (prepared.push(r), { ...r, nonce: prepared.length }),
+    signTransaction: async () => `0x${prepared.length.toString(16).padStart(8, "0")}`,
+  } as unknown as EvmEnv["walletClient"];
+  Object.assign(env.publicClient, {
+    sendRawTransaction: async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
+      const req = prepared[Number.parseInt(serializedTransaction.slice(2), 16) - 1]!;
+      if (submitFails(req)) throw new Error("request timed out");
+      broadcast.push(req);
+      return "0x";
+    },
+    getTransaction: async () => null,
+    waitForTransactionReceipt: async () => ({ status: "success", gasUsed: 100_000n, effectiveGasPrice: 10_000_000n }),
+  });
+  return { broadcast };
+}
+
 const prices: Record<string, number> = { USDC: 1, USDT: 1 };
 const mkCtx = (over: Partial<LiveContext> = {}): LiveContext => ({
   dryRun: true,
@@ -263,6 +289,30 @@ describe("min-out", () => {
     assert.equal(r.ok, true);
     assert.match(r.detail!, /approval mined first/);
     assert.equal(r.txs.length, 1); // only the approval
+  });
+  it("live: resets the router allowance to 0 when the swap reverts after our approval", async () => {
+    const { env } = mockEnv({ revertTo: KYBERSWAP_META_ROUTER_V2 });
+    const { broadcast } = withSigner(env);
+    const a = kyberOnly(env, kyberApi().f);
+    const r = await a.swap(await a.quote(USDC, USDT, AMOUNT_IN, mkCtx()), USDC, USDT, mkCtx({ dryRun: false }));
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /simulation reverted/);
+    assert.equal(broadcast.length, 2);
+    assert.deepEqual(decodeFunctionData({ abi: erc20Abi, data: broadcast[0]!.data }).args, [KYBERSWAP_META_ROUTER_V2, AMOUNT_IN]);
+    assert.deepEqual(decodeFunctionData({ abi: erc20Abi, data: broadcast[1]!.data }).args, [KYBERSWAP_META_ROUTER_V2, 0n]);
+    assert.equal(broadcast.every((b) => b.to === USDC.address), true);
+  });
+  it("live: an unconfirmed swap broadcast returns ok:false with the hash and keeps the allowance", async () => {
+    const { env } = mockEnv();
+    const { broadcast } = withSigner(env, (req) => req.to === KYBERSWAP_META_ROUTER_V2);
+    const a = kyberOnly(env, kyberApi().f);
+    const r = await a.swap(await a.quote(USDC, USDT, AMOUNT_IN, mkCtx()), USDC, USDT, mkCtx({ dryRun: false }));
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /may have landed\) hash=0x[0-9a-f]{64}/);
+    const last = r.txs[r.txs.length - 1]!;
+    assert.equal(last.unconfirmed, true);
+    assert.match(last.id!, /^0x[0-9a-f]{64}$/);
+    assert.equal(broadcast.length, 1, "only the approval; no allowance reset");
   });
   it("refuses a tampered SwapQuote", async () => {
     const { env } = mockEnv();

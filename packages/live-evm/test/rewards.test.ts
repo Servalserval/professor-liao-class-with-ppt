@@ -48,6 +48,27 @@ function mockEnv(chain: string, chainId: number, read: (a: Read) => unknown) {
   return { env, sent };
 }
 
+/**
+ * Mock signer matching live-evm-base sendTx (prepare -> sign -> sendRawTransaction -> receipt).
+ * `accept()` is called per submit; false = the submit times out and the tx is never seen.
+ */
+function withSigner(env: EvmEnv, accept: () => boolean) {
+  let n = 0;
+  env.walletClient = {
+    account: { address: ME },
+    prepareTransactionRequest: async (r: object) => ({ ...r, nonce: ++n }),
+    signTransaction: async () => `0x${n.toString(16).padStart(8, "0")}`,
+  } as unknown as EvmEnv["walletClient"];
+  Object.assign(env.publicClient, {
+    sendRawTransaction: async () => {
+      if (!accept()) throw new Error("request timed out");
+      return "0x";
+    },
+    getTransaction: async () => null,
+    waitForTransactionReceipt: async () => ({ status: "success", gasUsed: 100_000n, effectiveGasPrice: 10_000_000n }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Merkl claims
 // ---------------------------------------------------------------------------
@@ -159,8 +180,7 @@ describe("merkl claim", () => {
     assert.match(noSigner.detail!, /no signer/);
     // give the env a (mock) signer: first live claim goes through, the next one within 2 h is skipped
     let broadcasts = 0;
-    env.walletClient = { account: { address: ME }, sendTransaction: async () => (broadcasts++, `0x${"11".repeat(32)}`) } as unknown as EvmEnv["walletClient"];
-    (env.publicClient as unknown as Record<string, unknown>).waitForTransactionReceipt = async () => ({ status: "success", gasUsed: 100_000n, effectiveGasPrice: 10_000_000n });
+    withSigner(env, () => (broadcasts++, true));
     const live = await c.claim(ME, ctx({ dryRun: false }));
     assert.equal(live.ok, true, live.detail);
     assert.equal(live.txs[0]!.simulated, false);
@@ -171,6 +191,19 @@ describe("merkl claim", () => {
     t += 60 * 60_000;
     assert.equal((await c.claim(ME, ctx({ dryRun: false }))).txs.length, 1);
     assert.equal(broadcasts, 2);
+  });
+  it("an unconfirmed claim broadcast returns the hash and still starts the claim interval", async () => {
+    const { env } = mockEnv("arbitrum", 42161, distributorReads());
+    let submits = 0;
+    withSigner(env, () => (submits++, false)); // submit times out, tx not seen -> BroadcastUnconfirmedError
+    const c = new MerklClaimer(env, { chain: "arbitrum" }, rewardsApi().f);
+    const r = await c.claim(ME, ctx({ dryRun: false }));
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /may have landed\) hash=0x[0-9a-f]{64}/);
+    assert.equal(r.txs[0]!.unconfirmed, true);
+    const again = await c.claim(ME, ctx({ dryRun: false }));
+    assert.match(again.detail!, /skipped/);
+    assert.equal(submits, 1, "not re-sent immediately");
   });
 });
 

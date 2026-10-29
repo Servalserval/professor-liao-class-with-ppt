@@ -1,5 +1,5 @@
 import { exitThreshold, venueTier } from "../tiers.js";
-import type { Action, Flag, Opportunity, Position } from "../types.js";
+import type { Action, ExitCause, Flag, Opportunity, Position } from "../types.js";
 import { marginalHoldApr, valueAt } from "../valuation.js";
 import { LEVERAGED_KINDS, liquidityUsage, signalLevel, type DecisionContext } from "./common.js";
 
@@ -13,9 +13,9 @@ export interface ExitDecision {
   pendingSince: Record<string, number>;
 }
 
-function fullExit(oppId: string, reason: string, urgent: boolean): Action[] {
+function fullExit(oppId: string, reason: string, urgent: boolean, cause?: ExitCause): Action[] {
   return [
-    { type: "exit", oppId, fraction: 1, urgent, reason },
+    { type: "exit", oppId, fraction: 1, urgent, reason, ...(cause ? { cause } : {}) },
     { type: "alert", level: urgent ? "critical" : "warn", message: `EXIT ${oppId}: ${reason}` },
   ];
 }
@@ -32,7 +32,9 @@ function fullExit(oppId: string, reason: string, urgent: boolean): Action[] {
  *                      (checked before blind: a blind position with a dead exit path must not wait 10 cycles)
  *  0. blind            source has not (validly) reported the opportunity for N cycles
  *  1. exit flags       paused market, depeg, capacity drain, metric spike ...
- *  2. liquidity        my exit footprint >= 20% of exit capacity (the 1/5 rule)
+ *                      (a capacity drain set by swap depth needs confirm_cycles)
+ *  2. liquidity        my exit footprint >= 20% of exit capacity (the 1/5 rule;
+ *                      confirm_cycles when swap depth, not pool liquidity, binds)
  *  3. stress signals   utilization >= 95%, basis blow-out ...
  *  4. health           critical -> exit; drifting -> rebalance; missing on a leveraged position -> warn/exit
  *  6. reward ending    edge does not survive without the streams that end soon
@@ -51,6 +53,24 @@ export function decideExit(
   const actions: Action[] = [];
   const done = (a: Action[]): ExitDecision => ({ actions: a, pending, pendingSince });
 
+  /**
+   * Cycle-only debounce for urgent rules driven by a swap quote (a quote can
+   * fail or flicker; pool liquidity cannot). Still urgent once confirmed.
+   */
+  const cyclesConfirmed = (key: string, active: boolean): boolean => {
+    if (!active) {
+      delete pending[key];
+      delete pendingSince[key];
+      return false;
+    }
+    pending[key] = (pending[key] ?? 0) + 1;
+    pendingSince[key] ??= ctx.nowMs;
+    if (pending[key]! < cfg.thresholds.confirm_cycles) return false;
+    delete pending[key];
+    delete pendingSince[key];
+    return true;
+  };
+
   // F) latched exit
   if (pos.forcedExit) {
     const f = pos.forcedExit;
@@ -60,7 +80,7 @@ export function decideExit(
   // 5) exit path (before blind on purpose)
   if (pos.exitProbe.consecutiveFailures >= cfg.exit_probe.max_consecutive_failures)
     return done(
-      fullExit(pos.oppId, `exit simulation failed ${pos.exitProbe.consecutiveFailures}x — leaving while the path may still work`, true)
+      fullExit(pos.oppId, `exit simulation failed ${pos.exitProbe.consecutiveFailures}x — leaving while the path may still work`, true, "probe")
     );
 
   // 0) blind
@@ -69,7 +89,7 @@ export function decideExit(
     for (const k of Object.keys(pending)) delete pending[k];
     for (const k of Object.keys(pendingSince)) delete pendingSince[k];
     if (pos.blindCycles >= cfg.portfolio.blind_exit_cycles)
-      return done(fullExit(pos.oppId, `source blind for ${pos.blindCycles} cycles`, true));
+      return done(fullExit(pos.oppId, `source blind for ${pos.blindCycles} cycles`, true, "blind"));
     if (pos.blindCycles >= cfg.portfolio.blind_alert_cycles)
       actions.push({
         type: "alert",
@@ -82,13 +102,37 @@ export function decideExit(
 
   // 1) exit-severity flags (source + derived)
   const flags = [...opp.flags, ...derived];
-  const exitFlag = flags.find((f) => f.severity === "exit");
+  const swapBound = opp.liquidity.binding === "swap";
+  const debouncedFlag = (f: Flag) => swapBound && f.name === "capacity_drop";
+  const exitFlags = flags.filter((f) => f.severity === "exit");
+  const exitFlag = exitFlags.find((f) => !debouncedFlag(f));
   if (exitFlag) return done(fullExit(pos.oppId, `flag ${exitFlag.name}${exitFlag.detail ? `: ${exitFlag.detail}` : ""}`, true));
+  const swapDrop = exitFlags.find(debouncedFlag);
+  if (cyclesConfirmed("capacity_drop:swap", !!swapDrop))
+    return done(
+      fullExit(pos.oppId, `flag capacity_drop (swap depth, ${cfg.thresholds.confirm_cycles} cycles)${swapDrop?.detail ? `: ${swapDrop.detail}` : ""}`, true)
+    );
 
-  // 2) liquidity (the 1/5 rule)
-  const usage = liquidityUsage(cfg, opp, pos.equityUsd);
-  if (usage >= cfg.liquidity.exit_frac_of_capacity)
+  // 2) liquidity (the 1/5 rule) — immediate when pool liquidity binds, confirmed when swap depth does
+  const usage = liquidityUsage(cfg, opp, pos.equityUsd, true);
+  const breach = usage >= cfg.liquidity.exit_frac_of_capacity;
+  if (breach && !swapBound)
     return done(fullExit(pos.oppId, `position needs ${pct(usage)} of exit capacity >= ${pct(cfg.liquidity.exit_frac_of_capacity)}`, true));
+  if (cyclesConfirmed("liquidity:swap", breach && swapBound))
+    return done(
+      fullExit(
+        pos.oppId,
+        `position needs ${pct(usage)} of swap-limited exit capacity >= ${pct(cfg.liquidity.exit_frac_of_capacity)} (${cfg.thresholds.confirm_cycles} cycles)`,
+        true
+      )
+    );
+  if (breach || swapDrop)
+    actions.push({
+      type: "alert",
+      level: "warn",
+      message: `${pos.oppId}: swap-depth liquidity ${breach ? `usage ${pct(usage)}` : "drop"} — confirming before exit`,
+      dedupeKey: `${pos.oppId}|liquidity_swap`,
+    });
 
   // 3) stress signals at exit level
   for (const s of opp.signals)

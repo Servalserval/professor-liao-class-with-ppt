@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { newHistory, type History } from "./signals.js";
 import type { Position } from "./types.js";
@@ -31,6 +31,8 @@ export interface RouterState {
   hedgeExecutor: Record<string, string>;
   paused: boolean;
   killed: boolean;
+  /** Consecutive cycles the kill-switch drawdown has been seen (fires at portfolio.kill_confirm_cycles). */
+  killPending?: number;
   /** Manual exits requested via Telegram, executed next cycle. */
   manualExit: string[];
   /** Dedupe key -> last time a status alert with that key was sent. */
@@ -114,6 +116,7 @@ export function normalizeState(s: RouterState): RouterState {
   s.idle ??= {};
   s.transfers ??= [];
   s.frictionLedger ??= [];
+  s.killPending ??= 0;
   if (Object.keys(s.idle).length) s.idleUsd = sumIdle(s.idle);
   return s;
 }
@@ -141,7 +144,33 @@ export class MemoryStore implements Store {
   }
 }
 
-/** JSON state file (atomic write via rename) + append-only JSONL journal. */
+/**
+ * Crash-safe replace of a small file: a power loss leaves either the old or
+ * the new content, never a truncated file.
+ */
+export function writeFileAtomic(path: string, data: string): void {
+  const tmp = `${path}.tmp`;
+  const fd = openSync(tmp, "w");
+  try {
+    writeSync(fd, data);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, path);
+  try {
+    const dfd = openSync(dirname(path), "r");
+    try {
+      fsyncSync(dfd);
+    } finally {
+      closeSync(dfd);
+    }
+  } catch {
+    // directory fsync is not supported everywhere (best effort)
+  }
+}
+
+/** JSON state file (atomic write via tmp + fsync + rename) + append-only JSONL journal. */
 export class FileStore implements Store {
   constructor(
     private readonly statePath: string,
@@ -159,10 +188,9 @@ export class FileStore implements Store {
     if (s.version !== 1) throw new Error(`unsupported state version ${String(s.version)}`);
     return normalizeState(s);
   }
+  /** Atomic: write a temp file, fsync it, rename over the state file, fsync the directory. */
   save(s: RouterState): void {
-    const tmp = `${this.statePath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(s, null, 2));
-    renameSync(tmp, this.statePath);
+    writeFileAtomic(this.statePath, JSON.stringify(s, null, 2));
   }
   journal(event: Record<string, unknown>): void {
     appendFileSync(this.journalPath, JSON.stringify(event) + "\n");

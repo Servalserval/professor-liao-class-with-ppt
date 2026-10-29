@@ -1,4 +1,5 @@
 import type { RouterConfig } from "../config.js";
+import type { History } from "../signals.js";
 import type { Opportunity } from "../types.js";
 
 export interface SourceContext {
@@ -6,6 +7,12 @@ export interface SourceContext {
   nowMs: number;
   /** oppId -> my equity currently in it (from the router's positions). */
   myEquityByOpp: Record<string, number>;
+  /**
+   * The router's persisted history (previous cycles only), so a source can
+   * fall back to its last known value when one probe fails (loop pairs:
+   * swap depth / cost). Absent in one-shot tools (scan).
+   */
+  history?: History;
 }
 
 /**

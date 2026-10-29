@@ -148,13 +148,13 @@ async function cmdScan(cfg: RouterConfig, f: Flags) {
   }
 }
 
-function makeNotifier(cfg: RouterConfig): { notifier: Notifier; tg?: TelegramNotifier } {
+function makeNotifier(cfg: RouterConfig, stateDir?: string): { notifier: Notifier; tg?: TelegramNotifier } {
   const tokEnv = cfg.telegram?.bot_token_env ?? "TG_BOT_TOKEN";
   const chatEnv = cfg.telegram?.chat_id_env ?? "TG_CHAT_ID";
   const tok = process.env[tokEnv];
   const chat = process.env[chatEnv];
   if (tok && chat) {
-    const tg = new TelegramNotifier(tok, chat);
+    const tg = new TelegramNotifier(tok, chat, fetch, stateDir ? { offsetPath: `${stateDir}/telegram-offset.json` } : {});
     return { notifier: new MultiNotifier([new ConsoleNotifier(), tg]), tg };
   }
   return { notifier: new ConsoleNotifier() };
@@ -194,7 +194,7 @@ async function cmdRun(cfg: RouterConfig, f: Flags) {
   const dir = s(f, "state") ?? "state";
   const store = new FileStore(`${dir}/state.json`, `${dir}/journal.jsonl`, Number(s(f, "equity") ?? 100_000));
   const sources = buildSources(f);
-  const { notifier, tg } = makeNotifier(cfg);
+  const { notifier, tg } = makeNotifier(cfg, dir);
   const exec = new PaperExecutor();
   const executors = Object.fromEntries(sources.map((x) => [x.id, exec]));
   const router = new Router({ cfg, sources, executors, store, notifier, tokens: () => loadTokens(f), paperAccrual: true });
@@ -206,6 +206,17 @@ async function cmdRun(cfg: RouterConfig, f: Flags) {
     console.log(`[${new Date(r.nowMs).toISOString()}] equity $${Math.round(r.totalEquityUsd)} idle $${Math.round(r.idleUsd)} actions ${r.executed.length}`);
     if (i + 1 < cycles) await new Promise((res) => setTimeout(res, interval));
   }
+}
+
+/** Run one router command against a state dir (same as Telegram): `cmd "/transfer <id> refunded 1000"`. */
+function cmdCommand(cfg: RouterConfig, pos: string[], f: Flags) {
+  const text = pos.join(" ").trim();
+  if (!text.startsWith("/")) throw new Error('usage: cmd "/status" | "/pause" | "/resume" | "/exit <id>" | "/exitall" | "/transfer <id> arrived|failed|refunded [usd]" [--state dir]');
+  const dir = s(f, "state") ?? "state";
+  const store = new FileStore(`${dir}/state.json`, `${dir}/journal.jsonl`);
+  const router = new Router({ cfg, sources: [], executors: {}, store, notifier: new ConsoleNotifier(), tokens: () => ({}) });
+  const [cmd = "", ...args] = text.split(/\s+/);
+  console.log(router.handleCommand({ cmd: cmd.toLowerCase(), args }));
 }
 
 async function cmdVerify(cfg: RouterConfig) {
@@ -235,6 +246,7 @@ const HELP = `incentive-router
   plan   (same source flags) [--state dir] [--paper] [--why]
   sim    <scenario.yaml> [--verbose]
   run    --paper (same source flags) [--state dir] [--cycles N] [--interval sec]
+  cmd    "/status" | "/transfer <id> arrived|failed|refunded [usd]" | ... [--state dir]   (same commands as Telegram)
   verify-sources        check live Merkl / DefiLlama response shapes (needs internet)
 
   global: --config <yaml>   (default: config/default.yaml when present)`;
@@ -251,6 +263,8 @@ async function main() {
       return cmdRun(cfg, flags);
     case "verify-sources":
       return cmdVerify(cfg);
+    case "cmd":
+      return cmdCommand(cfg, pos, flags);
     case "sim": {
       if (!pos[0]) throw new Error("usage: sim <scenario.yaml>");
       const r = await runScenario(loadScenario(pos[0]));

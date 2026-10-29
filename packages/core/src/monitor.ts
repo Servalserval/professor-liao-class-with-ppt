@@ -58,7 +58,7 @@ export interface RouterDeps {
 
 /** What happened to cross-chain transfers this cycle (also journaled). */
 export interface TransferEvent {
-  kind: "sent" | "send_failed" | "hop" | "arrived" | "failed" | "refunded" | "stuck" | "wallet_seen";
+  kind: "sent" | "send_failed" | "send_unknown" | "hop" | "arrived" | "failed" | "refunded" | "stuck" | "wallet_seen";
   id: string;
   forOppId?: string;
   amountUsd: number;
@@ -185,20 +185,15 @@ export class Router {
           alerts.push({ level: "warn", text: `${p.oppId}: mark-to-market failed (${errMsg(e)})`, dedupeKey: `${p.oppId}|mtm` });
         }
       }
-      // --- cross-chain transfers: poll BEFORE reading wallets, so a completed
-      //     transfer is never both in flight and in the wallet balance ------------
-      st.frictionLedger = st.frictionLedger.filter((e) => e.t > now - 48 * HOUR);
-      if (st.transfers.length) await this.pollTransfers(st, now, alerts, xfers);
-
+      // --- wallet snapshot FIRST (live): taken before any action of this cycle ------
       if (this.d.idleBalances) {
         try {
           const m = await this.d.idleBalances();
           const bad = Object.entries(m).filter(([k, v]) => !Number.isFinite(v) || v < 0 || !/^[^:]+:.+$/.test(k));
           if (bad.length) throw new Error(`invalid balances for ${bad.map(([k]) => k).join(", ")}`);
-          // buckets missing from the read are empty, not unknown: keep bucket mode stable
-          const read: Record<string, number> = { ...Object.fromEntries(Object.keys(st.idle).map((k) => [k, 0])), ...m };
-          this.markWalletSeen(st, read, now, xfers);
-          setIdleBuckets(st, read);
+          // the read may be PARTIAL (a bucket whose read failed is omitted): missing keys keep their last value
+          this.markWalletSeen(st, m, now, xfers);
+          setIdleBuckets(st, { ...st.idle, ...m });
         } catch (e) {
           alerts.push({ level: "warn", text: `idle balances read failed (${errMsg(e)}); keeping last values`, dedupeKey: "idle|read" });
         }
@@ -217,6 +212,13 @@ export class Router {
             alerts.push({ level: "warn", text: `idle balance read failed (${errMsg(e)}); keeping last value`, dedupeKey: "idle|read" });
           }
       }
+      // --- cross-chain transfers (after the wallet snapshot: every effect of a
+      //     poll — a credit on arrival, a debit when the next hop leaves — is a
+      //     delta on top of it; funds the snapshot already showed are wallet-seen
+      //     and never credited twice) ---------------------------------------------
+      st.frictionLedger = st.frictionLedger.filter((e) => e.t > now - 48 * HOUR);
+      if (st.transfers.length) await this.pollTransfers(st, now, alerts, xfers);
+
       recordEquity(st.history, totalEquity(), now, keep);
 
       const ctx = (): DecisionContext => ({
@@ -243,17 +245,33 @@ export class Router {
       }
       pruneHistory(st.history, now, keep);
 
+      // --- latches caused by missing data / failed simulations: cleared when the
+      //     trigger is gone before the exit executed (BEFORE the kill switch, so a
+      //     kill-switch latch is never cleared by this) ---------------------------------
+      await this.clearRecoveredLatches(st, opps, alerts, now);
+
       // --- kill switch (latched through forcedExit) -----------------------------------
+      // The drawdown must persist kill_confirm_cycles consecutive cycles: one bad
+      // read (a wallet, a mark-to-market) must not liquidate the book.
       const dd = equityDrawdown(st.history, cfg, now);
       if (dd >= cfg.portfolio.kill_drawdown_frac && !st.killed) {
-        st.killed = true;
-        st.paused = true;
-        alerts.push({
-          level: "critical",
-          text: `KILL SWITCH: equity -${(dd * 100).toFixed(2)}% within ${cfg.portfolio.kill_window_hours}h — exiting everything, router paused (/resume to re-arm)`,
-        });
-        for (const p of st.positions) p.forcedExit ??= { reason: "kill switch", urgent: true, sinceMs: now };
-      }
+        st.killPending = (st.killPending ?? 0) + 1;
+        if (st.killPending >= cfg.portfolio.kill_confirm_cycles) {
+          st.killed = true;
+          st.paused = true;
+          st.killPending = 0;
+          alerts.push({
+            level: "critical",
+            text: `KILL SWITCH: equity -${(dd * 100).toFixed(2)}% within ${cfg.portfolio.kill_window_hours}h — exiting everything, router paused (/resume to re-arm)`,
+          });
+          for (const p of st.positions) p.forcedExit ??= { reason: "kill switch", urgent: true, sinceMs: now };
+        } else
+          alerts.push({
+            level: "critical",
+            text: `drawdown -${(dd * 100).toFixed(2)}% within ${cfg.portfolio.kill_window_hours}h (${st.killPending}/${cfg.portfolio.kill_confirm_cycles}) — kill switch fires if it persists`,
+            dedupeKey: "kill|pending",
+          });
+      } else st.killPending = 0;
 
       // --- manual exits (telegram) are latched too ---------------------------------
       for (const id of st.manualExit) {
@@ -273,7 +291,7 @@ export class Router {
           if (a.type === "alert") alerts.push({ level: a.level, text: a.message, dedupeKey: a.dedupeKey });
           else if (a.type === "exit") {
             // latch full exits before trying, so a failure (or a one-cycle trigger) is retried
-            if (a.fraction >= 1) p.forcedExit ??= { reason: a.reason, urgent: a.urgent, sinceMs: now };
+            if (a.fraction >= 1) p.forcedExit ??= { reason: a.reason, urgent: a.urgent, sinceMs: now, ...(a.cause ? { cause: a.cause } : {}) };
             await this.execExit(st, p, opps.get(p.oppId), a, executed, alerts, now);
           } else if (a.type === "rebalance") {
             const opp = opps.get(p.oppId);
@@ -293,16 +311,8 @@ export class Router {
         if (!ex) continue;
         const age = p.exitProbe.lastOkAtMs === null ? Infinity : now - p.exitProbe.lastOkAtMs;
         if (age < cfg.exit_probe.max_age_minutes * 60_000) continue;
-        const ok = await ex.simulateExit(p, opps.get(p.oppId)).catch(() => false);
-        if (ok) p.exitProbe = { lastOkAtMs: now, consecutiveFailures: 0 };
-        else {
-          p.exitProbe.consecutiveFailures += 1;
-          alerts.push({
-            level: "warn",
-            text: `${p.oppId}: exit simulation failed (${p.exitProbe.consecutiveFailures}x)`,
-            dedupeKey: `${p.oppId}|probe`,
-          });
-        }
+        const res = await this.probeExit(p, opps.get(p.oppId));
+        this.applyProbe(p, res, alerts, now);
       }
       this.d.store.save(st);
 
@@ -336,6 +346,7 @@ export class Router {
             totalEquityUsd: c.totalEquityUsd,
             bookYieldPerYearUsd: bookYieldPerYear(st.positions, opps, c),
             pausedRouteIds: pausedRoutes(st, now),
+            deployedUsd: c.exposure.totalDeployedUsd,
           });
         const plan = planAllocation([...opps.values()], c);
         allocationRejected = plan.rejected;
@@ -389,11 +400,76 @@ export class Router {
     };
   }
 
+  /** true / false = the simulation ran; "error" = it could not run (RPC), which proves nothing. */
+  private async probeExit(p: Position, opp: Opportunity | undefined): Promise<boolean | "error"> {
+    const ex = this.d.executors[p.sourceId];
+    if (!ex) return "error";
+    try {
+      return (await ex.simulateExit(p, opp)) === true;
+    } catch {
+      return "error";
+    }
+  }
+
+  private applyProbe(p: Position, res: boolean | "error", alerts: Alert[], now: number) {
+    const cfg = this.d.cfg;
+    if (res === true) {
+      p.exitProbe = { lastOkAtMs: now, consecutiveFailures: 0, consecutiveErrors: 0 };
+      return;
+    }
+    if (res === false) {
+      p.exitProbe.consecutiveFailures += 1;
+      alerts.push({
+        level: "warn",
+        text: `${p.oppId}: exit simulation failed (${p.exitProbe.consecutiveFailures}x)`,
+        dedupeKey: `${p.oppId}|probe`,
+      });
+      return;
+    }
+    // could not run: never counts toward max_consecutive_failures
+    p.exitProbe.consecutiveErrors = (p.exitProbe.consecutiveErrors ?? 0) + 1;
+    if (p.exitProbe.consecutiveErrors >= cfg.exit_probe.error_alert_after)
+      alerts.push({
+        level: "warn",
+        text: `${p.oppId}: exit simulation could not run ${p.exitProbe.consecutiveErrors}x (RPC error?) — exit path unverified, not counted as failures`,
+        dedupeKey: `${p.oppId}|probe_error`,
+      });
+  }
+
+  /**
+   * A full exit latched because the data went blind or the exit simulation
+   * failed is dropped when, before it executed, the data is back (valid) or a
+   * fresh simulation passes. The normal rules then decide again this cycle.
+   */
+  private async clearRecoveredLatches(st: RouterState, opps: Map<string, Opportunity>, alerts: Alert[], now: number) {
+    for (const p of st.positions) {
+      const f = p.forcedExit;
+      if (!f?.cause) continue;
+      let why: string | null = null;
+      if (f.cause === "blind" && opps.has(p.oppId) && p.blindCycles === 0) why = "source reports valid data again";
+      if (f.cause === "probe") {
+        const res = await this.probeExit(p, opps.get(p.oppId));
+        this.applyProbe(p, res, alerts, now);
+        if (res === true) why = "exit simulation passes again";
+      }
+      if (!why) continue;
+      p.forcedExit = undefined;
+      this.d.store.journal({ t: now, type: "latch_cleared", oppId: p.oppId, cause: f.cause, reason: f.reason, why });
+      alerts.push({ level: "warn", text: `${p.oppId}: latched exit cleared (${f.reason}) — ${why}` });
+    }
+    this.d.store.save(st);
+  }
+
   // -------------------------------------------------------------------------
   // Cross-chain transfers
   // -------------------------------------------------------------------------
 
-  /** Book the move, then send hop 0. A failed send leaves the money idle where it was. */
+  /**
+   * Book the move, persist it, then send hop 0. An explicit refusal (ok:false)
+   * leaves the money idle where it was; a send that THROWS has an unknown
+   * outcome (the tx may be out) and is kept as a stuck transfer, never
+   * credited back automatically.
+   */
   private async startTransfer(
     st: RouterState,
     opp: Opportunity,
@@ -430,38 +506,28 @@ export class Router {
       updatedAtMs: now,
       hopStartedAtMs: now,
     };
-    const ev = (kind: TransferEvent["kind"], detail?: string): TransferEvent => ({
-      kind,
-      id: t.id,
-      forOppId: t.forOppId,
-      amountUsd: t.amountUsd,
-      costUsd: t.costUsd,
-      from: srcKey,
-      to: dstKey,
-      route,
-      detail,
-    });
     // Books first, side effect second: a crash during send leaves a tracked
-    // transfer (polled, flagged stuck if it never lands), never vanished money.
+    // "planned" transfer (flagged stuck on restart, never re-sent), never vanished money.
     debitIdle(st, srcKey, t.amountUsd);
     st.transfers.push(t);
     this.d.store.save(st);
     let r: { ok: boolean; ref?: string; detail?: string };
-    let threw = false;
     try {
       r = await bridge.send(t);
     } catch (err) {
-      threw = true;
-      r = { ok: false, detail: `threw: ${errMsg(err)}` };
+      this.markSendUnknown(st, t, first.id, `send threw: ${errMsg(err)}`, now, alerts, xfers);
+      st.frictionLedger.push({ t: now, costUsd: q.costUsd, transferId: t.id }); // assume paid (conservative)
+      this.d.store.save(st);
+      return;
     }
     if (!r.ok) {
       st.transfers = st.transfers.filter((x) => x !== t);
       creditIdle(st, srcKey, t.amountUsd);
       alerts.push({
         level: "critical",
-        text: `bridge send FAILED ${usd0(t.amountUsd)} ${srcKey} -> ${dstKey} via ${route} for ${opp.id}: ${r.detail ?? ""} — kept idle on ${srcKey}${threw ? " (send threw: verify on-chain that nothing left the wallet)" : ""}`,
+        text: `bridge send FAILED ${usd0(t.amountUsd)} ${srcKey} -> ${dstKey} via ${route} for ${opp.id}: ${r.detail ?? ""} — kept idle on ${srcKey}`,
       });
-      xfers.push(ev("send_failed", r.detail));
+      xfers.push(this.transferEvent(t, "send_failed", r.detail));
       this.pauseRoute(st, first.id, now, alerts, "send refused");
       this.d.store.save(st);
       return;
@@ -471,10 +537,36 @@ export class Router {
     t.detail = r.detail;
     st.frictionLedger.push({ t: now, costUsd: q.costUsd, transferId: t.id });
     this.d.store.save(st);
-    xfers.push(ev("sent", r.detail));
+    xfers.push(this.transferEvent(t, "sent", r.detail));
     alerts.push({
       level: "info",
       text: `BRIDGE ${usd0(t.amountUsd)} ${srcKey} -> ${dstKey} via ${route} for ${opp.id}: cost $${q.costUsd.toFixed(2)}, eta ${q.etaMinutes} min`,
+    });
+  }
+
+  /** Outcome of a hop's send is unknown: keep it in flight, stuck, until resolved by hand. */
+  private markSendUnknown(
+    st: RouterState,
+    t: InFlightTransfer,
+    routeId: string,
+    detail: string | undefined,
+    now: number,
+    alerts: Alert[],
+    xfers: TransferEvent[]
+  ) {
+    const was = t.state === "stuck";
+    t.state = "stuck";
+    t.sendUnknownAtMs ??= now;
+    if (detail !== undefined) t.detail = `${detail} — outcome unknown`;
+    t.updatedAtMs = now;
+    if (!was) {
+      xfers.push(this.transferEvent(t, "send_unknown", t.detail, t.receivedUsd ?? t.amountUsd));
+      this.pauseRoute(st, routeId, now, alerts, "send outcome unknown");
+    }
+    alerts.push({
+      level: "critical",
+      text: `transfer ${t.id}: hop ${t.hop + 1}/${t.path.length} ${routeId} ${t.detail}; ${usd0(t.receivedUsd ?? t.amountUsd)} kept as in flight, NOT sent again — check the wallets / explorer and resolve with /transfer ${t.id} arrived|failed|refunded [usd]`,
+      dedupeKey: `xfer|${t.id}|unknown`,
     });
   }
 
@@ -488,6 +580,15 @@ export class Router {
       if (!hop0) {
         t.state = "failed";
         alerts.push({ level: "critical", text: `transfer ${t.id}: invalid hop ${t.hop} — removed from the books, check by hand` });
+        continue;
+      }
+      // A hop still "planned" here was persisted but its send never confirmed
+      // (crash / restart between save and send), or a send threw: the outcome
+      // is unknown. Never send it again automatically, never poll without a handle.
+      if (t.state === "planned" || t.sendUnknownAtMs !== undefined) {
+        const first = t.sendUnknownAtMs === undefined ? "hop persisted but its send was never confirmed (restart?)" : undefined;
+        this.markSendUnknown(st, t, hop0.id, first, now, alerts, xfers);
+        this.d.store.save(st);
         continue;
       }
       const bridge = this.d.bridges?.[hop0.kind];
@@ -506,7 +607,7 @@ export class Router {
         }
         if (r) await this.applyPoll(st, t, r, now, alerts, xfers);
       }
-      if (isFinalTransfer(t)) continue;
+      if (isFinalTransfer(t) || t.sendUnknownAtMs !== undefined) continue;
       const hop = t.path[t.hop]!;
       const started = t.hopStartedAtMs ?? t.createdAtMs;
       const limitMin = Math.max(x.stuck_min_minutes, hop.etaMinutes * x.stuck_eta_multiple);
@@ -519,7 +620,7 @@ export class Router {
         }
         alerts.push({
           level: "critical",
-          text: `transfer ${t.id} STUCK: hop ${t.hop + 1}/${t.path.length} ${hop.id} (${usd0(t.receivedUsd ?? t.amountUsd)}) not done after ${Math.round((now - started) / 60_000)} min (eta ${hop.etaMinutes}); NOT resent automatically — check ${t.ref ?? "the bridge"} by hand`,
+          text: `transfer ${t.id} STUCK: hop ${t.hop + 1}/${t.path.length} ${hop.id} (${usd0(t.receivedUsd ?? t.amountUsd)}) not done after ${Math.round((now - started) / 60_000)} min (eta ${hop.etaMinutes}); NOT resent automatically — check ${t.ref ?? "the bridge"} by hand, then /transfer ${t.id} arrived|failed|refunded [usd]`,
           dedupeKey: `xfer|${t.id}|stuck`,
         });
       }
@@ -570,34 +671,46 @@ export class Router {
         });
         return;
       }
-      // intermediate hop done: start the next one right away
+      // intermediate hop done: persist the NEXT hop as planned before sending it
+      const hubKey = assetKey(hop.to);
       t.hop += 1;
       t.hopStartedAtMs = now;
       t.state = "planned";
+      t.ref = undefined;
       t.detail = r.detail;
-      xfers.push(this.transferEvent(t, "hop", `hop ${t.hop}/${t.path.length} reached ${assetKey(hop.to)}`, got));
+      if (t.walletSeenAtMs !== undefined) {
+        // the wallet read already holds this money in the hub bucket; it leaves with the next hop
+        debitIdle(st, hubKey, t.walletSeenUsd ?? got);
+        t.walletSeenAtMs = undefined;
+        t.walletSeenUsd = undefined;
+      }
+      xfers.push(this.transferEvent(t, "hop", `hop ${t.hop}/${t.path.length} reached ${hubKey}`, got));
+      this.d.store.save(st);
       const next = t.path[t.hop]!;
       const b = this.d.bridges?.[next.kind];
       let s: { ok: boolean; ref?: string; detail?: string };
-      try {
-        s = b ? await b.send(t) : { ok: false, detail: `no bridge executor for ${next.kind}` };
-      } catch (e) {
-        s = { ok: false, detail: `threw: ${errMsg(e)}` };
-      }
+      if (!b) s = { ok: false, detail: `no bridge executor for ${next.kind}` };
+      else
+        try {
+          s = await b.send(t);
+        } catch (e) {
+          this.markSendUnknown(st, t, next.id, `send threw: ${errMsg(e)}`, now, alerts, xfers);
+          return;
+        }
       if (s.ok) {
         t.state = "submitted";
         if (s.ref) t.ref = s.ref;
         if (s.detail) t.detail = s.detail;
         return;
       }
-      // the money now sits on the intermediate chain: book it there as idle
+      // refused: the money sits on the intermediate chain, book it there as idle
       t.state = "failed";
-      creditIdle(st, assetKey(next.from), got);
+      creditIdle(st, hubKey, got);
       xfers.push(this.transferEvent(t, "failed", s.detail, got));
       this.pauseRoute(st, next.id, now, alerts, "send refused");
       alerts.push({
         level: "critical",
-        text: `transfer ${t.id}: next hop ${next.id} could not be sent (${s.detail ?? ""}); ${usd0(got)} kept idle on ${assetKey(next.from)}`,
+        text: `transfer ${t.id}: next hop ${next.id} could not be sent (${s.detail ?? ""}); ${usd0(got)} kept idle on ${hubKey}`,
       });
       return;
     }
@@ -639,27 +752,31 @@ export class Router {
   }
 
   /**
-   * Live mode: wallet balances are read right after polling. If a final-hop
-   * transfer's destination bucket already received about the expected amount
-   * (inflow not explained by our own books) while the adapter still reports
-   * it in flight, it would be counted twice (wallet + in flight) — a fake
-   * equity peak that later looks like a drawdown. Mark it wallet-seen: it
-   * stops counting as in flight and is not credited again on completion.
+   * Live mode: the wallet snapshot is taken at the start of the cycle, before
+   * transfers are polled. If the wallet at the end of a transfer's CURRENT hop
+   * (final destination or an intermediate hub) already received about the
+   * expected amount (inflow not explained by our own books) while the hop is
+   * still in flight in our books, it would be counted twice (wallet + in
+   * flight) — a fake equity peak that later looks like a drawdown. Mark it
+   * wallet-seen: it stops counting as in flight; on completion it is not
+   * credited again (final hop) or is debited from the hub bucket when it
+   * leaves with the next hop. `read` may be partial: buckets not read are skipped.
    */
   private markWalletSeen(st: RouterState, read: Record<string, number>, now: number, xfers: TransferEvent[]) {
     const inflow: Record<string, number> = {};
     for (const [k, v] of Object.entries(read)) inflow[k] = Math.max(0, v - (st.idle[k] ?? 0));
     for (const t of st.transfers) {
-      if (isFinalTransfer(t) || t.walletSeenAtMs !== undefined || t.state === "planned") continue;
-      if (t.hop !== t.path.length - 1) continue;
+      if (isFinalTransfer(t) || t.walletSeenAtMs !== undefined || t.state === "planned" || t.sendUnknownAtMs !== undefined) continue;
       const hop = t.path[t.hop]!;
       const k = assetKey(hop.to);
+      if (!(k in inflow)) continue;
       const input = t.receivedUsd ?? t.amountUsd;
       const expected = Math.max(0, input - routeCostUsd(hop, input));
-      if (expected > 0 && (inflow[k] ?? 0) >= 0.95 * expected) {
+      if (expected > 0 && inflow[k]! >= 0.95 * expected) {
         t.walletSeenAtMs = now;
-        inflow[k] = (inflow[k] ?? 0) - expected;
-        xfers.push(this.transferEvent(t, "wallet_seen", `destination wallet shows the funds; awaiting adapter confirmation`, expected));
+        t.walletSeenUsd = expected;
+        inflow[k] = inflow[k]! - expected;
+        xfers.push(this.transferEvent(t, "wallet_seen", `${k} wallet shows the funds of hop ${t.hop + 1}/${t.path.length}; awaiting adapter confirmation`, expected));
       }
     }
   }
@@ -670,7 +787,7 @@ export class Router {
     const myEquityByOpp: Record<string, number> = {};
     for (const p of st.positions) myEquityByOpp[p.oppId] = p.equityUsd;
     const opps = new Map<string, Opportunity>();
-    const results = await Promise.allSettled(this.d.sources.map((s) => s.fetch({ cfg, nowMs: now, myEquityByOpp })));
+    const results = await Promise.allSettled(this.d.sources.map((s) => s.fetch({ cfg, nowMs: now, myEquityByOpp, history: st.history })));
     results.forEach((r, i) => {
       const src = this.d.sources[i]!;
       if (r.status === "rejected") {
@@ -869,8 +986,16 @@ export class Router {
         // Re-arm the kill switch from here: otherwise the old peak in the window
         // re-triggers it on the very next cycle.
         st.history.equity = [];
+        st.killPending = 0;
         reply = "resumed (kill-switch window reset)";
         break;
+      case "/transfer": {
+        const [id, outcome, usdArg] = c.args;
+        const r = resolveTransfer(st, id ?? "", outcome ?? "", usdArg);
+        if (r.ok) this.d.store.journal({ t: this.now(), type: "transfer_resolved", ...r.event });
+        reply = r.text;
+        break;
+      }
       case "/exit": {
         const id = c.args[0];
         if (!id || !st.positions.some((p) => p.oppId === id)) reply = `unknown position ${id ?? ""}`;
@@ -892,6 +1017,64 @@ export class Router {
     this.d.store.save(st);
     return reply;
   }
+}
+
+export type TransferOutcome = "arrived" | "failed" | "refunded";
+
+/**
+ * Operator resolution of a transfer the router cannot settle by itself (stuck,
+ * send outcome unknown, adapter lost track):
+ *   arrived  [usd]  money is at the final destination: credit that bucket
+ *                   (default: what is in flight minus the remaining hops' fees)
+ *   refunded [usd]  money is back where the current hop started: credit that
+ *                   bucket (default: what is in flight)
+ *   failed          money is gone: nothing credited
+ * The transfer leaves the books and the kill-switch equity window is reset
+ * (the books jump by whatever was wrong). Money the live wallet read already
+ * shows (wallet-seen) is not credited twice.
+ */
+export function resolveTransfer(
+  st: RouterState,
+  id: string,
+  outcome: string,
+  usdArg?: string
+): { ok: boolean; text: string; event?: Record<string, unknown> } {
+  const usage = "usage: /transfer <id> arrived|failed|refunded [usd]";
+  const t = st.transfers.find((x) => x.id === id);
+  if (!t) return { ok: false, text: `unknown transfer ${id || "(none)"}; ${usage}` };
+  if (outcome !== "arrived" && outcome !== "failed" && outcome !== "refunded") return { ok: false, text: usage };
+  let usd: number | undefined;
+  if (usdArg !== undefined) {
+    usd = Number(usdArg);
+    if (!(Number.isFinite(usd) && usd >= 0)) return { ok: false, text: `invalid usd "${usdArg}"; ${usage}` };
+  }
+  const hop = t.path[t.hop] ?? t.path[t.path.length - 1]!;
+  const input = t.receivedUsd ?? t.amountUsd;
+  const lastHop = t.path[t.path.length - 1]!;
+  const seenKey = t.walletSeenAtMs !== undefined ? assetKey(hop.to) : undefined;
+  let credited = 0;
+  let bucket: string | undefined;
+  if (outcome === "arrived") {
+    bucket = assetKey(lastHop.to);
+    const fees = t.path.slice(t.hop).reduce((a, r) => a + routeCostUsd(r, input), 0);
+    credited = usd ?? Math.max(0, input - fees);
+    if (seenKey === bucket) credited = 0; // the wallet read already holds it
+    else if (seenKey) debitIdle(st, seenKey, t.walletSeenUsd ?? 0); // it left the hub
+  } else if (outcome === "refunded") {
+    bucket = assetKey(hop.from);
+    credited = usd ?? input;
+    if (seenKey) debitIdle(st, seenKey, t.walletSeenUsd ?? 0);
+  } else if (seenKey) debitIdle(st, seenKey, t.walletSeenUsd ?? 0);
+  if (bucket && credited > 0) creditIdle(st, bucket, credited);
+  st.transfers = st.transfers.filter((x) => x !== t);
+  st.history.equity = []; // the books jump: re-arm the kill-switch window from here
+  st.killPending = 0;
+  const event = { id: t.id, outcome, creditedUsd: credited, bucket, amountUsd: t.amountUsd, hop: t.hop };
+  return {
+    ok: true,
+    event,
+    text: `transfer ${t.id} resolved as ${outcome}${bucket ? `: $${Math.round(credited)} credited to ${bucket}` : ": nothing credited"} (kill-switch window reset)`,
+  };
 }
 
 function urgency(actions: Action[]): number {

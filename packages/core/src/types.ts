@@ -69,8 +69,21 @@ export interface Leg {
 export interface LiquidityView {
   exitCapacityUsd: number;
   footprintPerEquity: number;
-  /** true when the capacity is a guess (discovery sources). */
+  /** true when the capacity is a guess (discovery sources) or reuses an earlier quote. */
   estimated?: boolean;
+  /**
+   * Which limit sets exitCapacityUsd when a source has several (loop pairs:
+   * pool liquidity vs swap depth). Liquidity exits driven by swap depth (a
+   * quote that can fail or flicker) need confirm_cycles; pool-driven ones stay
+   * immediate.
+   */
+  binding?: "pool" | "swap";
+  /**
+   * The source reused a recent swap quote (or a conservative fallback)
+   * because this cycle's probe failed. Entries are blocked (flag
+   * swap_quote_unknown); exits use the capacity without the estimate haircut.
+   */
+  reusedQuote?: boolean;
 }
 
 /** A level-type risk signal reported by the source (utilization, basis ...). */
@@ -175,7 +188,12 @@ export interface Position {
   openedAtMs: number;
   lastActionAtMs: number;
   rewards: Record<string, RewardState>;
-  exitProbe: { lastOkAtMs: number | null; consecutiveFailures: number };
+  /**
+   * consecutiveFailures counts simulations that returned false (the exit path
+   * does not work); consecutiveErrors counts simulations that could not run
+   * (RPC error) — those never trigger an exit.
+   */
+  exitProbe: { lastOkAtMs: number | null; consecutiveFailures: number; consecutiveErrors?: number };
   /** Debounce counters for non-urgent exit reasons. */
   pending: Record<string, number>;
   /** When each debounced reason was first seen (time-based debounce). */
@@ -187,7 +205,7 @@ export interface Position {
    * retried every cycle until the position is gone, even if the trigger
    * (a one-cycle spike, a kill switch, a manual /exit) is no longer present.
    */
-  forcedExit?: { reason: string; urgent: boolean; sinceMs: number };
+  forcedExit?: { reason: string; urgent: boolean; sinceMs: number; cause?: ExitCause };
   /** Idle bucket (`chain:asset`) that funded the position; exit and reward proceeds go back there. */
   fundingAsset?: { chain: string; asset: string };
 }
@@ -202,7 +220,7 @@ export type Action =
       /** Set when idle is split per chain:asset: where the money comes from (non-empty path = bridge first). */
       funding?: FundingQuote;
     }
-  | { type: "exit"; oppId: string; fraction: number; urgent: boolean; reason: string }
+  | { type: "exit"; oppId: string; fraction: number; urgent: boolean; reason: string; cause?: ExitCause }
   | { type: "rebalance"; oppId: string; reason: string }
   | { type: "claim"; oppId: string; token: string; amountUsd: number; reason: string }
   | { type: "sell"; oppId: string; token: string; amountUsd: number; reason: string }
@@ -211,6 +229,13 @@ export type Action =
   | { type: "alert"; level: AlertLevel; message: string; dedupeKey?: string };
 
 export type AlertLevel = "info" | "warn" | "critical";
+
+/**
+ * Exits whose latch is cleared if the trigger goes away before the exit
+ * executed: missing data (blind) and failed exit simulations. Everything else
+ * (kill switch, manual, flags, liquidity) stays latched until done.
+ */
+export type ExitCause = "blind" | "probe";
 
 /** Market data about a reward token, used by the haircut model. */
 export interface TokenProfile {

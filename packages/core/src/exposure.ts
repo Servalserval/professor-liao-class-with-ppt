@@ -106,5 +106,7 @@ export function capViolations(cfg: RouterConfig, after: Exposure, opp: Opportuni
     r.push(`speculative budget ${pct(cfg.points.budget_frac)} exceeded`);
   if (after.totalDeployedUsd / totalEquityUsd > 1 - c.min_idle_frac + 1e-9)
     r.push(`would leave less than ${pct(c.min_idle_frac)} idle`);
+  if (c.max_total_deployed_usd !== undefined && after.totalDeployedUsd > c.max_total_deployed_usd + 1e-6)
+    r.push(`total deployed $${Math.round(after.totalDeployedUsd)} > max_total_deployed_usd $${Math.round(c.max_total_deployed_usd)}`);
   return r;
 }
