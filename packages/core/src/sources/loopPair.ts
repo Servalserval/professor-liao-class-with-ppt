@@ -52,6 +52,13 @@ export interface LoopPair {
   myLtv?: number;
   /** Block / API time the data was read at. */
   dataAsOfMs?: number;
+  /**
+   * Expected debt/collateral price ratio (debt.priceUsd / collateral.priceUsd)
+   * when nothing is depegged. Default 1 (two stablecoins). For yield-bearing
+   * collateral (sUSDe vs USDC) pass the protocol oracle ratio, so the depeg
+   * signal measures the MARKET ratio against it instead of against 1.
+   */
+  expectedPriceRatio?: number;
 }
 
 export function isSameAsset(p: LoopPair): boolean {
@@ -134,7 +141,9 @@ export function loopPairOpportunity(
     fin(r.apr) &&
     (r.perUserCapUsd === undefined || (fin(r.perUserCapUsd) && r.perUserCapUsd >= 0)) &&
     optOk(r.maxHealthFactor) &&
-    (r.netOf === undefined || Array.isArray(r.netOf));
+    (r.netOf === undefined || Array.isArray(r.netOf)) &&
+    (r.ineligibleIfBorrowing === undefined || Array.isArray(r.ineligibleIfBorrowing)) &&
+    (r.aprCap === undefined || (fin(r.aprCap) && r.aprCap >= 0));
   if (!C.supplyRewards.every(rewardOk) || !D.borrowRewards.every(rewardOk)) return null;
   if (!same && (!marketOk(D) || !fin(C.priceUsd) || !(C.priceUsd > 0) || !fin(D.priceUsd) || !(D.priceUsd > 0))) return null;
 
@@ -185,7 +194,7 @@ export function loopPairOpportunity(
     const base = proRataStream({
       label,
       kind: "reward",
-      aprNow: r.apr,
+      aprNow: r.aprCap !== undefined ? Math.min(r.apr, r.aprCap) : r.apr,
       poolUsd: side === "supply" ? S_c : B_d,
       grossPerEquity: g,
       myEquityNowUsd: myE,
@@ -199,9 +208,13 @@ export function loopPairOpportunity(
     if (hfIneligible) notes.push(`hf_${hf.toFixed(3)}_above_max_${r.maxHealthFactor}`);
     const cap = r.perUserCapUsd;
     if (cap !== undefined) notes.push(`per_user_cap_usd_${cap}`);
+    const debtIds = [D.assetId, D.symbol].filter((x): x is string => !!x).map((x) => x.toLowerCase());
+    const borrowIneligible = !!r.ineligibleIfBorrowing?.some((x) => debtIds.includes(x.toLowerCase()));
+    if (borrowIneligible) notes.push(`ineligible_borrowing_${D.symbol}`);
+    if (r.aprCap !== undefined && r.apr > r.aprCap) notes.push(`apr_capped_${r.aprCap}`);
     if (notes.length) rewardNotes[label] = notes;
 
-    if ((side === "borrow" && net) || hfIneligible || cap === 0) return { ...base, aprAt: () => 0 };
+    if ((side === "borrow" && net) || hfIneligible || borrowIneligible || cap === 0) return { ...base, aprAt: () => 0 };
     if (cap === undefined) return base;
     return {
       ...base,
@@ -224,7 +237,8 @@ export function loopPairOpportunity(
     exitAt,
     direction: "above",
   });
-  const depeg = same ? 0 : Math.abs(D.priceUsd / C.priceUsd - 1);
+  const expRatio = pair.expectedPriceRatio !== undefined && fin(pair.expectedPriceRatio) && pair.expectedPriceRatio > 0 ? pair.expectedPriceRatio : 1;
+  const depeg = same ? 0 : Math.abs(D.priceUsd / C.priceUsd / expRatio - 1);
   const signalsAt = (uc: number, ud: number): StressSignal[] =>
     same
       ? [sig("utilization", uc, ll.utilization_warn, ll.utilization_exit)]

@@ -190,3 +190,32 @@ describe("RewardKeeper", () => {
     assert.ok(dry.length > 0 && dry.every((x) => x === true), "shadow simulates only");
   });
 });
+
+describe("PairRegistry depeg reference", () => {
+  const leg = (symbol: string, priceUsd: number) => ({
+    symbol,
+    priceUsd,
+    totalSupplyUsd: 1e8,
+    totalBorrowUsd: 5e7,
+    supplyAprBase: 0.05,
+    borrowAprBase: 0.04,
+    supplyRewards: [],
+    borrowRewards: [],
+  });
+  const SUSDE = A("ethereum", "sUSDe", "0x03", 18);
+  const USDC = A("ethereum", "USDC", "0x04");
+  const pair: LoopPair = { protocol: "morpho:ethereum", chain: "ethereum", pairId: "m1", collateral: leg("sUSDe", 1.17), debt: leg("USDC", 1), maxLtv: 0.86, liqLtv: 0.915, swapCostFrac: 0.0003, swapDepthUsd: 5e6 };
+  const adapter = { id: "morpho:ethereum", chain: "ethereum", markets: async () => [pair] } as unknown as LendingAdapter;
+  const market = async (a: AssetRef) => (a.symbol === "sUSDe" ? 1.168 : 1);
+  it("stable default (1:1) flags a yield-bearing pair; 'oracle' measures market vs oracle", async () => {
+    const run = async (expectedPriceRatio?: number | "oracle") => {
+      const reg = new PairRegistry({ marketPrice: market, log: () => {} });
+      const src = reg.source(adapter, [{ pairId: "m1", collateral: SUSDE, debt: USDC, expectedPriceRatio }]);
+      const [o] = await src.fetch({ cfg: DEFAULT_CONFIG as RouterConfig, nowMs: 1, myEquityByOpp: {} });
+      return (o!.metrics as Record<string, number>).depeg!;
+    };
+    assert.ok((await run()) > 0.1, "1:1 reference: sUSDe looks depegged (would force exit)");
+    const d = await run("oracle");
+    assert.ok(Math.abs(d - (1.17 / 1.168 - 1)) < 1e-9, `market vs oracle ratio, got ${d}`);
+  });
+});

@@ -17,6 +17,13 @@ export interface PairWiring {
   pairId: string;
   collateral: AssetRef;
   debt: AssetRef;
+  /**
+   * Expected debt/collateral price ratio for the depeg signal. Default 1 (two
+   * stablecoins: any market deviation from 1:1 is a depeg). "oracle" = use the
+   * protocol's own price ratio — ONLY for yield-bearing collateral (sUSDe ...),
+   * since an oracle that follows the market would otherwise hide a real depeg.
+   */
+  expectedPriceRatio?: number | "oracle";
 }
 
 export interface PairRegistryDeps {
@@ -69,7 +76,13 @@ export class PairRegistry {
     const collateral = { ...p.collateral, priceUsd: await px(w.collateral, p.collateral.priceUsd) };
     const debt =
       p.debt === p.collateral ? collateral : { ...p.debt, priceUsd: await px(w.debt, p.debt.priceUsd) };
-    return { ...p, collateral, debt };
+    const out: LoopPair = { ...p, collateral, debt };
+    if (w.expectedPriceRatio === "oracle") {
+      const r = p.debt.priceUsd / p.collateral.priceUsd;
+      if (Number.isFinite(r) && r > 0) out.expectedPriceRatio = r;
+    } else if (typeof w.expectedPriceRatio === "number") out.expectedPriceRatio = w.expectedPriceRatio;
+    else delete out.expectedPriceRatio; // stable pair: 1:1 is the only acceptable ratio
+    return out;
   }
 
   /**

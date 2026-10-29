@@ -21,6 +21,8 @@ export interface PairSpec {
   marketId?: string;
   /** Suilend / Navi: market name */
   market?: string;
+  /** Depeg reference: default 1 (stable pair); "oracle" only for yield-bearing collateral. */
+  expected_price_ratio?: number | "oracle";
 }
 
 export interface LendingSpec {

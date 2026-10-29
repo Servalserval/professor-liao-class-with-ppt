@@ -65,7 +65,20 @@ export class SwapRouteAdapter implements BridgeAdapter {
     const max = this.d.maxCostBps(from, to);
     if (!(q.costBps <= max)) return { ok: false, txs: [], detail: `swap cost ${q.costBps.toFixed(2)} bps > allowed ${max} bps; not swapping` };
     const before = await this.d.balance(to);
-    const r = await sw.swap(q, from, to, ctx);
+    let r: LiveResult;
+    try {
+      r = await sw.swap(q, from, to, ctx);
+    } catch (e) {
+      // Core contract: never throw once something may have been broadcast.
+      // Look at the wallet: if the output arrived, report success.
+      if (ctx.dryRun) return { ok: false, txs: [], detail: `swap simulation failed: ${(e as Error).message}` };
+      const after = await this.d.balance(to).catch(() => before);
+      if (after > before) {
+        const h: Handle = { chain: from.chain, to: to.symbol, received: (after - before).toString(), simulated: false };
+        return { ok: true, txs: [], handle: JSON.stringify(h), detail: `swap error after broadcast (${(e as Error).message}) but output arrived` };
+      }
+      return { ok: false, txs: [], detail: `swap failed: ${(e as Error).message}` };
+    }
     if (!r.ok) return { ...r, ok: false };
     let received: bigint;
     if (ctx.dryRun) received = q.amountOut;

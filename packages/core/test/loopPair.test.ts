@@ -495,6 +495,24 @@ describe("loopPair: reward eligibility (netOf / perUserCapUsd / maxHealthFactor)
     assert.ok(stream(loopOpportunity(market({ supplyRewards: [{ token: "ENA", apr: 0.05, maxHealthFactor: 1.36 }] }), sctx(), "s")!, "supply_reward:ENA").aprAt(1e5) > 0);
   });
 
+  it("ineligibleIfBorrowing (address or symbol) zeroes the reward; aprCap caps it", () => {
+    const debtAddr = "0xDeBt000000000000000000000000000000000001";
+    const mk = (r: RewardRate) =>
+      pair({
+        collateral: leg("USDe", { totalSupplyUsd: S_C, totalBorrowUsd: 30e6, supplyRewards: [r] }),
+        debt: leg("USDT", { totalSupplyUsd: 40e6, totalBorrowUsd: B_D, assetId: debtAddr }),
+      });
+    for (const bad of [[debtAddr.toLowerCase()], ["usdt"], ["0xother", debtAddr]]) {
+      const o = loopPairOpportunity(mk({ token: "USDe", apr: 0.05, ineligibleIfBorrowing: bad }), sctx(), "s")!;
+      assert.equal(stream(o, "supply_reward:USDe").aprAt(1e5), 0, String(bad));
+    }
+    const fine = loopPairOpportunity(mk({ token: "USDe", apr: 0.05, ineligibleIfBorrowing: ["usde"] }), sctx(), "s")!;
+    assert.ok(stream(fine, "supply_reward:USDe").aprAt(1e5) > 0, "borrowing USDT, not USDe: eligible");
+    const capped = loopPairOpportunity(mk({ token: "USDe", apr: 0.09, aprCap: 0.055 }), sctx(), "s")!;
+    assert.ok(close(stream(capped, "supply_reward:USDe").aprAt(0), 0.055 * L70));
+    assert.equal(loopPairOpportunity(mk({ token: "USDe", apr: 0.05, aprCap: Number.NaN }), sctx(), "s"), null);
+  });
+
   it("combined fields + validation; plain rewards untouched; bad reward fields -> null", () => {
     const o = loopPairOpportunity(
       withRewards([{ token: "A", apr: 0.05, netOf: ["*"], perUserCapUsd: 5e4, maxHealthFactor: 2 }, { token: "P", apr: 0.03 }], [{ token: "B", apr: 0.02, netOf: ["*"] }]),

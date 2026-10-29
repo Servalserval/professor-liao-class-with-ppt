@@ -35,6 +35,14 @@ export interface RewardRate {
    * Leverage": HF <= 2, i.e. you must loop). For a loop HF = liqLtv / ltv.
    */
   maxHealthFactor?: number;
+  /**
+   * Borrowing any of these makes the position ineligible (Ethena campaigns:
+   * borrowing USDe voids the USDe supply reward). Entries are token addresses
+   * (matched case-insensitively against the debt leg's assetId) or symbols.
+   */
+  ineligibleIfBorrowing?: string[];
+  /** Campaign APR cap (target-APR campaigns); the stream never exceeds it. */
+  aprCap?: number;
 }
 
 /** Protocol-agnostic view of ONE same-asset lending market. */
