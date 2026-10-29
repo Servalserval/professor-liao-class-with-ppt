@@ -16,10 +16,19 @@ import {
   recordTokenPrice,
 } from "./signals.js";
 import type { Source } from "./sources/types.js";
-import type { RouterState, Store } from "./store.js";
+import { bucketMode, creditIdle, debitIdle, setIdleBuckets, type RouterState, type Store } from "./store.js";
 import type { Action, AlertLevel, Opportunity, Position, TokenProfile } from "./types.js";
 import { validateOpportunity } from "./validate.js";
 import { valueAt } from "./valuation.js";
+import {
+  FundingPlanner,
+  fundingTarget,
+  inFlightTotalUsd,
+  isFinalTransfer,
+  positionFundingAsset,
+} from "./xchain/planner.js";
+import { assetKey, routeCostUsd } from "./xchain/routes.js";
+import type { BridgeExecutor, BridgePollResult, InFlightTransfer } from "./xchain/types.js";
 
 const HOUR = 3600_000;
 const YEAR_MS = 365 * 24 * HOUR;
@@ -35,8 +44,29 @@ export interface RouterDeps {
   now?: () => number;
   /** Paper mode: accrue PnL and rewards from valuations between cycles. */
   paperAccrual?: boolean;
-  /** Live mode hook: authoritative idle USD (wallet balances). */
+  /** Live mode hook: authoritative idle USD (wallet balances). Legacy single-bucket mode only. */
   idleUsd?: () => Promise<number>;
+  /** Bridge executor per RouteKind (cross-chain funding). */
+  bridges?: Record<string, BridgeExecutor>;
+  /**
+   * Live mode hook: idle USD per `chain:asset` wallet bucket. When given it
+   * overrides `state.idle` every cycle (and idleUsd = its sum); money in
+   * flight is tracked by the router, not by this read.
+   */
+  idleBalances?: () => Promise<Record<string, number>>;
+}
+
+/** What happened to cross-chain transfers this cycle (also journaled). */
+export interface TransferEvent {
+  kind: "sent" | "send_failed" | "hop" | "arrived" | "failed" | "refunded" | "stuck" | "wallet_seen";
+  id: string;
+  forOppId?: string;
+  amountUsd: number;
+  costUsd?: number;
+  from: string;
+  to: string;
+  route: string;
+  detail?: string;
 }
 
 interface Alert {
@@ -56,15 +86,26 @@ export interface CycleReport {
   nowMs: number;
   totalEquityUsd: number;
   idleUsd: number;
+  /** Idle per chain:asset (empty in legacy single-bucket mode). */
+  idle: Record<string, number>;
+  /** USD on bridges (counted in totalEquityUsd). */
+  inFlightUsd: number;
   opportunities: number;
   sourceErrors: string[];
   executed: ExecutedAction[];
+  /** Cross-chain transfer events (sent / arrived / failed / stuck ...). */
+  transfers: TransferEvent[];
+  /** Why opportunities got no (more) money this cycle (allocation ran only). */
+  allocationRejected?: Record<string, string[]>;
   killed: boolean;
 }
 
 type ExitAction = Extract<Action, { type: "exit" }>;
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const usd0 = (x: number) => `$${Math.round(x).toLocaleString("en-US")}`;
+const routeName = (t: { path: { id: string }[] }) => t.path.map((r) => r.id).join(">");
+const finiteNonNeg = (x: number | undefined) => (x !== undefined && Number.isFinite(x) && x >= 0 ? x : undefined);
 
 /** Never let one adapter call take the whole cycle (and its state save) down. */
 async function safe(p: () => Promise<ExecResult>): Promise<ExecResult> {
@@ -95,10 +136,15 @@ export class Router {
     const executed: ExecutedAction[] = [];
     const alerts: Alert[] = [];
     const sourceErrors: string[] = [];
+    const xfers: TransferEvent[] = [];
+    let allocationRejected: Record<string, string[]> | undefined;
     let opps = new Map<string, Opportunity>();
 
+    // Money on a bridge is still ours: it counts in equity, so a move never
+    // looks like a drawdown to the kill switch.
     const totalEquity = () =>
       st.idleUsd +
+      inFlightTotalUsd(st.transfers) +
       st.positions.reduce(
         (a, p) => a + p.equityUsd + Object.values(p.rewards).reduce((b, r) => b + r.unclaimedUsd + r.heldUsd, 0),
         0
@@ -139,13 +185,37 @@ export class Router {
           alerts.push({ level: "warn", text: `${p.oppId}: mark-to-market failed (${errMsg(e)})`, dedupeKey: `${p.oppId}|mtm` });
         }
       }
-      if (this.d.idleUsd) {
+      // --- cross-chain transfers: poll BEFORE reading wallets, so a completed
+      //     transfer is never both in flight and in the wallet balance ------------
+      st.frictionLedger = st.frictionLedger.filter((e) => e.t > now - 48 * HOUR);
+      if (st.transfers.length) await this.pollTransfers(st, now, alerts, xfers);
+
+      if (this.d.idleBalances) {
         try {
-          const v = await this.d.idleUsd();
-          if (Number.isFinite(v)) st.idleUsd = v;
+          const m = await this.d.idleBalances();
+          const bad = Object.entries(m).filter(([k, v]) => !Number.isFinite(v) || v < 0 || !/^[^:]+:.+$/.test(k));
+          if (bad.length) throw new Error(`invalid balances for ${bad.map(([k]) => k).join(", ")}`);
+          // buckets missing from the read are empty, not unknown: keep bucket mode stable
+          const read: Record<string, number> = { ...Object.fromEntries(Object.keys(st.idle).map((k) => [k, 0])), ...m };
+          this.markWalletSeen(st, read, now, xfers);
+          setIdleBuckets(st, read);
         } catch (e) {
-          alerts.push({ level: "warn", text: `idle balance read failed (${errMsg(e)}); keeping last value`, dedupeKey: "idle|read" });
+          alerts.push({ level: "warn", text: `idle balances read failed (${errMsg(e)}); keeping last values`, dedupeKey: "idle|read" });
         }
+      } else if (this.d.idleUsd) {
+        if (bucketMode(st))
+          alerts.push({
+            level: "warn",
+            text: "idleUsd hook ignored: idle is split per chain:asset (wire idleBalances instead)",
+            dedupeKey: "idle|hook",
+          });
+        else
+          try {
+            const v = await this.d.idleUsd();
+            if (Number.isFinite(v)) st.idleUsd = v;
+          } catch (e) {
+            alerts.push({ level: "warn", text: `idle balance read failed (${errMsg(e)}); keeping last value`, dedupeKey: "idle|read" });
+          }
       }
       recordEquity(st.history, totalEquity(), now, keep);
 
@@ -247,23 +317,50 @@ export class Router {
         executed.some((x) => x.action.type === "exit" && x.action.urgent);
       if (urgentExit && !st.paused) alerts.push({ level: "info", text: "allocation skipped this cycle: urgent exit in progress" });
       if (!st.paused && !urgentExit) {
-        const plan = planAllocation([...opps.values()], ctx());
+        if (cfg.xchain.enabled && !bucketMode(st) && st.idleUsd > 0)
+          alerts.push({
+            level: "warn",
+            text: "xchain.enabled but idle is not split per chain:asset — single-bucket mode, no cross-chain moves",
+            dedupeKey: "xchain|legacy",
+          });
+        const c = ctx();
+        // Idle split per chain:asset -> every chunk is funded through the planner
+        // (local money is free; a move must pass the friction rules).
+        if (bucketMode(st))
+          c.funding = new FundingPlanner({
+            cfg,
+            nowMs: now,
+            idle: st.idle,
+            ledger: st.frictionLedger,
+            transfers: st.transfers,
+            totalEquityUsd: c.totalEquityUsd,
+            bookYieldPerYearUsd: bookYieldPerYear(st.positions, opps, c),
+            pausedRouteIds: pausedRoutes(st, now),
+          });
+        const plan = planAllocation([...opps.values()], c);
+        allocationRejected = plan.rejected;
         for (const e of plan.entries) {
           const opp = opps.get(e.oppId)!;
           const ex = this.d.executors[opp.sourceId];
           if (!ex) continue;
+          if (e.funding && e.funding.path.length > 0) {
+            // the money is elsewhere: move it first; the allocator deploys it once it arrives
+            await this.startTransfer(st, opp, e, alerts, xfers, now);
+            continue;
+          }
           const r = await safe(() => ex.enter(opp, e.deltaUsd));
           executed.push({ action: e, ok: r.ok, detail: r.detail });
           if (!r.ok) {
             alerts.push({ level: "warn", text: `enter FAILED ${e.oppId}: ${r.detail ?? ""}` });
             continue;
           }
-          st.idleUsd -= r.spentUsd ?? e.deltaUsd;
+          const srcKey = assetKey(e.funding?.source ?? fundingTarget(opp));
+          debitIdle(st, srcKey, r.spentUsd ?? e.deltaUsd);
           upsertPosition(st, opp, r.amountUsd ?? e.deltaUsd, now);
           this.d.store.save(st);
           alerts.push({
             level: "info",
-            text: `ENTER ${e.oppId} +$${Math.round(e.deltaUsd)} net ${(e.netApr * 100).toFixed(2)}% (marginal ${(e.marginalApr * 100).toFixed(2)}%)`,
+            text: `ENTER ${e.oppId} +$${Math.round(e.deltaUsd)} net ${(e.netApr * 100).toFixed(2)}% (marginal ${(e.marginalApr * 100).toFixed(2)}%)${bucketMode(st) ? ` from ${srcKey}` : ""}`,
           });
         }
       }
@@ -271,6 +368,7 @@ export class Router {
       st.lastCycleAtMs = now;
       this.d.store.save(st);
       for (const x of executed) this.d.store.journal({ t: now, ...x.action, ok: x.ok, detail: x.detail });
+      for (const x of xfers) this.d.store.journal({ t: now, type: "transfer", ...x });
     }
 
     await this.sendAlerts(st, alerts, now);
@@ -280,11 +378,290 @@ export class Router {
       nowMs: now,
       totalEquityUsd: totalEquity(),
       idleUsd: st.idleUsd,
+      idle: { ...st.idle },
+      inFlightUsd: inFlightTotalUsd(st.transfers),
       opportunities: opps.size,
       sourceErrors,
       executed,
+      transfers: xfers,
+      allocationRejected,
       killed: st.killed,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-chain transfers
+  // -------------------------------------------------------------------------
+
+  /** Book the move, then send hop 0. A failed send leaves the money idle where it was. */
+  private async startTransfer(
+    st: RouterState,
+    opp: Opportunity,
+    e: Extract<Action, { type: "enter" }>,
+    alerts: Alert[],
+    xfers: TransferEvent[],
+    now: number
+  ): Promise<void> {
+    const q = e.funding!;
+    const first = q.path[0]!;
+    const lastHop = q.path[q.path.length - 1]!;
+    const srcKey = assetKey(q.source ?? first.from);
+    const dstKey = assetKey(q.target ?? lastHop.to);
+    const route = routeName(q);
+    if (!this.d.cfg.xchain.enabled) return; // the planner never plans moves then; belt and braces
+    const bridge = this.d.bridges?.[first.kind];
+    if (!bridge) {
+      alerts.push({
+        level: "critical",
+        text: `no bridge executor for ${first.kind}: cannot move ${usd0(e.deltaUsd)} ${srcKey} -> ${dstKey} for ${opp.id}; money stays idle on ${srcKey}`,
+        dedupeKey: `bridge|${first.kind}|noexec`,
+      });
+      return;
+    }
+    const t: InFlightTransfer = {
+      id: `xf-${now}-${e.oppId}-${srcKey}`,
+      forOppId: e.oppId,
+      path: q.path,
+      hop: 0,
+      amountUsd: e.deltaUsd,
+      costUsd: q.costUsd,
+      state: "planned",
+      createdAtMs: now,
+      updatedAtMs: now,
+      hopStartedAtMs: now,
+    };
+    const ev = (kind: TransferEvent["kind"], detail?: string): TransferEvent => ({
+      kind,
+      id: t.id,
+      forOppId: t.forOppId,
+      amountUsd: t.amountUsd,
+      costUsd: t.costUsd,
+      from: srcKey,
+      to: dstKey,
+      route,
+      detail,
+    });
+    // Books first, side effect second: a crash during send leaves a tracked
+    // transfer (polled, flagged stuck if it never lands), never vanished money.
+    debitIdle(st, srcKey, t.amountUsd);
+    st.transfers.push(t);
+    this.d.store.save(st);
+    let r: { ok: boolean; ref?: string; detail?: string };
+    let threw = false;
+    try {
+      r = await bridge.send(t);
+    } catch (err) {
+      threw = true;
+      r = { ok: false, detail: `threw: ${errMsg(err)}` };
+    }
+    if (!r.ok) {
+      st.transfers = st.transfers.filter((x) => x !== t);
+      creditIdle(st, srcKey, t.amountUsd);
+      alerts.push({
+        level: "critical",
+        text: `bridge send FAILED ${usd0(t.amountUsd)} ${srcKey} -> ${dstKey} via ${route} for ${opp.id}: ${r.detail ?? ""} — kept idle on ${srcKey}${threw ? " (send threw: verify on-chain that nothing left the wallet)" : ""}`,
+      });
+      xfers.push(ev("send_failed", r.detail));
+      this.pauseRoute(st, first.id, now, alerts, "send refused");
+      this.d.store.save(st);
+      return;
+    }
+    t.state = "submitted";
+    t.ref = r.ref;
+    t.detail = r.detail;
+    st.frictionLedger.push({ t: now, costUsd: q.costUsd, transferId: t.id });
+    this.d.store.save(st);
+    xfers.push(ev("sent", r.detail));
+    alerts.push({
+      level: "info",
+      text: `BRIDGE ${usd0(t.amountUsd)} ${srcKey} -> ${dstKey} via ${route} for ${opp.id}: cost $${q.costUsd.toFixed(2)}, eta ${q.etaMinutes} min`,
+    });
+  }
+
+  /** Poll every unfinished transfer; credit arrivals / refunds; flag stuck hops. Never resends a stuck hop. */
+  private async pollTransfers(st: RouterState, now: number, alerts: Alert[], xfers: TransferEvent[]): Promise<void> {
+    const x = this.d.cfg.xchain;
+    for (const t of st.transfers) {
+      if (isFinalTransfer(t)) continue;
+      const wasStuck = t.state === "stuck";
+      const hop0 = t.path[t.hop];
+      if (!hop0) {
+        t.state = "failed";
+        alerts.push({ level: "critical", text: `transfer ${t.id}: invalid hop ${t.hop} — removed from the books, check by hand` });
+        continue;
+      }
+      const bridge = this.d.bridges?.[hop0.kind];
+      if (!bridge) {
+        alerts.push({
+          level: "critical",
+          text: `transfer ${t.id}: no bridge executor for ${hop0.kind}; cannot track ${usd0(t.amountUsd)}`,
+          dedupeKey: `xfer|${t.id}|noexec`,
+        });
+      } else {
+        let r: BridgePollResult | null = null;
+        try {
+          r = await bridge.poll(t);
+        } catch (e) {
+          alerts.push({ level: "warn", text: `transfer ${t.id}: poll failed (${errMsg(e)})`, dedupeKey: `xfer|${t.id}|poll` });
+        }
+        if (r) await this.applyPoll(st, t, r, now, alerts, xfers);
+      }
+      if (isFinalTransfer(t)) continue;
+      const hop = t.path[t.hop]!;
+      const started = t.hopStartedAtMs ?? t.createdAtMs;
+      const limitMin = Math.max(x.stuck_min_minutes, hop.etaMinutes * x.stuck_eta_multiple);
+      const overdue = now - started > limitMin * 60_000;
+      if (overdue || t.state === "stuck") {
+        t.state = "stuck";
+        if (!wasStuck) {
+          xfers.push(this.transferEvent(t, "stuck", t.detail));
+          this.pauseRoute(st, hop.id, now, alerts, "transfer stuck");
+        }
+        alerts.push({
+          level: "critical",
+          text: `transfer ${t.id} STUCK: hop ${t.hop + 1}/${t.path.length} ${hop.id} (${usd0(t.receivedUsd ?? t.amountUsd)}) not done after ${Math.round((now - started) / 60_000)} min (eta ${hop.etaMinutes}); NOT resent automatically — check ${t.ref ?? "the bridge"} by hand`,
+          dedupeKey: `xfer|${t.id}|stuck`,
+        });
+      }
+      this.d.store.save(st);
+    }
+    if (st.transfers.some(isFinalTransfer)) st.transfers = st.transfers.filter((t) => !isFinalTransfer(t));
+    this.d.store.save(st);
+  }
+
+  private transferEvent(t: InFlightTransfer, kind: TransferEvent["kind"], detail?: string, amountUsd?: number): TransferEvent {
+    return {
+      kind,
+      id: t.id,
+      forOppId: t.forOppId,
+      amountUsd: amountUsd ?? t.amountUsd,
+      costUsd: t.costUsd,
+      from: assetKey(t.path[0]!.from),
+      to: assetKey(t.path[t.path.length - 1]!.to),
+      route: routeName(t),
+      detail,
+    };
+  }
+
+  private async applyPoll(
+    st: RouterState,
+    t: InFlightTransfer,
+    r: BridgePollResult,
+    now: number,
+    alerts: Alert[],
+    xfers: TransferEvent[]
+  ): Promise<void> {
+    if (r.ref) t.ref = r.ref;
+    t.updatedAtMs = now;
+    const hop = t.path[t.hop]!;
+    const input = t.receivedUsd ?? t.amountUsd;
+    const last = t.hop === t.path.length - 1;
+    if (r.state === "completed") {
+      const got = finiteNonNeg(r.receivedUsd) ?? Math.max(0, input - routeCostUsd(hop, input));
+      t.receivedUsd = got;
+      if (last) {
+        t.state = "completed";
+        // already inside the wallet read (live): crediting again would double count
+        if (t.walletSeenAtMs === undefined) creditIdle(st, assetKey(hop.to), got);
+        xfers.push(this.transferEvent(t, "arrived", r.detail, got));
+        alerts.push({
+          level: "info",
+          text: `ARRIVED ${usd0(got)} on ${assetKey(hop.to)} (${t.id}${t.forOppId ? ` for ${t.forOppId}` : ""}); deployed by the allocator`,
+        });
+        return;
+      }
+      // intermediate hop done: start the next one right away
+      t.hop += 1;
+      t.hopStartedAtMs = now;
+      t.state = "planned";
+      t.detail = r.detail;
+      xfers.push(this.transferEvent(t, "hop", `hop ${t.hop}/${t.path.length} reached ${assetKey(hop.to)}`, got));
+      const next = t.path[t.hop]!;
+      const b = this.d.bridges?.[next.kind];
+      let s: { ok: boolean; ref?: string; detail?: string };
+      try {
+        s = b ? await b.send(t) : { ok: false, detail: `no bridge executor for ${next.kind}` };
+      } catch (e) {
+        s = { ok: false, detail: `threw: ${errMsg(e)}` };
+      }
+      if (s.ok) {
+        t.state = "submitted";
+        if (s.ref) t.ref = s.ref;
+        if (s.detail) t.detail = s.detail;
+        return;
+      }
+      // the money now sits on the intermediate chain: book it there as idle
+      t.state = "failed";
+      creditIdle(st, assetKey(next.from), got);
+      xfers.push(this.transferEvent(t, "failed", s.detail, got));
+      this.pauseRoute(st, next.id, now, alerts, "send refused");
+      alerts.push({
+        level: "critical",
+        text: `transfer ${t.id}: next hop ${next.id} could not be sent (${s.detail ?? ""}); ${usd0(got)} kept idle on ${assetKey(next.from)}`,
+      });
+      return;
+    }
+    if (r.state === "failed") {
+      t.state = "failed";
+      t.detail = r.detail;
+      const refund = finiteNonNeg(r.refundedUsd) ?? 0;
+      if (refund > 0 && t.walletSeenAtMs === undefined) creditIdle(st, assetKey(hop.from), refund);
+      xfers.push(this.transferEvent(t, refund > 0 ? "refunded" : "failed", r.detail, refund > 0 ? refund : input));
+      this.pauseRoute(st, hop.id, now, alerts, "transfer failed");
+      alerts.push({
+        level: "critical",
+        text:
+          `transfer ${t.id} FAILED on hop ${t.hop + 1}/${t.path.length} ${hop.id}: ${r.detail ?? ""} — ` +
+          (refund > 0
+            ? `${usd0(refund)} refunded to ${assetKey(hop.from)}`
+            : `${usd0(input)} NOT returned; removed from the books (equity drops) — recover by hand`),
+      });
+      return;
+    }
+    // still moving: keep our "stuck" label once set (cleared only by a final state)
+    if (t.state !== "stuck") t.state = r.state;
+    if (r.detail) t.detail = r.detail;
+  }
+
+  /**
+   * A route whose transfer failed, was refused or got stuck is not planned
+   * over again for reentry_cooldown_hours: otherwise a broken route would be
+   * retried every cycle, paying gas each time.
+   */
+  private pauseRoute(st: RouterState, routeId: string, now: number, alerts: Alert[], why: string) {
+    const until = now + this.d.cfg.caps.reentry_cooldown_hours * HOUR;
+    st.cooldownUntil[`${ROUTE_COOLDOWN_PREFIX}${routeId}`] = until;
+    alerts.push({
+      level: "warn",
+      text: `route ${routeId} paused until ${new Date(until).toISOString()} (${why}); no new moves over it`,
+      dedupeKey: `route|${routeId}|paused`,
+    });
+  }
+
+  /**
+   * Live mode: wallet balances are read right after polling. If a final-hop
+   * transfer's destination bucket already received about the expected amount
+   * (inflow not explained by our own books) while the adapter still reports
+   * it in flight, it would be counted twice (wallet + in flight) — a fake
+   * equity peak that later looks like a drawdown. Mark it wallet-seen: it
+   * stops counting as in flight and is not credited again on completion.
+   */
+  private markWalletSeen(st: RouterState, read: Record<string, number>, now: number, xfers: TransferEvent[]) {
+    const inflow: Record<string, number> = {};
+    for (const [k, v] of Object.entries(read)) inflow[k] = Math.max(0, v - (st.idle[k] ?? 0));
+    for (const t of st.transfers) {
+      if (isFinalTransfer(t) || t.walletSeenAtMs !== undefined || t.state === "planned") continue;
+      if (t.hop !== t.path.length - 1) continue;
+      const hop = t.path[t.hop]!;
+      const k = assetKey(hop.to);
+      const input = t.receivedUsd ?? t.amountUsd;
+      const expected = Math.max(0, input - routeCostUsd(hop, input));
+      if (expected > 0 && (inflow[k] ?? 0) >= 0.95 * expected) {
+        t.walletSeenAtMs = now;
+        inflow[k] = (inflow[k] ?? 0) - expected;
+        xfers.push(this.transferEvent(t, "wallet_seen", `destination wallet shows the funds; awaiting adapter confirmation`, expected));
+      }
+    }
   }
 
   /** Fetch every source in isolation, validate what comes back. */
@@ -357,13 +734,14 @@ export class Router {
       this.d.store.save(st);
       return;
     }
-    st.idleUsd += r.amountUsd ?? p.equityUsd * Math.min(1, a.fraction);
+    const bucket = assetKey(positionFundingAsset(p));
+    creditIdle(st, bucket, r.amountUsd ?? p.equityUsd * Math.min(1, a.fraction));
     p.equityUsd *= 1 - Math.min(1, a.fraction);
     p.lastActionAtMs = now;
     if (a.fraction >= 1) {
       st.positions = st.positions.filter((x) => x !== p);
       // Adapters claim + sell on a full exit; this approximates it for the books.
-      for (const rw of Object.values(p.rewards)) st.idleUsd += rw.heldUsd + rw.unclaimedUsd * cfg.rewards.default_realizable;
+      for (const rw of Object.values(p.rewards)) creditIdle(st, bucket, rw.heldUsd + rw.unclaimedUsd * cfg.rewards.default_realizable);
       const hours = a.urgent || p.forcedExit?.urgent ? cfg.caps.urgent_reentry_cooldown_hours : cfg.caps.reentry_cooldown_hours;
       st.cooldownUntil[p.oppId] = now + hours * HOUR;
       this.d.store.save(st);
@@ -429,7 +807,7 @@ export class Router {
       executed.push({ action: a, ok: r.ok, detail: r.detail });
       if (!r.ok) return void alerts.push({ level: "warn", text: `sell FAILED ${a.token}: ${r.detail ?? ""}` });
       rs.heldUsd -= amt;
-      st.idleUsd += r.amountUsd ?? amt;
+      creditIdle(st, assetKey(positionFundingAsset(p)), r.amountUsd ?? amt);
       if (a.reason !== "sell on claim" && amt >= this.d.cfg.rewards.default_token.claim_min_usd)
         alerts.push({ level: "warn", text: `SELL ${a.token} $${Math.round(amt)}: ${a.reason}` });
     }
@@ -525,6 +903,7 @@ export function upsertPosition(st: RouterState, opp: Opportunity, deployedUsd: n
   if (p) {
     p.equityUsd += deployedUsd;
     p.legs = opp.legs;
+    p.fundingAsset ??= fundingTarget(opp);
     p.lastActionAtMs = now;
     for (const s of opp.streams)
       if (s.kind === "reward" && s.rewardToken && !p.rewards[s.rewardToken])
@@ -551,13 +930,39 @@ export function upsertPosition(st: RouterState, opp: Opportunity, deployedUsd: n
     pending: {},
     pendingSince: {},
     blindCycles: 0,
+    fundingAsset: fundingTarget(opp),
   });
+}
+
+/** `cooldownUntil` keys for routes paused after a failure (opportunity ids never start with it). */
+export const ROUTE_COOLDOWN_PREFIX = "route:";
+
+export function pausedRoutes(st: RouterState, now: number): string[] {
+  return Object.entries(st.cooldownUntil)
+    .filter(([k, until]) => k.startsWith(ROUTE_COOLDOWN_PREFIX) && until > now)
+    .map(([k]) => k.slice(ROUTE_COOLDOWN_PREFIX.length));
+}
+
+/** Expected USD/year of what the book holds (holding net APR; blind positions count 0). */
+export function bookYieldPerYear(positions: Position[], opps: Map<string, Opportunity>, ctx: DecisionContext): number {
+  let s = 0;
+  for (const p of positions) {
+    const o = opps.get(p.oppId);
+    if (!o || p.equityUsd <= 0) continue;
+    const v = valueAt(o, p.equityUsd, ctx, { holding: true }).netApr * p.equityUsd;
+    if (Number.isFinite(v)) s += v;
+  }
+  return s;
 }
 
 export function statusText(st: RouterState): string {
   const lines = [
     `${st.paused ? "PAUSED" : "running"}${st.killed ? " (KILLED)" : ""} | idle $${Math.round(st.idleUsd)} | ${st.positions.length} positions`,
   ];
+  if (bucketMode(st))
+    lines.push(`  idle: ${Object.entries(st.idle).map(([k, v]) => `${k} $${Math.round(v)}`).join(" | ")}`);
+  for (const t of st.transfers)
+    lines.push(`  ⇄ ${t.id} ${t.state} hop ${t.hop + 1}/${t.path.length} $${Math.round(t.amountUsd)} ${routeName(t)}${t.forOppId ? ` for ${t.forOppId}` : ""}`);
   for (const p of st.positions) {
     const rw = Object.entries(p.rewards)
       .map(([t, r]) => `${t}:${Math.round(r.unclaimedUsd + r.heldUsd)}`)

@@ -24,6 +24,7 @@ import {
   type LendingAdapter,
   type LiveContext,
   type LiveResult,
+  type Logger,
   type LoopPositionView,
   type RewardRateProvider,
   type TxRecord,
@@ -100,6 +101,8 @@ export interface ScallopAdapterOptions {
   /** Also claim legacy spool (sCoin staking) rewards in claimRewards. Default false (this adapter never stakes in spools). */
   claimSpoolRewards?: boolean;
   now?: () => number;
+  /** Logger for ctx-free reads (markets() skips failing pairs with a warning). Default: console.warn. */
+  log?: Logger;
 }
 
 interface ResolvedPair {
@@ -140,6 +143,8 @@ type Built =
 const DEFAULT_PROBE_SIZES = [1_000, 10_000, 100_000];
 const DEFAULT_PROBE_MAX_BPS = 30;
 const LTV_EPS = 1e-4;
+
+const defaultLog: Logger = (level, msg, data) => console.warn(`[${level}] ${msg}`, ...(data ? [data] : []));
 
 const normType = (t: string) => normalizeStructTag(t.startsWith("0x") ? t : `0x${t}`);
 
@@ -271,7 +276,8 @@ export class ScallopAdapter implements LendingAdapter {
     this.obligationCache.clear();
   }
 
-  private async snapshots(pairs: ResolvedPair[]): Promise<{ snaps: Map<string, Snapshot>; incentives: Partial<Record<string, IncentivePoolLike>> }> {
+  /** Market state per pair; a pair whose market data is unusable maps to an Error (batched SDK failures throw). */
+  private async snapshots(pairs: ResolvedPair[]): Promise<{ snaps: Map<string, Snapshot | Error>; incentives: Partial<Record<string, IncentivePoolLike>> }> {
     const sdk = await this.sdk();
     const names = [...new Set(pairs.flatMap((p) => [p.collName, p.debtName]))];
     const debtNames = [...new Set(pairs.map((p) => p.debtName))];
@@ -280,12 +286,18 @@ export class ScallopAdapter implements LendingAdapter {
       sdk.query.getFlashLoanFees(debtNames),
       sdk.query.getBorrowIncentivePools(debtNames),
     ]);
-    const snaps = new Map<string, Snapshot>();
+    const snaps = new Map<string, Snapshot | Error>();
     for (const p of pairs) {
       const pool = pools[p.debtName];
       const coll = collaterals[p.collName];
-      if (!pool) throw new Error(`scallop ${p.cfg.pairId}: no lending pool for ${p.debtName}`);
-      if (!coll) throw new Error(`scallop ${p.cfg.pairId}: ${p.collName} has no collateral risk model`);
+      if (!pool) {
+        snaps.set(p.cfg.pairId, new Error(`scallop ${p.cfg.pairId}: no lending pool for ${p.debtName}`));
+        continue;
+      }
+      if (!coll) {
+        snaps.set(p.cfg.pairId, new Error(`scallop ${p.cfg.pairId}: ${p.collName} has no collateral risk model`));
+        continue;
+      }
       const bw = pool.borrowWeight > 0 ? pool.borrowWeight : 1;
       snaps.set(p.cfg.pairId, {
         pool,
@@ -296,6 +308,12 @@ export class ScallopAdapter implements LendingAdapter {
       });
     }
     return { snaps, incentives };
+  }
+
+  private async snapshot(p: ResolvedPair): Promise<Snapshot> {
+    const s = (await this.snapshots([p])).snaps.get(p.cfg.pairId)!;
+    if (s instanceof Error) throw s;
+    return s;
   }
 
   private async holdings(ob: ObligationRef, p: ResolvedPair): Promise<Holdings> {
@@ -395,9 +413,10 @@ export class ScallopAdapter implements LendingAdapter {
     const sdk = await this.sdk();
     const { snaps, incentives } = await this.snapshots(resolved);
     const exclude = new Set<string>([...sdk.constants.whitelist.rewardsAsPoint, ...sdk.constants.whitelist.deprecated]);
-    return Promise.all(
+    const results = await Promise.allSettled(
       resolved.map(async (p) => {
         const snap = snaps.get(p.cfg.pairId)!;
+        if (snap instanceof Error) throw snap;
         const ob = await this.obligationFor(p);
         let acct: ObligationAccountLike | undefined;
         let myLtv: number | undefined;
@@ -428,6 +447,19 @@ export class ScallopAdapter implements LendingAdapter {
         });
       })
     );
+    // One broken pair must not hide the others; but if nothing is readable, fail loudly.
+    const out: LoopPair[] = [];
+    const errors: string[] = [];
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") out.push(r.value);
+      else {
+        const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        errors.push(`${resolved[i]!.cfg.pairId}: ${msg}`);
+        (this.opts.log ?? defaultLog)("warn", `scallop: markets() skipping pair ${resolved[i]!.cfg.pairId}: ${msg}`);
+      }
+    });
+    if (!out.length) throw new Error(`scallop: markets() failed for every pair: ${errors.join("; ")}`);
+    return out;
   }
 
   async position(pairId: string): Promise<LoopPositionView | null> {
@@ -485,8 +517,7 @@ export class ScallopAdapter implements LendingAdapter {
     if (equity <= 0n) return { kind: "refuse", detail: "equity must be > 0" };
     const swapper = this.opts.swapper;
     if (!swapper) return { kind: "refuse", detail: "no swapper: Scallop loops are always two-asset" };
-    const { snaps } = await this.snapshots([p]);
-    const snap = snaps.get(pairId)!;
+    const snap = await this.snapshot(p);
     if (!(targetLtv > 0) || targetLtv >= snap.maxLtv) {
       return { kind: "refuse", detail: `target LTV ${targetLtv} not in (0, maxLtv ${snap.maxLtv.toFixed(4)})` };
     }
@@ -618,8 +649,7 @@ export class ScallopAdapter implements LendingAdapter {
     if (!ob) return { kind: "noop", detail: "no position" };
     const h = await this.holdings(ob, p);
     if (h.collateral === 0n && h.debt === 0n) return { kind: "noop", detail: "no position" };
-    const { snaps } = await this.snapshots([p]);
-    const snap = snaps.get(pairId)!;
+    const snap = await this.snapshot(p);
     const prices = this.prices(p, snap);
     const slip = ctx.limits.maxSlippageBps;
     const ff = snap.flashFeeFrac;

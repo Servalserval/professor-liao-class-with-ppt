@@ -55,6 +55,10 @@ export interface FundingQuote {
   etaMinutes: number;
   /** Where the money comes from. */
   source?: ChainAsset;
+  /** Where the money must end up (opportunity funding asset). */
+  target?: ChainAsset;
+  /** USD amount the quote is for. */
+  amountUsd?: number;
   reason?: string;
 }
 
@@ -74,6 +78,28 @@ export interface InFlightTransfer {
   /** Adapter-specific handle (tx hash, CCTP nonce, LayerZero guid ...). */
   ref?: string;
   detail?: string;
+  /** When the current hop was started (stuck detection; paper bridge timing). */
+  hopStartedAtMs?: number;
+  /** USD received at the end of the last completed hop (intermediate hops). */
+  receivedUsd?: number;
+  /**
+   * Live mode only: the destination wallet already shows the money although
+   * the adapter has not confirmed completion yet. The router then stops
+   * counting the transfer as in flight (it is inside the idle balances), so
+   * it is never counted twice in equity (a fake peak would later look like a
+   * drawdown to the kill switch).
+   */
+  walletSeenAtMs?: number;
+}
+
+export interface BridgePollResult {
+  state: TransferState;
+  ref?: string;
+  detail?: string;
+  /** "completed": USD that arrived at the end of this hop. */
+  receivedUsd?: number;
+  /** "failed": USD the protocol returned to the hop's source wallet (credited back to that bucket). */
+  refundedUsd?: number;
 }
 
 /**
@@ -81,8 +107,17 @@ export interface InFlightTransfer {
  * packages/live-bridges and convert to token amounts there.
  */
 export interface BridgeExecutor {
-  /** Start hop `t.hop` of the transfer. */
+  /**
+   * Start hop `t.hop` of the transfer (`t.path[t.hop]`, amount `t.receivedUsd ?? t.amountUsd`).
+   * Contract: return ok:false only when nothing left the wallet; once a
+   * transaction is broadcast return ok:true with a `ref` (never throw after
+   * broadcasting) — the router credits the money back to idle on ok:false.
+   */
   send(t: InFlightTransfer): Promise<{ ok: boolean; ref?: string; detail?: string }>;
-  /** Poll; may complete a "claimable" hop (e.g. CCTP receiveMessage on the destination). */
-  poll(t: InFlightTransfer): Promise<{ state: TransferState; ref?: string; detail?: string; receivedUsd?: number }>;
+  /**
+   * Poll; may complete a "claimable" hop (e.g. CCTP receiveMessage on the
+   * destination). Report "completed" as soon as the destination wallet holds
+   * the funds: the router reads wallet balances right after polling.
+   */
+  poll(t: InFlightTransfer): Promise<BridgePollResult>;
 }

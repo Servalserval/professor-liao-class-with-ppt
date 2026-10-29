@@ -1,0 +1,103 @@
+# Cross-chain funding with the "one day of yield" friction rule.
+# Money starts split across two chains; the router may move it only when the
+# all-in cost of the move (bridge fee + gas on both sides + yield lost while in
+# flight) is at most ONE DAY of the net yield that money earns where it lands,
+# and all moves in any 24h stay within one day of the whole book's yield.
+# Illustrative numbers, not market data.
+# Run: npx tsx packages/core/src/cli.ts sim examples/scenarios/cross-chain.yaml
+name: Cross-chain funding (cost <= one day of destination yield)
+idle:
+  "arbitrum:USDC": 150000
+  "sui:USDC": 150000
+step_minutes: 60
+steps: 40
+config:
+  venues:
+    navi: {enabled: true, tier: 1}
+    aave-v3: {enabled: true, tier: 1}
+    morpho: {enabled: true, tier: 1}
+    plasmavault: {enabled: true, tier: 2}
+  caps:
+    per_venue_frac_by_tier: {1: 0.6, 2: 0.15, 3: 0.05}
+    per_opportunity_frac: 0.6
+    per_chain_frac: {default: 0.6}
+    per_kind_frac: {lending_loop: 1.0}
+    per_token_frac: 0.95          # all-USDC demo book: keep the token cap out of the way
+    max_position_usd: 250000
+  allocator:
+    max_new_positions_per_cycle: 3
+
+routes:
+  # CCTP-like burn/mint: 1 bp + $0.50 gas on each side, ~20 minutes.
+  - {id: cctp-arb-sui, kind: cctp_v2_fast, from: {chain: arbitrum, asset: USDC}, to: {chain: sui, asset: USDC},
+     feeBps: 1, feeFixedUsd: 0, gasSrcUsd: 0.5, gasDstUsd: 0.5, etaMinutes: 20, enabled: true}
+  - {id: cctp-sui-arb, kind: cctp_v2_fast, from: {chain: sui, asset: USDC}, to: {chain: arbitrum, asset: USDC},
+     feeBps: 1, feeFixedUsd: 0, gasSrcUsd: 0.5, gasDstUsd: 0.5, etaMinutes: 20, enabled: true}
+  - {id: cctp-arb-base, kind: cctp_v2_fast, from: {chain: arbitrum, asset: USDC}, to: {chain: base, asset: USDC},
+     feeBps: 1, feeFixedUsd: 0, gasSrcUsd: 0.5, gasDstUsd: 0.5, etaMinutes: 20, enabled: true}
+  - {id: cctp-base-arb, kind: cctp_v2_fast, from: {chain: base, asset: USDC}, to: {chain: arbitrum, asset: USDC},
+     feeBps: 1, feeFixedUsd: 0, gasSrcUsd: 0.5, gasDstUsd: 0.5, etaMinutes: 20, enabled: true}
+  # The only way to Plasma USDT0 here: through an exchange, 30 bps + $1 withdrawal fee, ~1h.
+  - {id: cex-arb-plasma, kind: cex, from: {chain: arbitrum, asset: USDC}, to: {chain: plasma, asset: USDT0},
+     feeBps: 30, feeFixedUsd: 1, gasSrcUsd: 0.1, gasDstUsd: 0.1, etaMinutes: 60, enabled: true}
+
+opportunities:
+  - id: sui-navi-loop
+    name: Navi USDC loop on Sui (best loop)
+    kind: lending_loop
+    venue: navi
+    chain: sui
+    token: USDC
+    capacity_usd: 20000000
+    footprint_per_equity: 3.33
+    health: {metric: ltv, value: 0.70, rebalance_at: 0.78, critical_at: 0.85}
+    streams:
+      - {label: supply_base, kind: base, apr: 0.27}
+      - {label: borrow_base, kind: borrow_cost, apr: -0.14}
+  - id: arb-aave-loop
+    name: Aave USDC loop on Arbitrum
+    kind: lending_loop
+    venue: aave-v3
+    chain: arbitrum
+    token: USDC
+    capacity_usd: 20000000
+    footprint_per_equity: 3.33
+    health: {metric: ltv, value: 0.70, rebalance_at: 0.78, critical_at: 0.85}
+    streams:
+      - {label: supply_base, kind: base, apr: 0.24}
+      - {label: borrow_base, kind: borrow_cost, apr: -0.15}
+  - id: plasma-usdt0-vault
+    name: USDT0 vault on Plasma (25%, but only reachable via a 30 bps route)
+    kind: deposit
+    venue: plasmavault
+    chain: plasma
+    token: USDT0
+    funding_asset: USDT0
+    capacity_usd: 30000000
+    streams:
+      - {label: base, kind: base, apr: 0.25}
+  - id: base-morpho-usdc
+    name: Morpho USDC vault on Base (new campaign)
+    kind: deposit
+    venue: morpho
+    chain: base
+    token: USDC
+    capacity_usd: 30000000
+    streams:
+      - {label: base, kind: base, apr: 0.085}
+
+events:
+  - at: 0
+    note: base-morpho campaign not live yet
+    patch:
+      base-morpho-usdc: {hidden: true}
+  - at: 20
+    note: Arbitrum borrow rate jumps — the Aave loop now loses money
+    patch:
+      arb-aave-loop:
+        streams:
+          borrow_base: {apr: -0.26}
+  - at: 30
+    note: Morpho on Base starts paying 8.5%
+    patch:
+      base-morpho-usdc: {hidden: false}

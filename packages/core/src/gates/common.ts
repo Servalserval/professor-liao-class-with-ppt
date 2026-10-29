@@ -3,6 +3,7 @@ import type { Exposure } from "../exposure.js";
 import type { History } from "../signals.js";
 import type { Opportunity, Position, StressSignal } from "../types.js";
 import type { ValuationContext } from "../valuation.js";
+import type { FundingPlanner } from "../xchain/planner.js";
 
 /** Everything a decision needs, assembled once per cycle by the monitor. */
 export interface DecisionContext extends ValuationContext {
@@ -17,6 +18,12 @@ export interface DecisionContext extends ValuationContext {
   idleUsd: number;
   /** Current short hedge per reward token (USD notional). */
   hedges: Record<string, number>;
+  /**
+   * Set when idle money is tracked per chain:asset: the allocator asks it
+   * where every chunk comes from (local = free, cross-chain = friction rules).
+   * Absent = legacy single idle bucket.
+   */
+  funding?: FundingPlanner;
 }
 
 export function signalLevel(s: StressSignal): "ok" | "warn" | "exit" {

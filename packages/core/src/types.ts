@@ -14,6 +14,8 @@
  *  - USD everywhere. Token amounts never leave the adapters.
  */
 
+import type { FundingQuote } from "./xchain/types.js";
+
 export type Kind = "lending_loop" | "lp_incentive" | "delta_neutral_perp" | "deposit";
 
 /** 1 = blue chip, 2 = established but younger, 3 = new / unverified. */
@@ -186,10 +188,20 @@ export interface Position {
    * (a one-cycle spike, a kill switch, a manual /exit) is no longer present.
    */
   forcedExit?: { reason: string; urgent: boolean; sinceMs: number };
+  /** Idle bucket (`chain:asset`) that funded the position; exit and reward proceeds go back there. */
+  fundingAsset?: { chain: string; asset: string };
 }
 
 export type Action =
-  | { type: "enter"; oppId: string; deltaUsd: number; netApr: number; marginalApr: number }
+  | {
+      type: "enter";
+      oppId: string;
+      deltaUsd: number;
+      netApr: number;
+      marginalApr: number;
+      /** Set when idle is split per chain:asset: where the money comes from (non-empty path = bridge first). */
+      funding?: FundingQuote;
+    }
   | { type: "exit"; oppId: string; fraction: number; urgent: boolean; reason: string }
   | { type: "rebalance"; oppId: string; reason: string }
   | { type: "claim"; oppId: string; token: string; amountUsd: number; reason: string }

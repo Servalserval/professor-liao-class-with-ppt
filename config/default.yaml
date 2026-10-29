@@ -123,3 +123,37 @@ sources:
 telegram:
   bot_token_env: TG_BOT_TOKEN
   chat_id_env: TG_CHAT_ID
+
+# Cross-chain funding (packages/core/src/xchain). Off by default: the router then
+# behaves exactly as before (one idle bucket, no bridging). When idle money is
+# tracked per chain:asset, money already on the right chain is used first (free);
+# moving money from another chain is allowed only if ALL rules below hold.
+xchain:
+  enabled: false
+  # Rule 1 (the hard one): the all-in cost of one move (bridge fee + gas on both
+  # chains + swap slippage + the yield lost while the money is in flight) must
+  # not exceed this many DAYS of the net yield that money earns where it lands.
+  # 1 = "a move may cost at most one day of its own yield".
+  max_cost_days_of_yield: 1
+  # Rule 2: everything spent on moves in any rolling 24h must not exceed this
+  # many days of the WHOLE book's expected yield (stops death by many small moves).
+  book_daily_budget_days: 1
+  # Rule 3: the move must pay for itself within this many days from the APR
+  # improvement over leaving the money idle where it is (see idle_apr).
+  payback_days: 14
+  # Rule 4: never move less than this (fixed fees and gas dominate small moves).
+  min_move_usd: 1000
+  # Rule 5: at most this share of total equity may be on bridges at the same time.
+  max_in_flight_frac: 0.5
+  # A hop not finished after max(stuck_min_minutes, eta x stuck_eta_multiple) is
+  # flagged STUCK (critical alert). It is never re-sent automatically.
+  stuck_eta_multiple: 4
+  stuck_min_minutes: 60
+  # What idle cash earns where it sits while deciding (0 = nothing).
+  idle_apr: 0
+  # Known routes between chain:asset nodes. Paths may chain up to 3 routes.
+  # Each route: {id, kind, from: {chain, asset}, to: {chain, asset}, feeBps,
+  # feeFixedUsd, gasSrcUsd, gasDstUsd, etaMinutes, minUsd?, maxUsd?, enabled, notes?}
+  # kind: cctp_v2_fast | cctp_v2_standard | cctp_v1 | usdt0_oft | wormhole | across
+  #       | stargate | cex | swap | noop. Filled in by the orchestrator / live adapters.
+  routes: []

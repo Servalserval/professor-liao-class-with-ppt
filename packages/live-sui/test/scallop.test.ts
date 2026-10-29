@@ -283,6 +283,30 @@ describe("scallop mapping", () => {
     assert.throws(() => buildScallopLoopPair({ pairId: "x", collateral: SUI, debt: USDC, collateralMarket: collMarket({ coinPrice: 0 }), debtPool: pool(), swap: { costFrac: 0, depthUsd: 0 }, boost: 1, extra: { collateral: [], borrow: [] }, nowMs: NOW }));
   });
 
+  it("swapDepthUsd is capped by the debt pool's free cash (the unwind flash loan draws it)", () => {
+    const mk = (supplyCoin: number) =>
+      buildScallopLoopPair({
+        pairId: "SUI/USDC",
+        collateral: SUI,
+        debt: USDC,
+        collateralMarket: collMarket(),
+        debtPool: pool({ supplyCoin }),
+        swap: { costFrac: 0.001, depthUsd: 100_000 },
+        boost: 1,
+        extra: { collateral: [], borrow: [] },
+        nowMs: NOW,
+      });
+    assert.equal(mk(5_000_000).swapDepthUsd, 100_000); // cash 3M: swap depth binds
+    const tight = mk(2_050_000); // cash 50k: flash-loan cash binds
+    assert.equal(tight.swapDepthUsd, 50_000);
+    assert.equal(mk(2_000_000).swapDepthUsd, 0);
+    const o = loopPairOpportunity(tight, { cfg: DEFAULT_CONFIG, nowMs: NOW, myEquityByOpp: {} }, "test")!;
+    const L = o.meta!.leverage as number;
+    const ll = DEFAULT_CONFIG.sources.lending_loop;
+    const want = ll.footprint === "gross" ? (50_000 * L) / (L - 1) : 50_000 / (L - 1);
+    assert.ok(Math.abs(o.liquidity.exitCapacityUsd - want) < 1e-6, `${o.liquidity.exitCapacityUsd} vs ${want}`);
+  });
+
   it("the core accepts the pair and values the loop as borrow-incentive carry only (no supply yield)", () => {
     const pr = buildScallopLoopPair({
       pairId: "SUI/USDC",
@@ -506,6 +530,19 @@ describe("ScallopAdapter", () => {
     assert.equal(p!.myLtv, 0.6);
     assert.ok(Math.abs(p!.maxLtv - 0.85) < 1e-12);
     assert.deepEqual(sides.sort(), ["borrow", "collateral"]); // never "supply": collateral is not in the lending pool
+  });
+
+  it("markets(): a failing pair is skipped with a warning; all pairs failing throws", async () => {
+    const w = fakeWorld();
+    const warnings: string[] = [];
+    const pairs = [PAIR, { pairId: "USDC/SUI", collateral: USDC, debt: SUI }]; // fake market has no USDC collateral risk model
+    const a = new ScallopAdapter({ env: w.env, sdk: w.sdk, swapper: w.swapper, pairs, now: () => NOW, log: (lvl, msg) => void warnings.push(`${lvl}:${msg}`) });
+    const got = await a.markets();
+    assert.deepEqual(got.map((p) => p.pairId), ["SUI/USDC"]);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /^warn:.*USDC\/SUI.*no collateral risk model/);
+    (w.sdk.query as { getMarketPools: unknown }).getMarketPools = async () => ({ pools: { usdc: pool(), sui: pool() }, collaterals: {} });
+    await assert.rejects(a.markets(), /failed for every pair/);
   });
 
   it("markets(): veSCA boost only when the obligation is bound", async () => {

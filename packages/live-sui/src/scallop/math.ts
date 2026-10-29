@@ -433,6 +433,11 @@ export interface BuildPairInput {
  *    route draws the pool twice), borrow
  *    rewards = borrow-incentive pools (+ extraRewards side "borrow").
  *  - maxLtv/liqLtv include the debt's borrow weight.
+ *  - swapDepthUsd = min(swap depth, debt-pool free cash): every unwind
+ *    flash-borrows the debt from that pool's cash (collateral itself is
+ *    segregated and always withdrawable), and the core derives pair exit
+ *    capacity from swapDepthUsd/(L-1) — so the flash-loan cash limit binds
+ *    there, alongside the real swap depth.
  */
 export function buildScallopLoopPair(a: BuildPairInput): LoopPair {
   const cm = a.collateralMarket;
@@ -484,7 +489,7 @@ export function buildScallopLoopPair(a: BuildPairInput): LoopPair {
     maxLtv: cm.collateralFactor / bw,
     liqLtv: cm.liquidationFactor / bw,
     swapCostFrac: a.swap.costFrac,
-    swapDepthUsd: a.swap.depthUsd,
+    swapDepthUsd: Math.min(a.swap.depthUsd, cash * dPrice),
     dataAsOfMs: a.nowMs,
   };
   if (a.flashFeeFrac !== undefined && Number.isFinite(a.flashFeeFrac)) pair.flashloanFeeFrac = a.flashFeeFrac;

@@ -39,6 +39,7 @@ const DEFAULT_NATIVE: Record<string, string> = {
   gnosis: "xdai",
   mantle: "mantle",
   sui: "sui",
+  xlayer: "okb",
 };
 
 /** DefiLlama chain slugs differ from ours in a few places. */
@@ -50,7 +51,8 @@ export function llamaKey(a: AssetRef): string {
 }
 
 export class PriceFeed {
-  private cache = new Map<string, { p: number; at: number }>();
+  /** p = price, at = the price's own timestamp (staleness), fetchedAt = when we fetched it (cache). */
+  private cache = new Map<string, { p: number; at: number; fetchedAt: number }>();
   private readonly o: Required<Omit<PriceFeedOptions, "overrides" | "nativeIds">> & Pick<PriceFeedOptions, "overrides" | "nativeIds">;
 
   constructor(opts: PriceFeedOptions = {}) {
@@ -81,7 +83,7 @@ export class PriceFeed {
         for (const [k, v] of Object.entries(body.coins ?? {})) {
           if (typeof v.price !== "number" || !Number.isFinite(v.price) || v.price <= 0) continue;
           const at = typeof v.timestamp === "number" ? v.timestamp * 1000 : this.o.now();
-          this.cache.set(k, { p: v.price, at });
+          this.cache.set(k, { p: v.price, at, fetchedAt: this.o.now() });
         }
       } finally {
         clearTimeout(t);
@@ -91,7 +93,7 @@ export class PriceFeed {
 
   private fresh(k: string): boolean {
     const c = this.cache.get(k);
-    return !!c && this.o.now() - c.at < this.o.cacheMs;
+    return !!c && this.o.now() - c.fetchedAt < this.o.cacheMs;
   }
 
   async byKey(k: string): Promise<number> {
