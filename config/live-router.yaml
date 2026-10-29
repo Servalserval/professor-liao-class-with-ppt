@@ -24,6 +24,12 @@ venues:
   navi:             {enabled: true, tier: 2, chain: sui}   # Volo vault (subsidiary) key compromise Apr 2026
   suilend:          {enabled: true, tier: 1, chain: sui}
   scallop:          {enabled: true, tier: 3, chain: sui}   # $9.5M TVL, Apr 2026 rewards-contract incident
+  # Plain-deposit venues (ERC-4626 vault adapter; protocol id per flavor):
+  euler:            {enabled: true, tier: 2}   # Euler v2 (relaunched 2024); isolated vaults, check the collateral set
+  morpho-vault:     {enabled: true, tier: 2}   # MetaMorpho: curator risk (Mar 2026 Resolv USR hit 15 vaults)
+  fluid:            {enabled: true, tier: 1}   # Fluid (Instadapp): live since 2024, multi-$B TVL, no exploit found (review)
+  aave-horizon:     {enabled: true, tier: 2}   # Aave Horizon: RWA-collateral market (set protocol: aave-horizon on its lending entry)
+  erc4626:          {enabled: false, tier: 3}  # generic vaults: enable per vault only after reading its strategy
 
 gas_usd: {default: 0.05, ethereum: 0.5, arbitrum: 0.05, base: 0.03, plasma: 0.02, monad: 0.02, mantle: 0.05, avalanche: 0.05, sui: 0.02}
 
@@ -42,11 +48,62 @@ sources:
     txs_per_exit: 40
     depeg_warn: 0.003
     depeg_exit: 0.01
+  supply:
+    max_risk_tier: 2              # no plain deposits in tier-3 stables (USDe, sUSDe, crvUSD, FDUSD ...)
+    unknown_stable_tier: 3
 
 rewards:
+  # Weekly Aave / Merkl top-up campaigns end every week and are usually re-posted.
+  # Without an entry here a stream is worth nothing after its end time (the safe
+  # default: weekly campaigns barely count, and a position that needs one exits
+  # ending_hours before it ends). Opt in per venue once you trust the cycle:
+  # renewal:
+  #   aave-v4: {prob: 0.8, period_days: 7}
+  #   aave-v3: {prob: 0.8, period_days: 7}
   tokens:
     # Ethena Liquid Leverage pays aUSDe / USDe: already collateral, nothing to sell.
     USDe: {policy: hold, max_hold_usd: 1000000, claim_interval_hours: 168, claim_min_usd: 20}
+
+# --- supply-only lending + stablecoin depeg risk (docs/selection.md) ----------------
+thresholds:
+  # Plain deposits: no liquidation, no swap round trip, 1x exposure, and the
+  # expected depeg loss is already charged as a cost. Their premium over
+  # baseline is about a third of a loop's: entry tier 1/2/3 = +1% / +2% / +4%
+  # (4.5% -> 5.5% / 6.5% / 8.5%), exit +0% / +0.5% / +1.5%.
+  kind_premium_adjust:
+    deposit:
+      entry: {1: -0.02, 2: -0.04, 3: -0.08}
+      exit:  {1: 0.0, 2: -0.015, 3: -0.035}
+
+# Stablecoin depeg-risk table (research 2026-10-29, docs/selection.md §3).
+# expected_loss_apr = trigger frequency x realized loss at exit + p(permanent) x LGD.
+# Charged as a running cost: deposit 1x, same-asset loop 1x, two-asset loop L x (collateral).
+# depeg_warn / depeg_exit = |market price - 1| (robust median, never an oracle pinned at par).
+stables:
+  USDC:    {tier: 1, expected_loss_apr: 0.0005, depeg_warn: 0.003, depeg_exit: 0.010}
+  USDT:    {tier: 1, expected_loss_apr: 0.0010, depeg_warn: 0.003, depeg_exit: 0.010}   # also matches Avalanche USDt
+  USDS:    {tier: 1, expected_loss_apr: 0.0010, depeg_warn: 0.003, depeg_exit: 0.010}
+  DAI:     {tier: 1, expected_loss_apr: 0.0010, depeg_warn: 0.003, depeg_exit: 0.010}
+  PYUSD:   {tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.010}
+  RLUSD:   {tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.010}
+  USDG:    {tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.010}   # thin on most chains: depth gate decides
+  USDC.e:  {tier: 2, expected_loss_apr: 0.0020, depeg_warn: 0.005, depeg_exit: 0.015}
+  USDT0:   {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}   # OFT/DVN + multisig upgrade risk
+  GHO:     {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}
+  AUSD:    {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}
+  USDsui:  {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}   # $0.97 low on 2026-08-22
+  mUSD:    {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}
+  frxUSD:  {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}
+  USDtb:   {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}
+  USD1:    {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}
+  suiUSDT: {tier: 2, expected_loss_apr: 0.0030, depeg_warn: 0.005, depeg_exit: 0.015}
+  USDe:    {tier: 3, expected_loss_apr: 0.0150, depeg_warn: 0.007, depeg_exit: 0.020}   # synthetic; whitelist-only redemption
+  sUSDe:   {tier: 3, expected_loss_apr: 0.0200, depeg_warn: 0.007, depeg_exit: 0.020}
+  crvUSD:  {tier: 3, expected_loss_apr: 0.0150, depeg_warn: 0.007, depeg_exit: 0.020}
+  FDUSD:   {tier: 3, expected_loss_apr: 0.0150, depeg_warn: 0.007, depeg_exit: 0.020}
+  wUSDC:   {tier: 3, expected_loss_apr: 0.0200, depeg_warn: 0.007, depeg_exit: 0.020}   # deprecated Wormhole wrappers (Sui)
+  wUSDT:   {tier: 3, expected_loss_apr: 0.0200, depeg_warn: 0.007, depeg_exit: 0.020}
+tiers_default_loss: {1: 0.0008, 2: 0.003, 3: 0.015}
 
 xchain:
   enabled: true

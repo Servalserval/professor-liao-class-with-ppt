@@ -16,6 +16,8 @@ export interface AllocationPlan {
   entries: EnterAction[];
   /** Why each opportunity did not get (more) money. */
   rejected: Record<string, string[]>;
+  /** Ticket size (USD) the rejection reasons were evaluated at, when a sized gate said no. */
+  rejectedAtUsd?: Record<string, number>;
   deployableUsd: number;
 }
 
@@ -45,6 +47,7 @@ export interface AllocationPlan {
 export function planAllocation(opps: Opportunity[], ctx: DecisionContext): AllocationPlan {
   const { cfg } = ctx;
   const rejected: Record<string, string[]> = {};
+  const rejectedAtUsd: Record<string, number> = {};
   // Reward tokens count in total equity (for caps and drawdown) but are not
   // cash: what can be deployed is bounded by idle cash minus the idle buffer.
   // With idle buckets the cash is the sum of the buckets (same bounds otherwise).
@@ -166,6 +169,39 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
       }
       if (step <= 0) continue;
       let ev = evalStep(o, from, step);
+      let evAt = step;
+      if (!ev.ok && ev.sized && isNew && o.costs.fixedEntryUsd + o.costs.fixedExitUsd > 0) {
+        // Fixed costs (Ethereum gas) amortize only over a bigger first ticket: a
+        // chunk-sized start can fail the APR bar that a larger one clears. Try
+        // doubling first tickets up to what caps and reachable money allow and
+        // take the smallest one that passes every gate (funding included).
+        const reach = funding
+          ? funding.available(assetKey(fundingTarget(o))) + (cfg.xchain.enabled ? funding.largestRemoteUsd(o) : 0)
+          : left;
+        const cap = Math.min(left, room, reach);
+        let bestNet = valueAt(o, step, ctx).netApr;
+        for (let st = step * 2; st > step; st *= 2) {
+          const size = Math.min(st, cap);
+          if (size <= step) break;
+          const e2 = evalStep(o, from, size);
+          if (e2.ok) {
+            ev = e2;
+            evAt = size;
+            break;
+          }
+          // report the failure at the most favourable ticket tried, as long as
+          // the APR bar is all that stops it there (a cap breach at a size we
+          // would never pick is not the reason)
+          const n = valueAt(o, size, ctx).netApr;
+          const aprOnly = !e2.ok && e2.reasons.every((r) => /^(net|marginal) APR /.test(r));
+          if (e2.sized && aprOnly && Number.isFinite(n) && n > bestNet) {
+            bestNet = n;
+            ev = e2;
+            evAt = size;
+          }
+          if (size >= cap) break;
+        }
+      }
       if (!ev.ok && !ev.sized && funding && cfg.xchain.enabled) {
         const hi = Math.min(left, funding.largestRemoteUsd(o));
         if (hi > step + 1) {
@@ -174,12 +210,16 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
             const ev2 = evalStep(o, from, block);
             // report the block's verdict: it is the move that would actually happen
             ev = ev2;
+            evAt = block;
           }
         }
       }
       if (!ev.ok) {
         // keep the first reason set we saw for reporting (usually the binding one)
-        if (ev.report && !planned[o.id]) rejected[o.id] = ev.reasons;
+        if (ev.report && !planned[o.id]) {
+          rejected[o.id] = ev.reasons;
+          rejectedAtUsd[o.id] = evAt;
+        }
         continue;
       }
       // rank: non-speculative first, then by marginal APR (net of amortized move cost)
@@ -198,6 +238,7 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
     exposure = withAddition(exposure, best.opp, step);
     left -= step;
     delete rejected[best.opp.id];
+    delete rejectedAtUsd[best.opp.id];
   }
 
   const entries: EnterAction[] = [];
@@ -236,5 +277,5 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
     }
   }
   entries.sort((a, b) => b.marginalApr - a.marginalApr);
-  return { entries, rejected, deployableUsd: ceiling === undefined ? deployable : Math.min(deployable, Math.max(0, ceiling - ctx.exposure.totalDeployedUsd - inFlightUsd)) };
+  return { entries, rejected, rejectedAtUsd, deployableUsd: ceiling === undefined ? deployable : Math.min(deployable, Math.max(0, ceiling - ctx.exposure.totalDeployedUsd - inFlightUsd)) };
 }

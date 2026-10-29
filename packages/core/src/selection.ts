@@ -28,7 +28,7 @@ export interface SelectionRow {
   tier: Tier;
   chain: string;
   token: string;
-  /** Size the numbers are evaluated at (held + picked, else one entry chunk). */
+  /** Size the numbers are evaluated at (held + picked; else the first ticket with the best net APR, chunk .. per-position cap). */
   sizeUsd: number;
   rawApr: number;
   haircutApr: number;
@@ -62,7 +62,25 @@ export function explainSelection(opps: Opportunity[], ctx: DecisionContext, plan
     const moved = entries.filter((e) => (e.funding?.path.length ?? 0) > 0);
     const moveCostUsd = moved.reduce((a, e) => a + (e.funding?.costUsd ?? 0), 0);
     const h = held[o.id] ?? 0;
-    const size = h + picked > 0 ? h + picked : Math.max(chunk, cfg.caps.min_position_usd);
+    let size = h + picked > 0 ? h + picked : Math.max(chunk, cfg.caps.min_position_usd);
+    const at = plan.rejectedAtUsd?.[o.id];
+    if (h + picked <= 0 && at !== undefined && at > 0) size = at;
+    else if (h + picked <= 0) {
+      // Not funded: show it at its most favourable first ticket (fixed costs
+      // shrink with size, dilution grows), up to the per-position caps.
+      const cap = Math.min(cfg.caps.max_position_usd, cfg.caps.per_opportunity_frac * ctx.totalEquityUsd, o.maxEquityUsd ?? Infinity);
+      let best = valueAt(o, size, ctx).netApr;
+      for (let st = size * 2; st <= cap * 2; st *= 2) {
+        const at = Math.min(st, cap);
+        if (at <= size) break;
+        const n = valueAt(o, at, ctx).netApr;
+        if (Number.isFinite(n) && n > best + 1e-9) {
+          best = n;
+          size = at;
+        }
+        if (at >= cap) break;
+      }
+    }
     const v = valueAt(o, size, ctx, h > 0 && picked <= 0 ? { holding: true } : {});
     const reward = v.streams.filter((s) => s.kind !== "points");
     const haircut = reward.reduce((a, s) => a + (s.rawApr - s.valuedApr), 0);

@@ -1,0 +1,15 @@
+# WHAT-IF of selection-2026-10-29.yaml: identical markets, routes and caps;
+# ONLY adds a renewal assumption for the weekly Aave / Merkl top-up campaigns
+# (rewards.renewal: 80% chance each week that the campaign is re-posted at the
+# same rate). That is a belief about the incentive programme, not a market fact:
+# the live router keeps it off until you opt in (config/live-router.yaml).
+#
+# Run: npx tsx packages/core/src/cli.ts sim examples/scenarios/selection-2026-10-29-whatif-renewal.yaml --why
+extends: selection-2026-10-29.yaml
+name: Selection 2026-10-29 — WHAT-IF weekly Aave campaigns renew at 80% (example numbers)
+config:
+  rewards:
+    renewal:
+      aave-v3: {prob: 0.8, period_days: 7}
+      aave-v4: {prob: 0.8, period_days: 7}
+      aave-horizon: {prob: 0.8, period_days: 7}

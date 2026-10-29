@@ -1,19 +1,22 @@
 # Position selection on one risk-adjusted scale: stablecoin LOOPS vs plain
-# SUPPLY-ONLY deposits, $300k split across three chains.
+# SUPPLY-ONLY deposits, $300k split across three chains, under the LIVE policy
+# (config/live-router.yaml: baseline 4.5%, venue tiers, caps, depeg table,
+# deposit premia, routes).
 #
-#   EXAMPLE NUMBERS ONLY. Loops follow docs/lending-landscape.md (2026-10-29);
-#   supply-only candidates are provisional snapshot numbers from the
-#   orchestrator brief. Pool sizes / utilizations not in those sources are
-#   illustrative. Nothing here is live market data or advice.
+#   Market numbers: research snapshot 2026-10-29 00:00 UTC (docs/selection.md §4,
+#   docs/lending-landscape.md). Aave / Merkl "NET_APR" campaigns are TARGETS for
+#   the total APR, so the reward below is the part actually paid
+#   (dailyRewards x 365 / TVL), not Merkl's `apr` field. Pool sizes not in the
+#   sources are rounded from withdrawable liquidity and utilization.
+#   EXAMPLE NUMBERS ONLY — not live data, not advice.
 #
-# Router settings mirror config/live-router.yaml (baseline 4.5%, tiers, caps,
-# loop settings, routes). Every candidate goes through the real math
-# (sources/supply.ts, sources/loopPair.ts) incl. the depeg-risk haircut
-# (stables table in DEFAULT_CONFIG). Opportunity ids are static:<protocol>:<marketId|pairId>,
-# so marketIds / pairIds are chain-qualified here (one static source for all chains).
+# Every candidate goes through the real math (sources/supply.ts,
+# sources/loopPair.ts), including the expected depeg loss (stables table) and
+# reward time-weighting (most Aave campaigns are weekly and end today).
 #
-# Run: npx tsx packages/core/src/cli.ts sim examples/scenarios/selection-2026-10-29.yaml --verbose
-name: Selection 2026-10-29 — loops vs supply-only on one scale (example numbers)
+# Run: npx tsx packages/core/src/cli.ts sim examples/scenarios/selection-2026-10-29.yaml --why
+name: Selection 2026-10-29 — loops vs supply-only under the live policy (example numbers)
+router_config: ../../config/live-router.yaml
 start_at: "2026-10-29T00:00:00Z"
 idle:
   "arbitrum:USDC": 150000
@@ -22,79 +25,145 @@ idle:
 step_minutes: 60
 steps: 4
 
-config:
-  baseline_apr: 0.045
-  hold_horizon_days: 21
-  caps:
-    per_venue_frac_by_tier: {1: 0.40, 2: 0.15, 3: 0.05}
-    per_opportunity_frac: 0.40
-    max_concurrent_positions: 8
-    min_position_usd: 1000
-    max_position_usd: 120000
-    min_idle_frac: 0.05
-  venues:
-    aave-v3: {enabled: true, tier: 1}
-    aave-v4: {enabled: true, tier: 2}
-    navi:    {enabled: true, tier: 2, chain: sui}
-    # not in live-router.yaml yet (assumption for this example):
-    euler:   {enabled: true, tier: 2}
-    fluid:   {enabled: true, tier: 2}
-  gas_usd: {default: 0.05, ethereum: 0.5, arbitrum: 0.05, base: 0.03, plasma: 0.02, monad: 0.02, mantle: 0.05, avalanche: 0.05, sui: 0.02}
-  sources:
-    lending_loop:
-      target_ltv: 0.70
-      max_ltv_frac_of_open: 0.85
-      deleverage_at_ltv: 0.78
-      critical_ltv_frac_of_close: 0.95
-      utilization_warn: 0.90
-      utilization_exit: 0.95
-      footprint: gross
-      txs_per_entry: 40
-      txs_per_exit: 40
-  rewards:
-    tokens:
-      USDe: {policy: hold, max_hold_usd: 1000000, claim_interval_hours: 168, claim_min_usd: 20}
-
 tokens:
   USDe: {priceUsd: 1.0, depth2pctUsd: 50000000, vol: 0.02, trendApr: 0}
-  USDC: {priceUsd: 1.0, depth2pctUsd: 1000000000, vol: 0.0, trendApr: 0}
   WMON: {priceUsd: 0.03, depth2pctUsd: 2000000, vol: 1.0, trendApr: -0.3}
-  NAVX: {priceUsd: 0.05, depth2pctUsd: 300000, vol: 1.2, trendApr: -0.5}
+  WXPL: {priceUsd: 0.25, depth2pctUsd: 3000000, vol: 1.0, trendApr: -0.5}
+  CERT: {priceUsd: 3.0, depth2pctUsd: 1000000, vol: 0.8, trendApr: -0.2}
 
-# config/live-router.yaml routes (copied), then scenario-only assumptions.
+# Scenario-only routes (live-router.yaml routes are loaded through router_config):
+# destination swaps into GHO / RLUSD / USDsui and Monad via USDT0 (disabled in the live router).
 routes:
-  - {id: cctp-std-arb-base, kind: cctp_v2_standard, from: {chain: arbitrum, asset: USDC}, to: {chain: base, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0.05, etaMinutes: 25, enabled: true}
-  - {id: cctp-std-base-arb, kind: cctp_v2_standard, from: {chain: base, asset: USDC}, to: {chain: arbitrum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0.05, etaMinutes: 25, enabled: true}
-  - {id: cctp-std-arb-sui, kind: cctp_v2_standard, from: {chain: arbitrum, asset: USDC}, to: {chain: sui, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0.02, etaMinutes: 25, enabled: true}
-  - {id: cctp-std-sui-arb, kind: cctp_v2_standard, from: {chain: sui, asset: USDC}, to: {chain: arbitrum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0.05, etaMinutes: 3, enabled: true}
-  - {id: cctp-std-eth-arb, kind: cctp_v2_standard, from: {chain: ethereum, asset: USDC}, to: {chain: arbitrum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 4, gasDstUsd: 0.05, etaMinutes: 25, enabled: true}
-  - {id: cctp-std-arb-eth, kind: cctp_v2_standard, from: {chain: arbitrum, asset: USDC}, to: {chain: ethereum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 5, etaMinutes: 25, enabled: true}
-  - {id: usdt0-arb-plasma, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: plasma, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 5, enabled: true}
-  - {id: usdt0-plasma-arb, kind: usdt0_oft, from: {chain: plasma, asset: USDT0}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 5, enabled: true}
-  - {id: usdt0-arb-mantle, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: mantle, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 5, enabled: true}
-  - {id: usdt0-mantle-arb, kind: usdt0_oft, from: {chain: mantle, asset: USDT0}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 5, enabled: true}
-  - {id: usdt0-eth-arb, kind: usdt0_oft, from: {chain: ethereum, asset: USDT}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 1.5, gasSrcUsd: 5, gasDstUsd: 0, etaMinutes: 10, enabled: true}
-  - {id: usdt0-arb-eth, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: ethereum, asset: USDT}, feeBps: 0, feeFixedUsd: 2, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 10, enabled: true}
-  - {id: swap-arb-usdc-usdt0, kind: swap, from: {chain: arbitrum, asset: USDC}, to: {chain: arbitrum, asset: USDT0}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-arb-usdt0-usdc, kind: swap, from: {chain: arbitrum, asset: USDT0}, to: {chain: arbitrum, asset: USDC}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-plasma-usdt0-usde, kind: swap, from: {chain: plasma, asset: USDT0}, to: {chain: plasma, asset: USDe}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-plasma-usde-usdt0, kind: swap, from: {chain: plasma, asset: USDe}, to: {chain: plasma, asset: USDT0}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-mantle-usdt0-usde, kind: swap, from: {chain: mantle, asset: USDT0}, to: {chain: mantle, asset: USDe}, feeBps: 4, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-mantle-usde-usdt0, kind: swap, from: {chain: mantle, asset: USDe}, to: {chain: mantle, asset: USDT0}, feeBps: 4, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-eth-usdc-usde, kind: swap, from: {chain: ethereum, asset: USDC}, to: {chain: ethereum, asset: USDe}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 1, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-eth-usde-usdc, kind: swap, from: {chain: ethereum, asset: USDe}, to: {chain: ethereum, asset: USDC}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 1, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  # --- scenario-only assumptions (NOT in config/live-router.yaml): Monad via USDT0
-  #     (disabled there), and destination swaps the live router does not have yet.
-  - {id: usdt0-arb-monad, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: monad, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 5, enabled: true}
-  - {id: usdt0-monad-arb, kind: usdt0_oft, from: {chain: monad, asset: USDT0}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 5, enabled: true}
-  - {id: swap-monad-usdt0-usde, kind: swap, from: {chain: monad, asset: USDT0}, to: {chain: monad, asset: USDe}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-monad-usdt0-ausd, kind: swap, from: {chain: monad, asset: USDT0}, to: {chain: monad, asset: AUSD}, feeBps: 5, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-monad-usdt0-usdc, kind: swap, from: {chain: monad, asset: USDT0}, to: {chain: monad, asset: USDC}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-plasma-usdt0-gho, kind: swap, from: {chain: plasma, asset: USDT0}, to: {chain: plasma, asset: GHO}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
-  - {id: swap-sui-usdc-usdsui, kind: swap, from: {chain: sui, asset: USDC}, to: {chain: sui, asset: USDsui}, feeBps: 5, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-eth-usdc-gho, kind: swap, from: {chain: ethereum, asset: USDC}, to: {chain: ethereum, asset: GHO}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 1, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-eth-gho-usdc, kind: swap, from: {chain: ethereum, asset: GHO}, to: {chain: ethereum, asset: USDC}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 1, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-eth-usdc-rlusd, kind: swap, from: {chain: ethereum, asset: USDC}, to: {chain: ethereum, asset: RLUSD}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 1, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-eth-rlusd-usdc, kind: swap, from: {chain: ethereum, asset: RLUSD}, to: {chain: ethereum, asset: USDC}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 1, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-plasma-usdt0-gho, kind: swap, from: {chain: plasma, asset: USDT0}, to: {chain: plasma, asset: GHO}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-plasma-gho-usdt0, kind: swap, from: {chain: plasma, asset: GHO}, to: {chain: plasma, asset: USDT0}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-sui-usdc-usdsui, kind: swap, from: {chain: sui, asset: USDC}, to: {chain: sui, asset: USDsui}, feeBps: 5, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-sui-usdsui-usdc, kind: swap, from: {chain: sui, asset: USDsui}, to: {chain: sui, asset: USDC}, feeBps: 5, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-usdt0-arb-monad, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: monad, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 5, enabled: true}
+  - {id: sc-usdt0-monad-arb, kind: usdt0_oft, from: {chain: monad, asset: USDT0}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 5, enabled: true}
+  - {id: sc-swap-monad-usdt0-usdc, kind: swap, from: {chain: monad, asset: USDT0}, to: {chain: monad, asset: USDC}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-monad-usdc-usdt0, kind: swap, from: {chain: monad, asset: USDC}, to: {chain: monad, asset: USDT0}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+  - {id: sc-swap-monad-usdt0-usde, kind: swap, from: {chain: monad, asset: USDT0}, to: {chain: monad, asset: USDe}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
 
 opportunities:
-  # ---------------- loops (docs/lending-landscape.md §2.1) ----------------
+  # ================= supply-only (plain lending, no borrow) =================
+  - supply_market:   # Fluid fUSDC Ethereum: 5.87% organic (share-price growth), $14.85M withdrawable
+      protocol: fluid
+      chain: ethereum
+      marketId: ethereum:fUSDC
+      asset: {symbol: USDC, priceUsd: 1.0}
+      totalSupplyUsd: 140300000
+      totalBorrowUsd: 125450000
+      withdrawableUsd: 14850000
+      supplyAprBase: 0.0587
+      rewards: []
+  - supply_market:   # Aave V4 Ethereum Core USDC: 3.35% + 2.65% USDC top-up (net lending, first $100k), weekly, ends Oct 29 14:00
+      protocol: aave-v4
+      chain: ethereum
+      marketId: ethereum:core:USDC
+      asset: {symbol: USDC, priceUsd: 1.0}
+      totalSupplyUsd: 63500000
+      totalBorrowUsd: 52400000
+      supplyAprBase: 0.0335
+      rewards: [{token: USDC, apr: 0.0265, netOf: ["*"], perUserCapUsd: 100000, aprCap: 0.06, endsAtMs: 1793282400000}]
+  - supply_market:   # Aave V4 Ethereum Core USDG: 2.05% + 3.6% USDG, weekly, ends Oct 29 13:00
+      protocol: aave-v4
+      chain: ethereum
+      marketId: ethereum:core:USDG
+      asset: {symbol: USDG, priceUsd: 1.0}
+      totalSupplyUsd: 104500000
+      totalBorrowUsd: 77300000
+      supplyAprBase: 0.0205
+      rewards: [{token: USDG, apr: 0.036, endsAtMs: 1793278800000}]
+  - supply_market:   # Morpho Sentora RLUSD Main V2 (MetaMorpho, Ethereum): 3.4% + 2.9% RLUSD until Nov 5; withdrawable NOT verified (~$8.46M on Oct 1)
+      protocol: morpho-vault
+      chain: ethereum
+      marketId: ethereum:sentora-rlusd
+      asset: {symbol: RLUSD, priceUsd: 1.0}
+      totalSupplyUsd: 437000000
+      totalBorrowUsd: 428540000
+      withdrawableUsd: 8460000
+      supplyAprBase: 0.034
+      rewards: [{token: RLUSD, apr: 0.029, aprCap: 0.039, endsAtMs: 1793905200000}]
+  - supply_market:   # Aave Horizon RLUSD: 1.45% + 3.55% (paid in aHorRwaRLUSD), target 5%, until Nov 5
+      protocol: aave-horizon
+      chain: ethereum
+      marketId: ethereum:horizon:RLUSD
+      asset: {symbol: RLUSD, priceUsd: 1.0}
+      totalSupplyUsd: 161600000
+      totalBorrowUsd: 88900000
+      supplyAprBase: 0.0145
+      rewards: [{token: RLUSD, apr: 0.0355, aprCap: 0.05, endsAtMs: 1793905200000}]
+  - supply_market:   # Fluid fGHO Ethereum: 4.20% + 1.79% GHO until Nov 5
+      protocol: fluid
+      chain: ethereum
+      marketId: ethereum:fGHO
+      asset: {symbol: GHO, priceUsd: 0.9995}
+      totalSupplyUsd: 22500000
+      totalBorrowUsd: 15260000
+      withdrawableUsd: 7240000
+      supplyAprBase: 0.042
+      rewards: [{token: GHO, apr: 0.0179, endsAtMs: 1793905200000}]
+  - supply_market:   # Aave V3 Plasma GHO: 3.3% + 3.3% (WXPL until Nov 5, aPlaGHO until Nov 12; split assumed 50/50)
+      protocol: aave-v3
+      chain: plasma
+      marketId: plasma:GHO
+      asset: {symbol: GHO, priceUsd: 0.9995}
+      totalSupplyUsd: 20500000
+      totalBorrowUsd: 16400000
+      supplyAprBase: 0.033
+      rewards: [{token: WXPL, apr: 0.0165, endsAtMs: 1793905200000}, {token: GHO, apr: 0.0165, endsAtMs: 1794441600000}]
+  - supply_market:   # Aave V3 Plasma USDT0: 4.68% organic, ~$49M liquid of ~$780M (utilization ~93.7%)
+      protocol: aave-v3
+      chain: plasma
+      marketId: plasma:USDT0
+      asset: {symbol: USDT0, priceUsd: 1.0}
+      totalSupplyUsd: 780000000
+      totalBorrowUsd: 731000000
+      supplyAprBase: 0.0468
+      rewards: []
+  - supply_market:   # Aave V3 Monad USDC: 4.2% + 1.49% WMON top-up (target 5.7%), weekly, ends Oct 29 13:00; utilization 92%
+      protocol: aave-v3
+      chain: monad
+      marketId: monad:USDC
+      asset: {symbol: USDC, priceUsd: 1.0}
+      totalSupplyUsd: 162000000
+      totalBorrowUsd: 149000000
+      supplyAprBase: 0.042
+      rewards: [{token: WMON, apr: 0.0149, aprCap: 0.057, endsAtMs: 1793278800000}]
+  - supply_market:   # NAVI USDC (Sui): 5.48% + 0.32% CERT, $5.5M withdrawable
+      protocol: navi
+      chain: sui
+      marketId: sui:USDC
+      asset: {symbol: USDC, priceUsd: 1.0}
+      totalSupplyUsd: 27500000
+      totalBorrowUsd: 22000000
+      supplyAprBase: 0.0548
+      rewards: [{token: CERT, apr: 0.0032}]
+  - supply_market:   # Fluid fUSDT0 Arbitrum: 5.09% organic, $5.47M withdrawable
+      protocol: fluid
+      chain: arbitrum
+      marketId: arbitrum:fUSDT0
+      asset: {symbol: USDT0, priceUsd: 1.0}
+      totalSupplyUsd: 40000000
+      totalBorrowUsd: 34530000
+      withdrawableUsd: 5470000
+      supplyAprBase: 0.0509
+      rewards: []
+  - supply_market:   # NAVI USDsui: 3.75% + 3.40% CERT, only ~$0.95M liquid (USDsui hit $0.97 on Aug 22)
+      protocol: navi
+      chain: sui
+      marketId: sui:USDsui
+      asset: {symbol: USDsui, priceUsd: 0.9995}
+      totalSupplyUsd: 9000000
+      totalBorrowUsd: 8050000
+      supplyAprBase: 0.0375
+      rewards: [{token: CERT, apr: 0.034}]
+
+  # ================= loops (docs/lending-landscape.md §2.1) =================
   - loop_pair:   # Aave V3 Plasma USDe -> GHO (Liquid Leverage, HF <= 2): s 4.95%, b 3.58%
       protocol: aave-v3
       chain: plasma
@@ -113,19 +182,19 @@ opportunities:
       pairId: plasma:USDe/USDT0
       collateral: {symbol: USDe, priceUsd: 1.0, totalSupplyUsd: 615000000, totalBorrowUsd: 5000000, supplyAprBase: 0.0025, borrowAprBase: 0.01,
                    supplyRewards: [{token: USDe, apr: 0.047, maxHealthFactor: 2, aprCap: 0.0575}], borrowRewards: []}
-      debt: {symbol: USDT0, priceUsd: 1.0, totalSupplyUsd: 400000000, totalBorrowUsd: 374800000, supplyAprBase: 0.036, borrowAprBase: 0.0405,
+      debt: {symbol: USDT0, priceUsd: 1.0, totalSupplyUsd: 780000000, totalBorrowUsd: 731000000, supplyAprBase: 0.0468, borrowAprBase: 0.0505,
              supplyRewards: [], borrowRewards: []}
       maxLtv: 0.90
       liqLtv: 0.93
       swapCostFrac: 0.0002
       swapDepthUsd: 8000000
-  - loop_pair:   # Aave V3 Monad USDe -> USDT0: s ~6.0% incl. 1% WMON, b 4.32%, ~$14M USDT0 borrowable
+  - loop_pair:   # Aave V3 Monad USDe -> USDT0: s ~6.0% incl. 1% WMON, b 4.32%
       protocol: aave-v3
       chain: monad
       pairId: monad:USDe/USDT0
       collateral: {symbol: USDe, priceUsd: 1.0, totalSupplyUsd: 80000000, totalBorrowUsd: 1000000, supplyAprBase: 0.0,  borrowAprBase: 0.01,
-                   supplyRewards: [{token: USDe, apr: 0.05, maxHealthFactor: 2, aprCap: 0.0575}, {token: WMON, apr: 0.01}], borrowRewards: []}
-      debt: {symbol: USDT0, priceUsd: 1.0, totalSupplyUsd: 30000000, totalBorrowUsd: 16000000, supplyAprBase: 0.03, borrowAprBase: 0.0432,
+                   supplyRewards: [{token: USDe, apr: 0.05, maxHealthFactor: 2, aprCap: 0.0575}, {token: WMON, apr: 0.01, endsAtMs: 1793278800000}], borrowRewards: []}
+      debt: {symbol: USDT0, priceUsd: 1.0, totalSupplyUsd: 67000000, totalBorrowUsd: 54600000, supplyAprBase: 0.03, borrowAprBase: 0.0432,
              supplyRewards: [], borrowRewards: []}
       maxLtv: 0.90
       liqLtv: 0.93
@@ -143,60 +212,3 @@ opportunities:
       liqLtv: 0.93
       swapCostFrac: 0.0002
       swapDepthUsd: 20000000
-
-  # ---------------- supply-only (provisional snapshot, EXAMPLES) ----------------
-  - supply_market:   # Euler Monad AUSD: 4.0% base + 4.5% Merkl; TVL $60M, $20M withdrawable; AUSD tier 2
-      protocol: euler
-      chain: monad
-      marketId: monad:AUSD
-      asset: {symbol: AUSD, priceUsd: 0.9998}
-      totalSupplyUsd: 60000000
-      totalBorrowUsd: 40000000
-      withdrawableUsd: 20000000
-      supplyAprBase: 0.040
-      rewards: [{token: WMON, apr: 0.045}]
-  - supply_market:   # Aave V4 Core USDC: 3.2% + 6% NET_LENDING Merkl on the first $100k per user
-      protocol: aave-v4
-      chain: ethereum
-      marketId: ethereum:core:USDC
-      asset: {symbol: USDC, priceUsd: 1.0}
-      totalSupplyUsd: 900000000
-      totalBorrowUsd: 700000000
-      supplyAprBase: 0.032
-      rewards: [{token: USDC, apr: 0.06, netOf: ["*"], perUserCapUsd: 100000}]
-  - supply_market:   # Aave V3 Monad USDC: 3.0% + 2.5% NET_LENDING
-      protocol: aave-v3
-      chain: monad
-      marketId: monad:USDC
-      asset: {symbol: USDC, priceUsd: 1.0}
-      totalSupplyUsd: 150000000
-      totalBorrowUsd: 110000000
-      supplyAprBase: 0.030
-      rewards: [{token: USDC, apr: 0.025, netOf: ["*"]}]
-  - supply_market:   # Fluid Plasma GHO lend: 5.03% total
-      protocol: fluid
-      chain: plasma
-      marketId: plasma:fGHO
-      asset: {symbol: GHO, priceUsd: 0.9997}
-      totalSupplyUsd: 80000000
-      totalBorrowUsd: 60000000
-      supplyAprBase: 0.0503
-      rewards: []
-  - supply_market:   # NAVI USDsui: 3.73% + 3.31% rewards, pool ~$1M (thin: the 1/10 rule binds on withdrawable)
-      protocol: navi
-      chain: sui
-      marketId: sui:USDsui
-      asset: {symbol: USDsui, priceUsd: 0.9995}
-      totalSupplyUsd: 1000000
-      totalBorrowUsd: 500000
-      supplyAprBase: 0.0373
-      rewards: [{token: NAVX, apr: 0.0331}]
-  - supply_market:   # Aave V3 Ethereum Core USDC: 3.5%, no rewards (below threshold)
-      protocol: aave-v3
-      chain: ethereum
-      marketId: ethereum:USDC
-      asset: {symbol: USDC, priceUsd: 1.0}
-      totalSupplyUsd: 3000000000
-      totalBorrowUsd: 2820000000
-      supplyAprBase: 0.035
-      rewards: []

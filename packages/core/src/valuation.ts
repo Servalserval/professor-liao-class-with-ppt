@@ -1,4 +1,5 @@
 import { rewardTokenConfig, type RouterConfig } from "./config.js";
+import { stableConfig } from "./stables.js";
 import type { Opportunity, TokenProfile, YieldStream } from "./types.js";
 
 const HOUR = 3600_000;
@@ -41,6 +42,11 @@ export interface ValueOptions {
   /** Position already exists: entry cost is sunk, exit cost is paid either way. */
   holding?: boolean;
   /**
+   * With excludeEndingWithinMs: keep the ending streams scaled by this factor
+   * instead of dropping them (the renewal probability of a re-posted campaign).
+   */
+  endingScale?: number;
+  /**
    * Value streams at their current rate until they end (no horizon
    * time-weighting). Used for hold decisions: whether a stream that ends
    * soon still carries the edge is rule 6's job, not the spread rule's.
@@ -74,6 +80,10 @@ export function rewardRealizable(
 ): number {
   const { cfg } = ctx;
   const p = ctx.tokens[token];
+  // A reward paid in a stablecoin from the `stables` table (USDC net-lending
+  // top-ups, GHO, RLUSD ...) with no token profile: no price drift to haircut;
+  // its depeg risk is a tier-2/3 matter, not a selling one.
+  if (!p && stableConfig(cfg, token)) return cfg.rewards.max_realizable;
   // A price alone says nothing about how sellable the token is: without depth
   // AND volatility we fall back to the conservative default.
   if (!p || !(p.depth2pctUsd !== undefined && p.depth2pctUsd > 0) || p.vol === undefined)
@@ -92,12 +102,32 @@ export function rewardRealizable(
   return clamp(1 - slip - drift, cfg.rewards.min_realizable, cfg.rewards.max_realizable);
 }
 
-function timeWeight(ctx: ValuationContext, endsAtMs: number | null | undefined, noTimeWeight = false): number {
+/**
+ * Share of the hold horizon during which a stream is expected to be alive.
+ * With a renewal assumption (rewards.renewal[venue]: campaigns that are
+ * re-posted every `period_days` with probability `prob`, e.g. weekly Aave /
+ * Merkl top-ups), each further period counts with prob^k.
+ */
+export function timeWeight(
+  ctx: ValuationContext,
+  endsAtMs: number | null | undefined,
+  noTimeWeight = false,
+  renewal?: { prob: number; period_days: number }
+): number {
   if (endsAtMs === null || endsAtMs === undefined) return 1;
   const remaining = endsAtMs - ctx.nowMs;
   if (remaining <= 0) return 0;
   if (noTimeWeight) return 1;
-  return clamp(remaining / (ctx.cfg.hold_horizon_days * DAY), 0, 1);
+  const H = ctx.cfg.hold_horizon_days * DAY;
+  if (!renewal || !(renewal.prob > 0) || !(renewal.period_days > 0)) return clamp(remaining / H, 0, 1);
+  const T = renewal.period_days * DAY;
+  let alive = Math.min(remaining, H);
+  let t = remaining;
+  for (let k = 1, w = renewal.prob; t < H && w > 1e-6; k++, w *= renewal.prob) {
+    alive += w * Math.min(T, H - t);
+    t += T;
+  }
+  return clamp(alive / H, 0, 1);
 }
 
 export function valueAt(
@@ -112,16 +142,19 @@ export function valueAt(
   let realizableApr = 0;
   let speculativeApr = 0;
 
+  const renewal = cfg.rewards.renewal?.[opp.primaryVenue];
   for (const s of opp.streams) {
+    let scale = 1;
     if (
       opts.excludeEndingWithinMs !== undefined &&
       s.endsAtMs !== null &&
       s.endsAtMs !== undefined &&
       s.endsAtMs - ctx.nowMs <= opts.excludeEndingWithinMs
     ) {
-      continue;
+      if (!(opts.endingScale !== undefined && opts.endingScale > 0 && s.kind === "reward")) continue;
+      scale = opts.endingScale;
     }
-    const raw = s.aprAt(Math.max(0, equityUsd));
+    const raw = s.aprAt(Math.max(0, equityUsd)) * scale;
     let realizable = 1;
     let tw = 1;
     switch (s.kind) {
@@ -133,7 +166,7 @@ export function valueAt(
         const tc = rewardTokenConfig(cfg, s.rewardToken ?? "?");
         const claimSize = equityUsd * Math.max(0, raw) * (tc.claim_interval_hours / YEAR_HOURS);
         realizable = rewardRealizable(ctx, s.rewardToken ?? "?", claimSize);
-        tw = timeWeight(ctx, s.endsAtMs, opts.noTimeWeight);
+        tw = timeWeight(ctx, s.endsAtMs, opts.noTimeWeight, renewal);
         break;
       }
       case "funding":

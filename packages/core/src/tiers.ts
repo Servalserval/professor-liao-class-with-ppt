@@ -52,12 +52,18 @@ export function venueEnabled(cfg: RouterConfig, venue: string): boolean {
  * baseline_apr); the exit threshold is lower (hysteresis). Plain deposits get
  * a negative adjustment by default: no liquidation, no swap, no leverage.
  */
+/** A kind adjustment is one number for every tier, or a per-tier map (missing tiers = 0). */
+export function kindAdjust(cfg: RouterConfig, tier: Tier, kind: Kind | undefined, side: "entry" | "exit"): number {
+  if (!kind) return 0;
+  const v = cfg.thresholds.kind_premium_adjust?.[kind]?.[side];
+  if (v === undefined) return 0;
+  return typeof v === "number" ? v : v[tier] ?? 0;
+}
+
 export function entryThreshold(cfg: RouterConfig, tier: Tier, kind?: Kind): number {
-  const adj = kind ? cfg.thresholds.kind_premium_adjust?.[kind]?.entry ?? 0 : 0;
-  return Math.max(cfg.baseline_apr, cfg.baseline_apr + cfg.thresholds.entry_premium_by_tier[tier] + adj);
+  return Math.max(cfg.baseline_apr, cfg.baseline_apr + cfg.thresholds.entry_premium_by_tier[tier] + kindAdjust(cfg, tier, kind, "entry"));
 }
 
 export function exitThreshold(cfg: RouterConfig, tier: Tier, kind?: Kind): number {
-  const adj = kind ? cfg.thresholds.kind_premium_adjust?.[kind]?.exit ?? 0 : 0;
-  return cfg.baseline_apr + cfg.thresholds.exit_premium_by_tier[tier] + adj;
+  return cfg.baseline_apr + cfg.thresholds.exit_premium_by_tier[tier] + kindAdjust(cfg, tier, kind, "exit");
 }

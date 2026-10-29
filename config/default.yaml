@@ -140,24 +140,31 @@ sources:
 # Per stable: tier (1|2|3), expected_loss_apr (default tiers_default_loss[tier]),
 # depeg_warn / depeg_exit (|price-1| levels, override sources.lending_loop), and
 # max_frac (cap on that asset across ALL positions, share of total equity).
-stables:
-  USDC:   {tier: 1}
-  USDC.e: {tier: 1}
-  USDT:   {tier: 1}
-  USDT0:  {tier: 1}
-  USDt:   {tier: 1}
-  DAI:    {tier: 1}
-  USDS:   {tier: 1}
-  PYUSD:  {tier: 2}
-  GHO:    {tier: 2}
-  USDe:   {tier: 2}
-  sUSDe:  {tier: 2}
-  AUSD:   {tier: 2}
-  USDG:   {tier: 2}
-  frxUSD: {tier: 2}
-  crvUSD: {tier: 2}
-  USDsui: {tier: 2}
-tiers_default_loss: {1: 0.0005, 2: 0.003, 3: 0.015}   # expected depeg loss APR by tier (provisional)
+stables:   # researched 2026-10-29 (docs/selection.md §3)
+  USDC:    {tier: 1, expected_loss_apr: 0.0005, depeg_warn: 0.003, depeg_exit: 0.01}
+  USDT:    {tier: 1, expected_loss_apr: 0.001, depeg_warn: 0.003, depeg_exit: 0.01}
+  USDS:    {tier: 1, expected_loss_apr: 0.001, depeg_warn: 0.003, depeg_exit: 0.01}
+  DAI:     {tier: 1, expected_loss_apr: 0.001, depeg_warn: 0.003, depeg_exit: 0.01}
+  PYUSD:   {tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.01}
+  RLUSD:   {tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.01}
+  USDG:    {tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.01}
+  USDC.e:  {tier: 2, expected_loss_apr: 0.002, depeg_warn: 0.005, depeg_exit: 0.015}
+  USDT0:   {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  GHO:     {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  AUSD:    {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  USDsui:  {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  mUSD:    {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  frxUSD:  {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  USDtb:   {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  USD1:    {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  suiUSDT: {tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015}
+  USDe:    {tier: 3, expected_loss_apr: 0.015, depeg_warn: 0.007, depeg_exit: 0.02}
+  sUSDe:   {tier: 3, expected_loss_apr: 0.02, depeg_warn: 0.007, depeg_exit: 0.02}
+  crvUSD:  {tier: 3, expected_loss_apr: 0.015, depeg_warn: 0.007, depeg_exit: 0.02}
+  FDUSD:   {tier: 3, expected_loss_apr: 0.015, depeg_warn: 0.007, depeg_exit: 0.02}
+  wUSDC:   {tier: 3, expected_loss_apr: 0.02, depeg_warn: 0.007, depeg_exit: 0.02}
+  wUSDT:   {tier: 3, expected_loss_apr: 0.02, depeg_warn: 0.007, depeg_exit: 0.02}
+tiers_default_loss: {1: 0.0008, 2: 0.003, 3: 0.015}   # expected depeg loss APR for a stable with a tier but no expected_loss_apr
 
 telegram:
   bot_token_env: TG_BOT_TOKEN

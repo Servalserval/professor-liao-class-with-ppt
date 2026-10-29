@@ -66,6 +66,12 @@ export interface Scenario {
    * onto it (objects merge, arrays replace) — for what-if variants.
    */
   extends?: string;
+  /**
+   * Path (relative to this file) of a router config YAML (e.g.
+   * ../../config/live-router.yaml) used as the base instead of DEFAULT_CONFIG,
+   * so a scenario runs the live policy without copying it; `config` merges on top.
+   */
+  router_config?: string;
   /** Single idle bucket (legacy). Ignored when `idle` is given. */
   start_equity_usd?: number;
   /**
@@ -123,6 +129,7 @@ class FundingAssetSource implements Source {
 
 export function loadScenario(path: string, depth = 0): Scenario {
   const doc = parse(readFileSync(path, "utf8")) as Scenario;
+  if (doc.router_config) doc.router_config = resolve(dirname(path), doc.router_config);
   if (!doc.extends) return doc;
   if (depth > 5) throw new Error(`scenario extends chain too deep at ${path}`);
   const base = loadScenario(resolve(dirname(path), doc.extends), depth + 1);
@@ -160,7 +167,8 @@ function applyPatch(src: StaticSource<ScenarioOppSpec>, oppId: string, p: Scenar
 }
 
 export async function runScenario(sc: Scenario): Promise<ScenarioResult> {
-  const cfg: RouterConfig = deepMerge(DEFAULT_CONFIG, sc.config ?? {});
+  const baseCfg: RouterConfig = sc.router_config ? deepMerge(DEFAULT_CONFIG, parse(readFileSync(sc.router_config, "utf8"))) : DEFAULT_CONFIG;
+  const cfg: RouterConfig = deepMerge(baseCfg, sc.config ?? {});
   const bucketed = !!sc.idle && Object.keys(sc.idle).length > 0;
   if (bucketed) cfg.xchain = { ...cfg.xchain, enabled: true };
   if (sc.routes?.length) cfg.xchain = { ...cfg.xchain, routes: [...cfg.xchain.routes, ...sc.routes] };

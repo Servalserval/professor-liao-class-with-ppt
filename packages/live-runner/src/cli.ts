@@ -25,6 +25,7 @@ import {
   statusText,
   TelegramNotifier,
   upsertPosition,
+  formatSelection,
   valueAt,
   venueTier,
   type DecisionContext,
@@ -142,7 +143,7 @@ async function cmdMarkets(rt: Runtime, f: Flags): Promise<number> {
     console.log(JSON.stringify(rows.map((r) => ({ id: r.o.id, netApr: r.v.netApr, rawApr: r.v.rawApr, passes: !r.reasons.length, reasons: r.reasons, metrics: r.o.metrics, meta: r.o.meta })), null, 2));
     return 0;
   }
-  console.log(`${opps.length} live loop opportunities, probe ${usd(probe)} on equity ${usd(equity)}\n`);
+  console.log(`${opps.length} live opportunities (loops + plain deposits), probe ${usd(probe)} on equity ${usd(equity)}\n`);
   for (const r of rows) {
     const m = r.o.metrics as Record<string, number>;
     const extra = [m.depeg !== undefined ? `depeg ${(m.depeg * 1e4).toFixed(1)}bp` : "", m.utilization_d !== undefined ? `u(debt) ${pct(m.utilization_d)}` : m.utilization !== undefined ? `u ${pct(m.utilization)}` : ""]
@@ -195,8 +196,13 @@ async function cmdPlan(rt: Runtime, f: Flags): Promise<number> {
   for (const [k, v] of Object.entries(r.idle).sort()) console.log(`  idle ${k} ${usd(v)}`);
   for (const x of r.executed) console.log(`  ${x.ok ? "✓" : "✗"} ${x.action.type.toUpperCase()} ${JSON.stringify(x.action).slice(0, 160)}`);
   for (const t of r.transfers) console.log(`  ⇄ ${t.kind} ${usd(t.amountUsd)} ${t.from} -> ${t.to} via ${t.route}${t.costUsd !== undefined ? ` (cost $${t.costUsd.toFixed(2)})` : ""}`);
-  if (f["why"] && r.allocationRejected)
-    for (const [id, why] of Object.entries(r.allocationRejected)) console.log(`  skip ${id}: ${why.slice(0, 3).join("; ")}`);
+  if (f["why"]) {
+    if (r.selection?.length) {
+      console.log("\nselection (one scale: net = raw - haircut - depeg - costs - move, vs the tier/kind entry threshold):");
+      for (const line of formatSelection(r.selection, 3).split("\n")) console.log(`  ${line}`);
+    } else if (r.allocationRejected)
+      for (const [id, why] of Object.entries(r.allocationRejected)) console.log(`  skip ${id}: ${why.slice(0, 3).join("; ")}`);
+  }
   for (const e of r.sourceErrors) console.log(`  source error: ${e}`);
   return 0;
 }

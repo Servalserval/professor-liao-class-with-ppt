@@ -165,12 +165,18 @@ export function decideExit(
     (s) => s.endsAtMs !== null && s.endsAtMs !== undefined && s.endsAtMs - ctx.nowMs <= endingMs
   );
   if (ending.length) {
-    const exEnding = valueAt(opp, pos.equityUsd, ctx, { holding: true, noTimeWeight: true, excludeEndingWithinMs: endingMs });
+    const ren = cfg.rewards.renewal?.[opp.primaryVenue];
+    const exEnding = valueAt(opp, pos.equityUsd, ctx, {
+      holding: true,
+      noTimeWeight: true,
+      excludeEndingWithinMs: endingMs,
+      ...(ren ? { endingScale: ren.prob } : {}),
+    });
     if (exEnding.netApr < threshold)
       return done(
         fullExit(
           pos.oppId,
-          `${ending.map((s) => s.label).join(",")} ending within ${cfg.rewards.ending_hours}h; net without them ${pct(exEnding.netApr)} < ${pct(threshold)}`,
+          `${ending.map((s) => s.label).join(",")} ending within ${cfg.rewards.ending_hours}h; net ${ren ? `with ${Math.round(ren.prob * 100)}% renewal` : "without them"} ${pct(exEnding.netApr)} < ${pct(threshold)}`,
           false
         )
       );

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 import type { Kind, Tier } from "./types.js";
+import { entryThreshold, exitThreshold } from "./tiers.js";
 import type { RouteSpec } from "./xchain/types.js";
 
 export type RewardPolicy = "sell_on_claim" | "hedge" | "hold";
@@ -66,7 +67,7 @@ export interface RouterConfig {
      * baseline_apr). Plain deposits carry no liquidation / swap risk, so they
      * clear a lower bar than loops at the same venue tier.
      */
-    kind_premium_adjust: Partial<Record<Kind, { entry: number; exit: number }>>;
+    kind_premium_adjust: Partial<Record<Kind, { entry: number | Partial<Record<Tier, number>>; exit: number | Partial<Record<Tier, number>> }>>;
   };
 
   liquidity: {
@@ -86,6 +87,14 @@ export interface RouterConfig {
     max_realizable: number;
     /** Streams ending within this window are dropped for the "does the edge survive" test. */
     ending_hours: number;
+    /**
+     * Opt-in renewal assumption per venue (opp.primaryVenue) for reward
+     * campaigns that are re-posted on a fixed cycle (Aave / Merkl weekly
+     * top-ups). Valuation counts each further period with prob^k; the
+     * reward-ending exit rule keeps an ending stream at `prob` instead of 0.
+     * Without an entry a stream is worth nothing after its end time.
+     */
+    renewal?: Record<string, { prob: number; period_days: number }>;
     claim_gas_multiple: number;
     vol_penalty_k: number;
     /** 24h price drop that triggers claim-and-dump. */
@@ -338,26 +347,33 @@ export const DEFAULT_CONFIG: RouterConfig = {
     },
     supply: { max_risk_tier: 2, unknown_stable_tier: 3, txs_per_entry: 2, txs_per_exit: 1 },
   },
-  // PROVISIONAL tiers (to be replaced by researched values); losses default to tiers_default_loss.
+  // Researched 2026-10-29 (docs/selection.md §3): tier, expected yearly depeg loss, |p-1| warn/exit.
   stables: {
-    USDC: { tier: 1 },
-    "USDC.e": { tier: 1 },
-    USDT: { tier: 1 },
-    USDT0: { tier: 1 },
-    USDt: { tier: 1 },
-    DAI: { tier: 1 },
-    USDS: { tier: 1 },
-    PYUSD: { tier: 2 },
-    GHO: { tier: 2 },
-    USDe: { tier: 2 },
-    sUSDe: { tier: 2 },
-    AUSD: { tier: 2 },
-    USDG: { tier: 2 },
-    frxUSD: { tier: 2 },
-    crvUSD: { tier: 2 },
-    USDsui: { tier: 2 },
+    USDC: { tier: 1, expected_loss_apr: 0.0005, depeg_warn: 0.003, depeg_exit: 0.01 },
+    USDT: { tier: 1, expected_loss_apr: 0.001, depeg_warn: 0.003, depeg_exit: 0.01 },
+    USDS: { tier: 1, expected_loss_apr: 0.001, depeg_warn: 0.003, depeg_exit: 0.01 },
+    DAI: { tier: 1, expected_loss_apr: 0.001, depeg_warn: 0.003, depeg_exit: 0.01 },
+    PYUSD: { tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.01 },
+    RLUSD: { tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.01 },
+    USDG: { tier: 1, expected_loss_apr: 0.0008, depeg_warn: 0.003, depeg_exit: 0.01 },
+    "USDC.e": { tier: 2, expected_loss_apr: 0.002, depeg_warn: 0.005, depeg_exit: 0.015 },
+    USDT0: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    GHO: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    AUSD: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    USDsui: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    mUSD: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    frxUSD: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    USDtb: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    USD1: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    suiUSDT: { tier: 2, expected_loss_apr: 0.003, depeg_warn: 0.005, depeg_exit: 0.015 },
+    USDe: { tier: 3, expected_loss_apr: 0.015, depeg_warn: 0.007, depeg_exit: 0.02 },
+    sUSDe: { tier: 3, expected_loss_apr: 0.02, depeg_warn: 0.007, depeg_exit: 0.02 },
+    crvUSD: { tier: 3, expected_loss_apr: 0.015, depeg_warn: 0.007, depeg_exit: 0.02 },
+    FDUSD: { tier: 3, expected_loss_apr: 0.015, depeg_warn: 0.007, depeg_exit: 0.02 },
+    wUSDC: { tier: 3, expected_loss_apr: 0.02, depeg_warn: 0.007, depeg_exit: 0.02 },
+    wUSDT: { tier: 3, expected_loss_apr: 0.02, depeg_warn: 0.007, depeg_exit: 0.02 },
   },
-  tiers_default_loss: { 1: 0.0005, 2: 0.003, 3: 0.015 },
+  tiers_default_loss: { 1: 0.0008, 2: 0.003, 3: 0.015 },
   xchain: {
     enabled: false,
     max_cost_days_of_yield: 1,
@@ -431,11 +447,20 @@ export function validateConfig(c: RouterConfig): string[] {
   if (!tierOk(c.sources.supply.unknown_stable_tier)) e.push("sources.supply.unknown_stable_tier must be 1, 2 or 3");
   for (const [kind, adj] of Object.entries(c.thresholds.kind_premium_adjust ?? {})) {
     if (!adj) continue;
+    for (const side of ["entry", "exit"] as const) {
+      const v = adj[side];
+      const vals = typeof v === "number" ? [v] : Object.values(v ?? {});
+      if (vals.some((x) => typeof x !== "number" || !Number.isFinite(x))) e.push(`thresholds.kind_premium_adjust.${kind}.${side} must be a number or a {1,2,3} map of numbers`);
+    }
     for (const t of [1, 2, 3] as Tier[]) {
-      const entry = Math.max(c.baseline_apr, c.baseline_apr + c.thresholds.entry_premium_by_tier[t] + adj.entry);
-      const exit = c.baseline_apr + c.thresholds.exit_premium_by_tier[t] + adj.exit;
+      const entry = entryThreshold(c, t, kind as Kind);
+      const exit = exitThreshold(c, t, kind as Kind);
       if (exit >= entry) e.push(`thresholds.kind_premium_adjust.${kind}: exit must stay below entry for tier ${t} (hysteresis)`);
     }
+  }
+  for (const [v, r] of Object.entries(c.rewards.renewal ?? {})) {
+    if (!(r.prob >= 0 && r.prob < 1)) e.push(`rewards.renewal.${v}.prob must be in [0,1)`);
+    if (!(r.period_days > 0)) e.push(`rewards.renewal.${v}.period_days must be > 0`);
   }
   if (c.portfolio.blind_exit_cycles < c.portfolio.blind_alert_cycles)
     e.push("portfolio.blind_exit_cycles must be >= blind_alert_cycles");
