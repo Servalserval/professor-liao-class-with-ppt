@@ -12,6 +12,8 @@ export interface RouterState {
   cooldownUntil: Record<string, number>;
   /** Current short hedge per reward token (USD notional). */
   hedges: Record<string, number>;
+  /** Which executor (sourceId) holds each hedge, so it can be closed after the last position is gone. */
+  hedgeExecutor: Record<string, string>;
   paused: boolean;
   killed: boolean;
   /** Manual exits requested via Telegram, executed next cycle. */
@@ -29,6 +31,7 @@ export function newState(idleUsd: number): RouterState {
     history: newHistory(),
     cooldownUntil: {},
     hedges: {},
+    hedgeExecutor: {},
     paused: false,
     killed: false,
     manualExit: [],
@@ -77,6 +80,7 @@ export class FileStore implements Store {
     s.alertSentAt ??= {};
     s.manualExit ??= [];
     s.hedges ??= {};
+    s.hedgeExecutor ??= {};
     return s;
   }
   save(s: RouterState): void {

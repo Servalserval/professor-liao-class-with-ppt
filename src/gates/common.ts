@@ -13,6 +13,10 @@ export interface DecisionContext extends ValuationContext {
   /** oppId -> epoch ms until which re-entry is blocked. */
   cooldownUntil: Record<string, number>;
   paused: boolean;
+  /** Cash actually available to deploy (rewards held as tokens are NOT cash). */
+  idleUsd: number;
+  /** Current short hedge per reward token (USD notional). */
+  hedges: Record<string, number>;
 }
 
 export function signalLevel(s: StressSignal): "ok" | "warn" | "exit" {
@@ -33,6 +37,9 @@ export function liquidityUsage(cfg: RouterConfig, opp: Opportunity, equityUsd: n
   if (cap <= 0) return Infinity;
   return (equityUsd * opp.liquidity.footprintPerEquity) / cap;
 }
+
+/** Kinds whose positions carry leverage and therefore need a health metric while held. */
+export const LEVERAGED_KINDS = new Set(["lending_loop", "delta_neutral_perp"]);
 
 export function venues(opp: Opportunity): string[] {
   return [...new Set(opp.legs.map((l) => l.venue))];

@@ -72,16 +72,19 @@ export function derivedFlags(opp: Opportunity, hist: History, cfg: RouterConfig,
     }
   }
 
-  // 2) spikes on tracked metrics vs previous cycle (loop-farm: borrow APR +10pp)
-  const prev = snaps[snaps.length - 1];
-  if (prev) {
-    for (const [metric, absUp] of Object.entries(cfg.spike_rules)) {
-      const cur = opp.metrics[metric];
-      const old = prev.metrics[metric];
-      if (cur === undefined || old === undefined) continue;
-      if (cur - old >= absUp)
-        flags.push({ name: `spike:${metric}`, severity: "exit", detail: `${metric} ${old.toFixed(4)} -> ${cur.toFixed(4)}` });
-    }
+  // 2) spikes on tracked metrics (loop-farm: borrow APR +10pp vs last cycle).
+  //    Compared with the LOW of the window, so a ramp in small steps fires too.
+  const swin = cfg.spike_window_minutes * 60_000;
+  const sRecent = snaps.filter((s) => s.t >= now - swin);
+  const lastSnap = snaps[snaps.length - 1];
+  if (lastSnap && !sRecent.includes(lastSnap)) sRecent.push(lastSnap); // always compare with the previous cycle
+  for (const [metric, absUp] of Object.entries(cfg.spike_rules)) {
+    const cur = opp.metrics[metric];
+    const olds = sRecent.map((s) => s.metrics[metric]).filter((v): v is number => v !== undefined);
+    if (cur === undefined || !olds.length) continue;
+    const low = Math.min(...olds);
+    if (cur - low >= absUp)
+      flags.push({ name: `spike:${metric}`, severity: "exit", detail: `${metric} ${low.toFixed(4)} -> ${cur.toFixed(4)}` });
   }
 
   // 3) emission cut: pool reward APR (ex-me) down X% within the window
@@ -109,6 +112,20 @@ export function recordOpp(hist: History, opp: Opportunity, now: number, keepMs: 
     metrics: { ...opp.metrics },
   });
   hist.opps[opp.id] = trim(arr, now, keepMs);
+}
+
+/** Drop series that were not updated within keepMs (opportunities that stopped being reported). */
+export function pruneHistory(hist: History, now: number, keepMs: number) {
+  for (const [id, arr] of Object.entries(hist.opps)) {
+    const t = trim(arr, now, keepMs);
+    if (t.length) hist.opps[id] = t;
+    else delete hist.opps[id];
+  }
+  for (const [tok, arr] of Object.entries(hist.tokenPrices)) {
+    const t = trim(arr, now, keepMs);
+    if (t.length) hist.tokenPrices[tok] = t;
+    else delete hist.tokenPrices[tok];
+  }
 }
 
 export function recordTokenPrice(hist: History, token: string, price: number, now: number, keepMs: number) {

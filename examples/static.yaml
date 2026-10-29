@@ -9,6 +9,7 @@ opportunities:
     token: USDC
     capacity_usd: 10000000          # available liquidity
     footprint_per_equity: 3.33      # gross supply per equity at 70% LTV
+    health: {metric: ltv, value: 0.70, rebalance_at: 0.78, critical_at: 0.85}
     costs: {fixed_entry_usd: 0.05, fixed_exit_usd: 0.05}
     streams:
       - {label: supply_base, kind: base, apr: 0.20}          # 3.33 x 6%

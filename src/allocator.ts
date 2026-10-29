@@ -30,9 +30,14 @@ export interface AllocationPlan {
 export function planAllocation(opps: Opportunity[], ctx: DecisionContext): AllocationPlan {
   const { cfg } = ctx;
   const rejected: Record<string, string[]> = {};
+  // Reward tokens count in total equity (for caps and drawdown) but are not
+  // cash: what can be deployed is bounded by idle cash minus the idle buffer.
   const deployable = Math.max(
     0,
-    ctx.totalEquityUsd * (1 - cfg.caps.min_idle_frac) - ctx.exposure.totalDeployedUsd
+    Math.min(
+      ctx.totalEquityUsd * (1 - cfg.caps.min_idle_frac) - ctx.exposure.totalDeployedUsd,
+      ctx.idleUsd - ctx.totalEquityUsd * cfg.caps.min_idle_frac
+    )
   );
   const chunk = Math.max(cfg.allocator.min_chunk_usd, ctx.totalEquityUsd * cfg.allocator.chunk_frac);
 
@@ -74,6 +79,7 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
         continue;
       }
       // rank: non-speculative first, then by marginal APR
+      if (!Number.isFinite(chk.marginalNetApr)) continue;
       const key: [number, number] = [o.speculative ? 0 : 1, chk.marginalNetApr];
       if (!bestKey || key[0] > bestKey[0] || (key[0] === bestKey[0] && key[1] > bestKey[1])) {
         best = { opp: o, from, to, marginal: chk.marginalNetApr };

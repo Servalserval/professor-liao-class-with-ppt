@@ -28,18 +28,23 @@ export function dctx(args: {
   tokens?: Record<string, TokenProfile>;
   cooldown?: Record<string, number>;
   paused?: boolean;
+  idle?: number;
+  hedges?: Record<string, number>;
 } = {}): DecisionContext {
   const positions = args.positions ?? [];
+  const equity = args.equity ?? 100_000;
   return {
     cfg: args.cfg ?? cfgWith(),
     nowMs: NOW,
     tokens: args.tokens ?? {},
-    totalEquityUsd: args.equity ?? 100_000,
+    totalEquityUsd: equity,
     positions,
     exposure: computeExposure(positions),
     history: newHistory(),
     cooldownUntil: args.cooldown ?? {},
     paused: args.paused ?? false,
+    idleUsd: args.idle ?? equity - positions.reduce((a, p) => a + p.equityUsd, 0),
+    hedges: args.hedges ?? {},
   };
 }
 

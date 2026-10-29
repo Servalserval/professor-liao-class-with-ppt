@@ -7,11 +7,18 @@ import { fetchJson, type FetchLike, type Source, type SourceContext } from "./ty
  * DefiLlama yields scanner (https://yields.llama.fi/pools).
  *
  * Pool fields per the DefiLlama yield-server adaptor spec: pool, chain,
- * project, symbol, tvlUsd, apyBase, apyReward (both in %), rewardTokens,
+ * project, symbol, tvlUsd, apyBase, apyReward (both APY in %), rewardTokens,
  * underlyingTokens, poolMeta, and for lending markets apyBaseBorrow,
  * apyRewardBorrow, totalSupplyUsd, totalBorrowUsd, ltv (0..1).
  * For lending pools tvlUsd = totalSupplyUsd - totalBorrowUsd (= available
  * liquidity, exactly what the 1/10 rule needs).
+ *
+ * The public API appears to serve the borrow-side fields from a separate
+ * endpoint (/lendBorrow, keyed by `pool`) rather than inside /pools; the
+ * source fetches both and joins them (a /lendBorrow failure just means no
+ * loop candidates). Verify with `verify-sources` before trusting it.
+ * All APYs are converted to APR (daily compounding) because every rule in
+ * the router works in APR.
  *
  * Two kinds of candidates come out of it:
  *  - lending pools with borrow data -> a same-asset loop candidate, priced at
@@ -27,11 +34,36 @@ export interface DefiLlamaOptions {
   minTvlUsd?: number;
   rewardSymbols?: Record<string, string>;
   baseUrl?: string;
+  lendBorrowUrl?: string;
 }
 
 type J = Record<string, unknown>;
 const num = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 const str = (v: unknown): string | undefined => (typeof v === "string" && v.length ? v : undefined);
+
+/** APY in percent -> APR as a yearly fraction, assuming daily compounding. */
+export function apyPctToApr(pct: number | undefined): number {
+  if (pct === undefined) return 0;
+  const apy = pct / 100;
+  if (apy <= -1) return apy;
+  return 365 * (Math.pow(1 + apy, 1 / 365) - 1);
+}
+
+const LEND_BORROW_FIELDS = ["apyBaseBorrow", "apyRewardBorrow", "totalSupplyUsd", "totalBorrowUsd", "ltv", "borrowable"];
+
+/** Merge /lendBorrow rows into /pools rows by `pool` id (borrow fields only). */
+export function joinLendBorrow(pools: J[], lendBorrow: unknown): J[] {
+  const rows = Array.isArray(lendBorrow) ? lendBorrow : Array.isArray((lendBorrow as J)?.data) ? ((lendBorrow as J).data as unknown[]) : [];
+  const byPool = new Map<string, J>();
+  for (const r of rows) if (r && typeof r === "object" && str((r as J).pool)) byPool.set(str((r as J).pool)!, r as J);
+  return pools.map((p) => {
+    const lb = byPool.get(str(p.pool) ?? "");
+    if (!lb) return p;
+    const extra: J = {};
+    for (const k of LEND_BORROW_FIELDS) if (lb[k] !== undefined && lb[k] !== null) extra[k] = lb[k];
+    return { ...p, ...extra };
+  });
+}
 
 export function llamaPoolToOpportunities(p: J, ctx: SourceContext, sourceId: string, opts: DefiLlamaOptions = {}): Opportunity[] {
   const out: Opportunity[] = [];
@@ -44,8 +76,8 @@ export function llamaPoolToOpportunities(p: J, ctx: SourceContext, sourceId: str
   if (opts.projects?.length && !opts.projects.includes(project)) return out;
   if (tvl < (opts.minTvlUsd ?? ctx.cfg.sources.discovery.min_tvl_usd)) return out;
 
-  const apyBase = (num(p.apyBase) ?? 0) / 100;
-  const apyReward = (num(p.apyReward) ?? 0) / 100;
+  const apyBase = apyPctToApr(num(p.apyBase));
+  const apyReward = apyPctToApr(num(p.apyReward));
   const rewardAddrs = Array.isArray(p.rewardTokens) ? (p.rewardTokens as unknown[]).map(str).filter((x): x is string => !!x) : [];
   const rewardToken = rewardAddrs.length ? opts.rewardSymbols?.[rewardAddrs[0]!.toLowerCase()] ?? `${project}:reward` : `${project}:reward`;
 
@@ -61,9 +93,9 @@ export function llamaPoolToOpportunities(p: J, ctx: SourceContext, sourceId: str
       totalSupplyUsd: totalSupply,
       totalBorrowUsd: totalBorrow,
       supplyAprBase: apyBase,
-      borrowAprBase: borrowBase / 100,
+      borrowAprBase: apyPctToApr(borrowBase),
       supplyRewards: apyReward > 0 ? [{ token: rewardToken, apr: apyReward }] : [],
-      borrowRewards: (num(p.apyRewardBorrow) ?? 0) > 0 ? [{ token: rewardToken, apr: (num(p.apyRewardBorrow) ?? 0) / 100 }] : [],
+      borrowRewards: (num(p.apyRewardBorrow) ?? 0) > 0 ? [{ token: rewardToken, apr: apyPctToApr(num(p.apyRewardBorrow)) }] : [],
       openLtv: ltv,
       closeLtv: Math.min(0.99, ltv + 0.05),
     };
@@ -125,9 +157,13 @@ export class DefiLlamaSource implements Source {
     this.id = id;
   }
   async fetch(ctx: SourceContext): Promise<Opportunity[]> {
-    const body = await fetchJson(this.fetchImpl, this.opts.baseUrl ?? "https://yields.llama.fi/pools", 30_000);
+    const [body, lb] = await Promise.all([
+      fetchJson(this.fetchImpl, this.opts.baseUrl ?? "https://yields.llama.fi/pools", 30_000),
+      fetchJson(this.fetchImpl, this.opts.lendBorrowUrl ?? "https://yields.llama.fi/lendBorrow", 30_000).catch(() => []),
+    ]);
     const data = (body as J)?.data;
     if (!Array.isArray(data)) throw new Error("defillama: response has no data[]");
-    return data.flatMap((p) => (p && typeof p === "object" ? llamaPoolToOpportunities(p as J, ctx, this.id, this.opts) : []));
+    const pools = joinLendBorrow(data.filter((p): p is J => !!p && typeof p === "object"), lb);
+    return pools.flatMap((p) => llamaPoolToOpportunities(p, ctx, this.id, this.opts));
   }
 }

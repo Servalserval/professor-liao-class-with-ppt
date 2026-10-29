@@ -35,6 +35,7 @@ opportunities:
     token: USDC
     capacity_usd: 10000000
     footprint_per_equity: 3.33
+    health: {metric: ltv, value: 0.70, rebalance_at: 0.78, critical_at: 0.85}
     streams:
       - {label: supply_base, kind: base, apr: 0.20}
       - {label: borrow_base, kind: borrow_cost, apr: -0.1867}

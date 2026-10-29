@@ -77,7 +77,10 @@ describe("router", () => {
     r.tick();
     const after = await r.router.cycle();
     assert.equal(after.executed.filter((x) => x.action.type === "enter").length, 0, "paused after kill");
-    assert.equal(r.router.handleCommand({ cmd: "/resume", args: [] }), "resumed");
+    assert.match(r.router.handleCommand({ cmd: "/resume", args: [] }), /resumed/);
+    r.tick();
+    const re = await r.router.cycle();
+    assert.equal(re.killed, false, "resume re-arms the window instead of re-killing");
   });
 
   it("manual /exit via telegram command", async () => {

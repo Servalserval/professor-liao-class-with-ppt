@@ -116,7 +116,8 @@ export function lpIncentiveOpportunity(input: LpIncentiveInput, ctx: SourceConte
       ongoingApr: lvrApr + hedgeCost,
     },
     // on the way out half the equity is the volatile side that must be sold
-    liquidity: { exitCapacityUsd: input.exitCapacityUsd, footprintPerEquity: input.hedged ? 0.1 : 0.5 },
+    // (hedged or not: withdrawing the LP still hands you the volatile token)
+    liquidity: { exitCapacityUsd: input.exitCapacityUsd, footprintPerEquity: 0.5 },
     signals:
       input.priceDeviation !== undefined
         ? [

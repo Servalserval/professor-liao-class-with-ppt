@@ -19,13 +19,13 @@
 - **出場優先序**：通用版 1/5 規則、壓力訊號、流動性被抽乾、出口模擬失敗、獎勵即將結束、利差壓縮（去抖動、分段減倉）、被自己稀釋。
 - **配置器**：按邊際淨 APR 做水位填充。
 - **獎勵處理**：領了就賣／對沖／持有，崩盤自動賣，單一獎勵幣曝險上限。
-- **組合保護**：回撤熔斷、資料源失聯出場、告警去重、Telegram 指令。
+- **組合保護**：回撤熔斷、資料驗證與過期判定、資料源失聯出場、全退鎖存重試、告警去重、Telegram 指令。
 
 ## 快速開始
 
 ```bash
 npm install
-npm test                 # 60 個測試，包含兩個情境的整合測試
+npm test                 # 79 個測試：單元、兩個情境的整合測試、獨立審查的回歸測試
 npm run typecheck
 
 # 用範例機會掃描（--why 顯示沒過的原因）
@@ -34,7 +34,8 @@ npx tsx src/cli.ts scan --static examples/static.yaml --tokens examples/tokens.y
 
 # 用 Merkl / DefiLlama 的離線樣本掃描（有網路時改用 --live）
 npx tsx src/cli.ts scan --merkl-fixture examples/fixtures/merkl-opportunities.json \
-  --llama-fixture examples/fixtures/defillama-pools.json --config config/default.yaml --why
+  --llama-fixture examples/fixtures/defillama-pools.json \
+  --llama-lendborrow-fixture examples/fixtures/defillama-lendborrow.json --why
 
 # 情境重播：Plasma 式獎勵崩盤、擠兌／出口失效／資料源失聯
 npx tsx src/cli.ts sim examples/scenarios/plasma-reward-collapse.yaml
@@ -66,6 +67,7 @@ src/
   allocator.ts        邊際 APR 水位填充
   rewards.ts          領取／賣出／對沖
   monitor.ts          Router：每輪的觀察 → 出場 → 出口模擬 → 獎勵 → 配置
+  validate.ts         進來的資料是否為有限數字、是否過期
   store.ts notify.ts executor.ts scenario.ts cli.ts
   sources/
     loopLending.ts    同資產循環貸（含 IRM、loop-farm MarketState 轉接）
@@ -83,5 +85,6 @@ docs/design.md        設計說明
 ## 接上真實協議
 
 1. 寫一個 `Source`：回傳 `Opportunity[]`。循環貸可以直接用 `LoopLendingSource` 包 loop-farm 的 market provider（見 `fromLoopFarmMarket`）。
-2. 寫一個 `Executor`：`enter / exit / rebalance / simulateExit / claim / sell / hedge`，全部以 USD 為介面。
+2. 寫一個 `Executor`：`enter / exit / rebalance / simulateExit / claim / sell / hedge`，全部以 USD 為介面；
+   實盤再加 `markToMarket`，讓熔斷看得到真實損益。source 請設 `dataAsOfMs`，槓桿部位請給健康度。
 3. 在 `Router` 的 `executors` 用 `sourceId` 對應起來。沒有 executor 的 source 只會出現在掃描報告。

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { llamaPoolToOpportunities } from "../src/sources/defillama.js";
+import { apyPctToApr, joinLendBorrow, llamaPoolToOpportunities } from "../src/sources/defillama.js";
 import { fromLoopFarmMarket, interpIrm, loopLeverage, loopOpportunity, type LoopMarket } from "../src/sources/loopLending.js";
 import { lpIncentiveOpportunity } from "../src/sources/lpIncentive.js";
 import { checkMerklShape, merklToOpportunity, toMs } from "../src/sources/merkl.js";
@@ -173,6 +173,7 @@ describe("LP incentive source", () => {
 describe("discovery sources", () => {
   const merkl = JSON.parse(readFileSync("examples/fixtures/merkl-opportunities.json", "utf8")) as unknown[];
   const llama = JSON.parse(readFileSync("examples/fixtures/defillama-pools.json", "utf8")) as { data: Record<string, unknown>[] };
+  const lendBorrow = JSON.parse(readFileSync("examples/fixtures/defillama-lendborrow.json", "utf8")) as unknown;
 
   it("maps Merkl LIVE opportunities, drops PAST, reads campaign end in seconds", () => {
     assert.deepEqual(checkMerklShape(merkl), []);
@@ -186,8 +187,17 @@ describe("discovery sources", () => {
     assert.equal(o.streams[0]!.endsAtMs, 1793900000 * 1000);
     assert.equal(toMs(1793900000123), 1793900000123);
   });
-  it("turns DefiLlama lending pools into loop candidates and reward pools into deposits", () => {
+  it("converts APY% to APR", () => {
+    assert.ok(close(apyPctToApr(0), 0));
+    assert.ok(close(apyPctToApr(10.516), 0.1, 1e-4)); // e^0.1 - 1 = 10.517%
+    assert.ok(apyPctToApr(300) < 3);
+  });
+  it("without /lendBorrow there are no loop candidates", () => {
     const ops = llama.data.flatMap((p) => llamaPoolToOpportunities(p, sctx(), "llama"));
+    assert.ok(!ops.some((o) => o.kind === "lending_loop"));
+  });
+  it("turns DefiLlama lending pools into loop candidates and reward pools into deposits", () => {
+    const ops = joinLendBorrow(llama.data, lendBorrow).flatMap((p) => llamaPoolToOpportunities(p, sctx(), "llama"));
     const kinds = ops.map((o) => `${o.kind}:${o.primaryVenue}`);
     assert.ok(kinds.includes("lending_loop:suilend"));
     assert.ok(kinds.includes("lending_loop:aave-v3"));

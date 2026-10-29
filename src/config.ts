@@ -41,8 +41,9 @@ export interface RouterConfig {
     hard_floor_apr: number;
     /** Fraction to trim per decision when the spread is merely below the exit threshold. */
     spread_reduce_step: number;
-    /** Non-urgent exit reasons must persist this many cycles. */
+    /** Non-urgent exit reasons must persist this many cycles AND this many minutes. */
     confirm_cycles: number;
+    confirm_minutes: number;
   };
 
   liquidity: {
@@ -66,6 +67,8 @@ export interface RouterConfig {
     vol_penalty_k: number;
     /** 24h price drop that triggers claim-and-dump. */
     price_crash_frac: number;
+    /** Crash / over-cap claims skip the schedule but not this minimum spacing (gas churn). */
+    urgent_claim_min_interval_hours: number;
     /** Reward APR drop within the window that raises an emission-cut warning. */
     emission_drop_frac: number;
     emission_drop_window_hours: number;
@@ -85,8 +88,9 @@ export interface RouterConfig {
     realizable: number;
   };
 
-  /** Raise an exit flag when a tracked metric jumps by >= abs value between two cycles. */
+  /** Raise an exit flag when a tracked metric rises by >= abs value vs its low within the window. */
   spike_rules: Record<string, number>;
+  spike_window_minutes: number;
 
   caps: {
     per_venue_frac_by_tier: Record<Tier, number>;
@@ -120,8 +124,12 @@ export interface RouterConfig {
     kill_window_hours: number;
     blind_alert_cycles: number;
     blind_exit_cycles: number;
-    /** Repeated status alerts (same text modulo numbers) are re-sent at most this often. */
+    /** Repeated status alerts (same oppId + rule) are re-sent at most this often. */
     alert_repeat_hours: number;
+    /** Data older than this (Opportunity.dataAsOfMs) counts as not reported. */
+    max_data_age_minutes: number;
+    /** Held leveraged position (loop / perp hedge) whose source reports no health metric. */
+    health_missing: "warn" | "exit";
   };
 
   tiers: {
@@ -168,6 +176,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
     hard_floor_apr: 0.0,
     spread_reduce_step: 0.5,
     confirm_cycles: 2,
+    confirm_minutes: 10,
   },
   liquidity: {
     entry_max_frac_of_capacity: 0.1,
@@ -185,6 +194,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
     claim_gas_multiple: 5,
     vol_penalty_k: 1.0,
     price_crash_frac: 0.25,
+    urgent_claim_min_interval_hours: 6,
     emission_drop_frac: 0.5,
     emission_drop_window_hours: 24,
     default_token: {
@@ -198,6 +208,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
   points: { max_cost_apr: 0.03, budget_frac: 0.1 },
   funding: { realizable: 0.7 },
   spike_rules: { borrow_apr: 0.1 },
+  spike_window_minutes: 60,
   caps: {
     per_venue_frac_by_tier: { 1: 0.4, 2: 0.15, 3: 0.05 },
     per_chain_frac: { default: 0.6 },
@@ -225,6 +236,8 @@ export const DEFAULT_CONFIG: RouterConfig = {
     blind_alert_cycles: 3,
     blind_exit_cycles: 10,
     alert_repeat_hours: 6,
+    max_data_age_minutes: 10,
+    health_missing: "warn",
   },
   tiers: { tier1_min_score: 7, tier2_min_score: 4 },
   gas_usd: { default: 0.5, ethereum: 8, sui: 0.05, arbitrum: 0.1, base: 0.05 },

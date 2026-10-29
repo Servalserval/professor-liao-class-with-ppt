@@ -28,7 +28,10 @@ export interface PerpHedgeInput {
   short: PerpVenueQuote;
   /** Notional / margin on each leg. Equity is split evenly between the two venues. */
   leverage: number;
-  /** Extra round-trip volume farmed per year, as multiples of notional (0 = pure funding carry). */
+  /**
+   * Extra one-way volume traded per leg per year, as a multiple of notional
+   * (0 = pure funding carry). Each unit costs one fee on each leg.
+   */
   turnoverPerYear?: number;
   /** Your guess of $ per point. Undefined = points valued at 0 (shown as speculative only). */
   pointValueUsd?: number;

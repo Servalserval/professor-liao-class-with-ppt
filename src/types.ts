@@ -138,6 +138,13 @@ export interface Opportunity {
   /** My equity currently in this opportunity, as seen by the source. */
   myEquityUsd: number;
   observedAtMs: number;
+  /**
+   * When the underlying data was produced (block time, API updated_at).
+   * Adapters should set it; data older than `portfolio.max_data_age_minutes`
+   * is treated as not reported (blind), so a cached provider cannot keep a
+   * position "seen" with stale numbers.
+   */
+  dataAsOfMs?: number;
   meta?: Record<string, unknown>;
 }
 
@@ -163,8 +170,16 @@ export interface Position {
   exitProbe: { lastOkAtMs: number | null; consecutiveFailures: number };
   /** Debounce counters for non-urgent exit reasons. */
   pending: Record<string, number>;
+  /** When each debounced reason was first seen (time-based debounce). */
+  pendingSince?: Record<string, number>;
   /** Consecutive cycles the source did not report this opportunity. */
   blindCycles: number;
+  /**
+   * A full exit that was decided but has not succeeded yet. Latched: it is
+   * retried every cycle until the position is gone, even if the trigger
+   * (a one-cycle spike, a kill switch, a manual /exit) is no longer present.
+   */
+  forcedExit?: { reason: string; urgent: boolean; sinceMs: number };
 }
 
 export type Action =
@@ -174,7 +189,8 @@ export type Action =
   | { type: "claim"; oppId: string; token: string; amountUsd: number; reason: string }
   | { type: "sell"; oppId: string; token: string; amountUsd: number; reason: string }
   | { type: "hedge"; token: string; targetShortUsd: number; reason: string }
-  | { type: "alert"; level: AlertLevel; message: string; dedupe?: boolean };
+  /** Status alerts carry a dedupe key (oppId + rule); event alerts never do. */
+  | { type: "alert"; level: AlertLevel; message: string; dedupeKey?: string };
 
 export type AlertLevel = "info" | "warn" | "critical";
 

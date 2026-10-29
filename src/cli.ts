@@ -42,9 +42,14 @@ function parseArgs(argv: string[]): { cmd: string; pos: string[]; flags: Flags }
 
 const s = (f: Flags, k: string): string | undefined => (typeof f[k] === "string" ? (f[k] as string) : undefined);
 
-/** A FetchLike that serves a local JSON file (offline fixtures). */
-function fileFetch(path: string): FetchLike {
-  return async () => ({ ok: true, status: 200, json: async () => JSON.parse(readFileSync(path, "utf8")) });
+/** A FetchLike that serves local JSON files (offline fixtures), routed by URL substring. */
+function fileFetch(routes: Record<string, string | undefined>, fallback: string): FetchLike {
+  return async (url: string) => {
+    const hit = Object.entries(routes).find(([k]) => url.includes(k));
+    const path = hit ? hit[1] : fallback;
+    if (!path) return { ok: false, status: 404, json: async () => null };
+    return { ok: true, status: 200, json: async () => JSON.parse(readFileSync(path, "utf8")) };
+  };
 }
 
 function buildSources(f: Flags): Source[] {
@@ -55,10 +60,13 @@ function buildSources(f: Flags): Source[] {
     out.push(new StaticSource(doc.opportunities ?? []));
   }
   const merkl = s(f, "merkl-fixture");
-  if (merkl) out.push(new MerklSource({}, fileFetch(merkl)));
+  if (merkl) out.push(new MerklSource({}, fileFetch({}, merkl)));
   else if (f["live"]) out.push(new MerklSource({ apiKey: process.env.MERKL_API_KEY }));
   const llama = s(f, "llama-fixture");
-  if (llama) out.push(new DefiLlamaSource({}, fileFetch(llama)));
+  if (llama) {
+    const lb = s(f, "llama-lendborrow-fixture");
+    out.push(new DefiLlamaSource({}, fileFetch({ lendBorrow: lb ?? "" }, llama)));
+  }
   else if (f["live"]) out.push(new DefiLlamaSource({}));
   return out;
 }
@@ -98,6 +106,8 @@ async function cmdScan(cfg: RouterConfig, f: Flags) {
     history: newHistory(),
     cooldownUntil: {},
     paused: false,
+    idleUsd: equity,
+    hedges: {},
   };
   const rows = opps.map((o) => {
     const v = valueAt(o, probe, ctx);
@@ -170,6 +180,8 @@ async function cmdPlan(cfg: RouterConfig, f: Flags) {
     history: st.history,
     cooldownUntil: st.cooldownUntil,
     paused: st.paused,
+    idleUsd: st.idleUsd,
+    hedges: st.hedges,
   });
   console.log(`deployable $${Math.round(plan.deployableUsd)} of $${Math.round(total)}`);
   for (const e of plan.entries)
@@ -218,7 +230,7 @@ async function cmdVerify(cfg: RouterConfig) {
 
 const HELP = `incentive-router
 
-  scan   [--static f.yaml] [--merkl-fixture f.json] [--llama-fixture f.json] [--live]
+  scan   [--static f.yaml] [--merkl-fixture f.json] [--llama-fixture f.json [--llama-lendborrow-fixture f.json]] [--live]
          [--tokens tokens.yaml] [--probe 10000] [--equity 100000] [--top 30] [--why] [--json]
   plan   (same source flags) [--state dir] [--paper] [--why]
   sim    <scenario.yaml> [--verbose]

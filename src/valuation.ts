@@ -40,6 +40,12 @@ export interface ValueOptions {
   excludeEndingWithinMs?: number;
   /** Position already exists: entry cost is sunk, exit cost is paid either way. */
   holding?: boolean;
+  /**
+   * Value streams at their current rate until they end (no horizon
+   * time-weighting). Used for hold decisions: whether a stream that ends
+   * soon still carries the edge is rule 6's job, not the spread rule's.
+   */
+  noTimeWeight?: boolean;
 }
 
 const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
@@ -68,9 +74,12 @@ export function rewardRealizable(
 ): number {
   const { cfg } = ctx;
   const p = ctx.tokens[token];
-  if (!p) return cfg.rewards.default_realizable;
+  // A price alone says nothing about how sellable the token is: without depth
+  // AND volatility we fall back to the conservative default.
+  if (!p || !(p.depth2pctUsd !== undefined && p.depth2pctUsd > 0) || p.vol === undefined)
+    return cfg.rewards.default_realizable;
   const tc = rewardTokenConfig(cfg, token);
-  const slip = p.depth2pctUsd && p.depth2pctUsd > 0 ? Math.min(0.5, (0.02 * claimSizeUsd) / p.depth2pctUsd) : 0.05;
+  const slip = Math.min(0.5, (0.02 * claimSizeUsd) / p.depth2pctUsd);
   let drift: number;
   if (tc.policy === "hedge" && p.perpAvailable) {
     const t = tc.claim_interval_hours / YEAR_HOURS;
@@ -83,10 +92,11 @@ export function rewardRealizable(
   return clamp(1 - slip - drift, cfg.rewards.min_realizable, cfg.rewards.max_realizable);
 }
 
-function timeWeight(ctx: ValuationContext, endsAtMs: number | null | undefined): number {
+function timeWeight(ctx: ValuationContext, endsAtMs: number | null | undefined, noTimeWeight = false): number {
   if (endsAtMs === null || endsAtMs === undefined) return 1;
   const remaining = endsAtMs - ctx.nowMs;
   if (remaining <= 0) return 0;
+  if (noTimeWeight) return 1;
   return clamp(remaining / (ctx.cfg.hold_horizon_days * DAY), 0, 1);
 }
 
@@ -123,18 +133,19 @@ export function valueAt(
         const tc = rewardTokenConfig(cfg, s.rewardToken ?? "?");
         const claimSize = equityUsd * Math.max(0, raw) * (tc.claim_interval_hours / YEAR_HOURS);
         realizable = rewardRealizable(ctx, s.rewardToken ?? "?", claimSize);
-        tw = timeWeight(ctx, s.endsAtMs);
+        tw = timeWeight(ctx, s.endsAtMs, opts.noTimeWeight);
         break;
       }
       case "funding":
         realizable = raw > 0 ? cfg.funding.realizable : 1;
-        tw = timeWeight(ctx, s.endsAtMs);
+        tw = timeWeight(ctx, s.endsAtMs, opts.noTimeWeight);
         break;
       default:
-        tw = timeWeight(ctx, s.endsAtMs);
+        tw = timeWeight(ctx, s.endsAtMs, opts.noTimeWeight);
     }
-    // Costs (negative streams) are never haircut down: we pay them in full.
-    const valued = raw < 0 ? raw : raw * realizable * tw;
+    // Costs (negative streams) are never haircut down: we pay them in full
+    // while the stream is alive (a borrow that "ends" is not a thing, but be exact).
+    const valued = raw < 0 ? raw * (tw > 0 ? 1 : 0) : raw * realizable * tw;
     rawApr += raw;
     realizableApr += valued;
     streams.push({ label: s.label, kind: s.kind, rawApr: raw, realizable, timeWeight: tw, valuedApr: valued });
@@ -157,7 +168,8 @@ export function costAprAt(opp: Opportunity, equityUsd: number, ctx: ValuationCon
   const c = opp.costs;
   if (holding) return c.ongoingApr; // entry is sunk; exit cost is paid whether we leave now or later
   const perYear = 365 / ctx.cfg.hold_horizon_days;
-  const fixed = equityUsd > 0 ? ((c.fixedEntryUsd + c.fixedExitUsd) / equityUsd) * perYear : Infinity;
+  const fixedUsd = c.fixedEntryUsd + c.fixedExitUsd;
+  const fixed = fixedUsd <= 0 ? 0 : equityUsd > 0 ? (fixedUsd / equityUsd) * perYear : Infinity;
   return c.ongoingApr + (c.entryFrac + c.exitFrac) * perYear + fixed;
 }
 
@@ -179,6 +191,18 @@ export function marginalNetApr(opp: Opportunity, fromUsd: number, toUsd: number,
   const after = valueAt(opp, toUsd, ctx, { holding: true }).netApr * toUsd;
   const before = valueAt(opp, fromUsd, ctx, { holding: true }).netApr * fromUsd;
   return (after - before - oneOffsPerYear) / delta;
+}
+
+/**
+ * Net APR earned by money ALREADY held between `fromUsd` and `toUsd` (no
+ * one-offs: they are sunk for held money). Used by the "oversized" exit rule.
+ */
+export function marginalHoldApr(opp: Opportunity, fromUsd: number, toUsd: number, ctx: ValuationContext): number {
+  if (toUsd <= fromUsd) return -Infinity;
+  const o: ValueOptions = { holding: true, noTimeWeight: true };
+  const after = valueAt(opp, toUsd, ctx, o).netApr * toUsd;
+  const before = valueAt(opp, fromUsd, ctx, o).netApr * fromUsd;
+  return (after - before) / (toUsd - fromUsd);
 }
 
 // ---------------------------------------------------------------------------

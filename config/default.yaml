@@ -14,7 +14,8 @@ thresholds:
   exit_premium_by_tier:  {1: 0.00, 2: 0.02, 3: 0.05}   # leave if net <  baseline + premium (hysteresis)
   hard_floor_apr: 0.0          # below this: close fully instead of trimming
   spread_reduce_step: 0.5      # trim size per confirmed spread breach
-  confirm_cycles: 2            # non-urgent reasons must persist this many cycles
+  confirm_cycles: 2            # non-urgent reasons must persist this many cycles...
+  confirm_minutes: 10          # ...and at least this long (a 60s poll alone would be a 2-min debounce)
 
 # The generalized 1/10 -> 1/5 rule. "capacity" = what can get out (lending: available
 # liquidity; LP: depth for the volatile side; perp: min book depth of both venues).
@@ -34,6 +35,7 @@ rewards:
   claim_gas_multiple: 5                # never claim < 5x gas (crash: 1x)
   vol_penalty_k: 1.0
   price_crash_frac: 0.25               # reward token -25% in 24h -> claim and dump
+  urgent_claim_min_interval_hours: 6   # crash / over-cap claims still wait this long between claims
   emission_drop_frac: 0.5              # pool reward APR halves within the window -> warn
   emission_drop_window_hours: 24
   default_token: {policy: sell_on_claim, max_hold_usd: 0, claim_interval_hours: 24, claim_min_usd: 50}
@@ -49,7 +51,8 @@ points:
 funding:
   realizable: 0.7             # positive funding valued at 70% (it flips); negative counted in full
 
-spike_rules:                  # metric jump between two cycles -> FULL EXIT
+spike_window_minutes: 60      # spike = current minus the LOW of this window (catches ramps too)
+spike_rules:                  # metric jump -> FULL EXIT
   borrow_apr: 0.10            # loop-farm: borrow APR +10pp
   # funding_flip_apr: 0.50    # perp hedges: funding diff collapses by 50pp annualized
 
@@ -82,7 +85,9 @@ portfolio:
   kill_window_hours: 24
   blind_alert_cycles: 3       # source missing a held opportunity
   blind_exit_cycles: 10
-  alert_repeat_hours: 6       # status alerts are deduped (numbers ignored) within this window
+  alert_repeat_hours: 6       # status alerts are deduped per (opportunity, rule) within this window
+  max_data_age_minutes: 10    # adapters set dataAsOfMs; older data = blind
+  health_missing: warn        # held loop / perp hedge without a health metric: warn | exit
 
 tiers:                        # see src/tiers.ts for the score
   tier1_min_score: 7

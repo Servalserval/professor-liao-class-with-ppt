@@ -7,6 +7,8 @@ export interface ExecResult {
    * sell: USD proceeds; claim: USD claimed; hedge: new short notional.
    */
   amountUsd?: number;
+  /** enter: USD actually taken from idle (may differ from the request on partial fills). */
+  spentUsd?: number;
   detail?: string;
   txIds?: string[];
 }
@@ -28,6 +30,13 @@ export interface Executor {
   claim(pos: Position, token: string, amountUsd: number): Promise<ExecResult>;
   sell(pos: Position, token: string, amountUsd: number): Promise<ExecResult>;
   hedge(token: string, targetShortUsd: number): Promise<ExecResult>;
+  /**
+   * Live mode: current USD value of the position (collateral - debt, LP value,
+   * margin + unrealized PnL). The router replaces its book value with this
+   * every cycle so exploits, bad debt, IL and perp PnL show up in the
+   * drawdown kill switch. Paper mode leaves it undefined.
+   */
+  markToMarket?(pos: Position, opp?: Opportunity): Promise<number>;
 }
 
 export interface PaperOptions {
@@ -42,7 +51,7 @@ export interface PaperOptions {
 /** Dry-run executor: never touches a chain, applies the opportunity's cost model. */
 export class PaperExecutor implements Executor {
   readonly log: string[] = [];
-  constructor(private readonly opts: PaperOptions = {}) {}
+  constructor(public opts: PaperOptions = {}) {}
 
   async enter(opp: Opportunity, deltaUsd: number): Promise<ExecResult> {
     const cost = deltaUsd * opp.costs.entryFrac + opp.costs.fixedEntryUsd;

@@ -128,6 +128,7 @@ describe("exit gates", () => {
   it("spread compression is debounced, then trims, then closes below the floor", () => {
     const thin = opp({ streams: [constantStream("b", "base", 0.03)] }); // < 4.5% exit threshold, > 0 floor
     const { p, ctx } = ctxFor(thin, 10_000);
+    ctx.cfg = cfgWith({ thresholds: { confirm_minutes: 0 } });
     const d1 = decideExit(p, thin, [], ctx);
     assert.equal(exits(d1.actions).length, 0);
     p.pending = d1.pending;
@@ -136,6 +137,7 @@ describe("exit gates", () => {
     assert.equal(e2[0]!.fraction, ctx.cfg.thresholds.spread_reduce_step);
     const neg = opp({ streams: [constantStream("b", "base", -0.01)] });
     const q = ctxFor(neg, 10_000, { pending: { spread: 1 } });
+    q.ctx.cfg = ctx.cfg;
     assert.equal(exits(decideExit(q.p, neg, [], q.ctx).actions)[0]!.fraction, 1);
   });
   it("trims the last chunk when my own size diluted it below the exit threshold", () => {
@@ -144,7 +146,7 @@ describe("exit gates", () => {
       streams: [proRataStream({ label: "r", kind: "base", aprNow: 0.1, poolUsd: 100_000, grossPerEquity: 1, myEquityNowUsd: 60_000, aprMultiplier: 1 })],
       liquidity: { exitCapacityUsd: 1e9, footprintPerEquity: 1 },
     });
-    const { p, ctx } = ctxFor(diluted, 60_000, { pending: { oversized: 1 } });
+    const { p, ctx } = ctxFor(diluted, 60_000, { pending: { oversized: 1 }, pendingSince: { oversized: NOW - 20 * 60_000 } });
     const e = exits(decideExit(p, diluted, [], ctx).actions);
     assert.equal(e.length, 1);
     assert.ok(e[0]!.fraction < 0.1);

@@ -1,7 +1,7 @@
 import { exitThreshold, venueTier } from "../tiers.js";
 import type { Action, Flag, Opportunity, Position } from "../types.js";
-import { marginalNetApr, valueAt } from "../valuation.js";
-import { liquidityUsage, signalLevel, type DecisionContext } from "./common.js";
+import { marginalHoldApr, valueAt } from "../valuation.js";
+import { LEVERAGED_KINDS, liquidityUsage, signalLevel, type DecisionContext } from "./common.js";
 
 const HOUR = 3600_000;
 const pct = (x: number) => `${(x * 100).toFixed(2)}%`;
@@ -10,6 +10,7 @@ export interface ExitDecision {
   actions: Action[];
   /** Updated debounce counters for the position. */
   pending: Record<string, number>;
+  pendingSince: Record<string, number>;
 }
 
 function fullExit(oppId: string, reason: string, urgent: boolean): Action[] {
@@ -20,20 +21,23 @@ function fullExit(oppId: string, reason: string, urgent: boolean): Action[] {
 }
 
 /**
- * Exit rules in priority order. The first urgent rule wins and returns
+ * Exit rules in priority order. The first full-exit rule wins and returns
  * immediately: in a bank run the first one out gets paid, so liquidity and
  * stress exits are always full and never debounced (loop-farm: "流動性警報要一次全跑").
- * Spread compression is debounced and handled stepwise.
+ * Any full exit is LATCHED by the router (Position.forcedExit) and retried
+ * every cycle until it succeeds. Spread compression is debounced and stepwise.
  *
- *  0. blind            source has not reported the opportunity for N cycles
+ *  F. forced           a previously decided full exit has not succeeded yet
+ *  5. exit path        simulated exit failed repeatedly -> leave while it still works
+ *                      (checked before blind: a blind position with a dead exit path must not wait 10 cycles)
+ *  0. blind            source has not (validly) reported the opportunity for N cycles
  *  1. exit flags       paused market, depeg, capacity drain, metric spike ...
  *  2. liquidity        my exit footprint >= 20% of exit capacity (the 1/5 rule)
  *  3. stress signals   utilization >= 95%, basis blow-out ...
- *  4. health           LTV / liquidation distance critical (rebalance first if only drifting)
- *  5. exit path        simulated exit failed repeatedly -> leave while it still works
+ *  4. health           critical -> exit; drifting -> rebalance; missing on a leveraged position -> warn/exit
  *  6. reward ending    edge does not survive without the streams that end soon
  *  7. spread           realized net APR < exit threshold (hysteresis) -> trim / close
- *  8. oversized        marginal dollars earn < exit threshold -> trim one chunk
+ *  8. oversized        held marginal dollars earn < exit threshold -> trim one chunk
  */
 export function decideExit(
   pos: Position,
@@ -43,52 +47,70 @@ export function decideExit(
 ): ExitDecision {
   const { cfg } = ctx;
   const pending = { ...pos.pending };
+  const pendingSince = { ...(pos.pendingSince ?? {}) };
   const actions: Action[] = [];
+  const done = (a: Action[]): ExitDecision => ({ actions: a, pending, pendingSince });
+
+  // F) latched exit
+  if (pos.forcedExit) {
+    const f = pos.forcedExit;
+    return done(fullExit(pos.oppId, f.sinceMs < ctx.nowMs ? `retry: ${f.reason}` : f.reason, f.urgent));
+  }
+
+  // 5) exit path (before blind on purpose)
+  if (pos.exitProbe.consecutiveFailures >= cfg.exit_probe.max_consecutive_failures)
+    return done(
+      fullExit(pos.oppId, `exit simulation failed ${pos.exitProbe.consecutiveFailures}x — leaving while the path may still work`, true)
+    );
 
   // 0) blind
   if (!opp) {
+    // counters measured on data we can no longer see are meaningless
+    for (const k of Object.keys(pending)) delete pending[k];
+    for (const k of Object.keys(pendingSince)) delete pendingSince[k];
     if (pos.blindCycles >= cfg.portfolio.blind_exit_cycles)
-      return { actions: fullExit(pos.oppId, `source blind for ${pos.blindCycles} cycles`, true), pending };
+      return done(fullExit(pos.oppId, `source blind for ${pos.blindCycles} cycles`, true));
     if (pos.blindCycles >= cfg.portfolio.blind_alert_cycles)
-      actions.push({ type: "alert", level: "critical", message: `${pos.oppId}: source blind for ${pos.blindCycles} cycles`, dedupe: true });
-    return { actions, pending };
+      actions.push({
+        type: "alert",
+        level: "critical",
+        message: `${pos.oppId}: source blind for ${pos.blindCycles} cycles`,
+        dedupeKey: `${pos.oppId}|blind`,
+      });
+    return done(actions);
   }
 
   // 1) exit-severity flags (source + derived)
   const flags = [...opp.flags, ...derived];
   const exitFlag = flags.find((f) => f.severity === "exit");
-  if (exitFlag) return { actions: fullExit(pos.oppId, `flag ${exitFlag.name}${exitFlag.detail ? `: ${exitFlag.detail}` : ""}`, true), pending };
+  if (exitFlag) return done(fullExit(pos.oppId, `flag ${exitFlag.name}${exitFlag.detail ? `: ${exitFlag.detail}` : ""}`, true));
 
   // 2) liquidity (the 1/5 rule)
   const usage = liquidityUsage(cfg, opp, pos.equityUsd);
   if (usage >= cfg.liquidity.exit_frac_of_capacity)
-    return {
-      actions: fullExit(pos.oppId, `position needs ${pct(usage)} of exit capacity >= ${pct(cfg.liquidity.exit_frac_of_capacity)}`, true),
-      pending,
-    };
+    return done(fullExit(pos.oppId, `position needs ${pct(usage)} of exit capacity >= ${pct(cfg.liquidity.exit_frac_of_capacity)}`, true));
 
   // 3) stress signals at exit level
-  for (const s of opp.signals) {
-    if (signalLevel(s) === "exit")
-      return { actions: fullExit(pos.oppId, `signal ${s.name}=${s.value.toFixed(4)} past ${s.exitAt}`, true), pending };
-  }
+  for (const s of opp.signals)
+    if (signalLevel(s) === "exit") return done(fullExit(pos.oppId, `signal ${s.name}=${s.value.toFixed(4)} past ${s.exitAt}`, true));
 
   // 4) health
   if (opp.health) {
     const h = opp.health;
     const past = (v: number, lim: number) => (h.direction === "above" ? v >= lim : v <= lim);
-    if (past(h.value, h.criticalAt))
-      return { actions: fullExit(pos.oppId, `health ${h.metric}=${h.value.toFixed(4)} critical`, true), pending };
+    if (past(h.value, h.criticalAt)) return done(fullExit(pos.oppId, `health ${h.metric}=${h.value.toFixed(4)} critical`, true));
     if (past(h.value, h.rebalanceAt))
       actions.push({ type: "rebalance", oppId: pos.oppId, reason: `${h.metric}=${h.value.toFixed(4)} past ${h.rebalanceAt}` });
+  } else if (LEVERAGED_KINDS.has(opp.kind)) {
+    if (cfg.portfolio.health_missing === "exit")
+      return done(fullExit(pos.oppId, "leveraged position without a health metric", true));
+    actions.push({
+      type: "alert",
+      level: "warn",
+      message: `${pos.oppId}: leveraged position but the source reports no health metric`,
+      dedupeKey: `${pos.oppId}|health_missing`,
+    });
   }
-
-  // 5) exit path
-  if (pos.exitProbe.consecutiveFailures >= cfg.exit_probe.max_consecutive_failures)
-    return {
-      actions: fullExit(pos.oppId, `exit simulation failed ${pos.exitProbe.consecutiveFailures}x — leaving while the path may still work`, true),
-      pending,
-    };
 
   const tier = venueTier(cfg, opp.primaryVenue);
   const threshold = opp.speculative ? -cfg.points.max_cost_apr : exitThreshold(cfg, tier);
@@ -99,64 +121,88 @@ export function decideExit(
     (s) => s.endsAtMs !== null && s.endsAtMs !== undefined && s.endsAtMs - ctx.nowMs <= endingMs
   );
   if (ending.length) {
-    const exEnding = valueAt(opp, pos.equityUsd, ctx, { holding: true, excludeEndingWithinMs: endingMs });
+    const exEnding = valueAt(opp, pos.equityUsd, ctx, { holding: true, noTimeWeight: true, excludeEndingWithinMs: endingMs });
     if (exEnding.netApr < threshold)
-      return {
-        actions: fullExit(
+      return done(
+        fullExit(
           pos.oppId,
           `${ending.map((s) => s.label).join(",")} ending within ${cfg.rewards.ending_hours}h; net without them ${pct(exEnding.netApr)} < ${pct(threshold)}`,
           false
-        ),
-        pending,
-      };
-  }
-
-  // 7) spread compression (debounced, stepwise)
-  const hold = valueAt(opp, pos.equityUsd, ctx, { holding: true });
-  if (hold.netApr < threshold) {
-    pending.spread = (pending.spread ?? 0) + 1;
-    if (pending.spread >= cfg.thresholds.confirm_cycles) {
-      pending.spread = 0;
-      const floor = opp.speculative ? -cfg.points.max_cost_apr * 2 : cfg.thresholds.hard_floor_apr;
-      if (hold.netApr < floor || pos.equityUsd * (1 - cfg.thresholds.spread_reduce_step) < cfg.caps.min_position_usd)
-        return { actions: fullExit(pos.oppId, `net APR ${pct(hold.netApr)} below floor/exit ${pct(threshold)}`, false), pending };
-      actions.push(
-        { type: "exit", oppId: pos.oppId, fraction: cfg.thresholds.spread_reduce_step, urgent: false, reason: `net APR ${pct(hold.netApr)} < exit ${pct(threshold)}` },
-        { type: "alert", level: "warn", message: `TRIM ${pos.oppId} by ${pct(cfg.thresholds.spread_reduce_step)}: net ${pct(hold.netApr)}` }
+        )
       );
-      return { actions, pending };
-    }
-  } else {
-    pending.spread = 0;
   }
 
-  // 8) oversized: the last chunk earns less than the exit threshold
+  /** Debounce: the reason must persist confirm_cycles cycles AND confirm_minutes. */
+  const confirmed = (key: string, active: boolean): boolean => {
+    if (!active) {
+      delete pending[key];
+      delete pendingSince[key];
+      return false;
+    }
+    pending[key] = (pending[key] ?? 0) + 1;
+    pendingSince[key] ??= ctx.nowMs;
+    const ok =
+      pending[key]! >= cfg.thresholds.confirm_cycles &&
+      ctx.nowMs - pendingSince[key]! >= cfg.thresholds.confirm_minutes * 60_000;
+    if (ok) {
+      delete pending[key];
+      delete pendingSince[key];
+    }
+    return ok;
+  };
+
+  // 7) spread compression (debounced, stepwise). Streams valued at their
+  //    current rate: an ending stream is rule 6's business.
+  const hold = valueAt(opp, pos.equityUsd, ctx, { holding: true, noTimeWeight: true });
+  if (confirmed("spread", hold.netApr < threshold)) {
+    const floor = opp.speculative ? -cfg.points.max_cost_apr * 2 : cfg.thresholds.hard_floor_apr;
+    if (hold.netApr < floor || pos.equityUsd * (1 - cfg.thresholds.spread_reduce_step) < cfg.caps.min_position_usd)
+      return done(fullExit(pos.oppId, `net APR ${pct(hold.netApr)} below floor/exit ${pct(threshold)}`, false));
+    actions.push(
+      { type: "exit", oppId: pos.oppId, fraction: cfg.thresholds.spread_reduce_step, urgent: false, reason: `net APR ${pct(hold.netApr)} < exit ${pct(threshold)}` },
+      { type: "alert", level: "warn", message: `TRIM ${pos.oppId} by ${pct(cfg.thresholds.spread_reduce_step)}: net ${pct(hold.netApr)}` }
+    );
+    return done(actions);
+  }
+
+  // 8) oversized: the last held chunk earns less than the exit threshold
+  //    (holding-only marginal: one-offs of money already in are sunk).
   const chunk = Math.max(cfg.allocator.min_chunk_usd, ctx.totalEquityUsd * cfg.allocator.chunk_frac);
-  if (pos.equityUsd - chunk >= cfg.caps.min_position_usd) {
-    const m = marginalNetApr(opp, pos.equityUsd - chunk, pos.equityUsd, ctx);
-    if (m < threshold) {
-      pending.oversized = (pending.oversized ?? 0) + 1;
-      if (pending.oversized >= cfg.thresholds.confirm_cycles) {
-        pending.oversized = 0;
-        actions.push({
-          type: "exit",
-          oppId: pos.oppId,
-          fraction: chunk / pos.equityUsd,
-          urgent: false,
-          reason: `last $${Math.round(chunk)} earns ${pct(m)} < ${pct(threshold)} (diluted)`,
-        });
-      }
-    } else pending.oversized = 0;
+  const canTrim = pos.equityUsd - chunk >= cfg.caps.min_position_usd;
+  const m = canTrim ? marginalHoldApr(opp, pos.equityUsd - chunk, pos.equityUsd, ctx) : Infinity;
+  if (confirmed("oversized", canTrim && m < threshold)) {
+    actions.push({
+      type: "exit",
+      oppId: pos.oppId,
+      fraction: chunk / pos.equityUsd,
+      urgent: false,
+      reason: `last $${Math.round(chunk)} earns ${pct(m)} < ${pct(threshold)} (diluted)`,
+    });
   }
 
   // warnings only
   for (const f of flags.filter((f) => f.severity === "warn"))
-    actions.push({ type: "alert", level: "warn", message: `${pos.oppId}: ${f.name}${f.detail ? ` (${f.detail})` : ""}`, dedupe: true });
+    actions.push({
+      type: "alert",
+      level: "warn",
+      message: `${pos.oppId}: ${f.name}${f.detail ? ` (${f.detail})` : ""}`,
+      dedupeKey: `${pos.oppId}|flag|${f.name}`,
+    });
   for (const s of opp.signals)
     if (signalLevel(s) === "warn")
-      actions.push({ type: "alert", level: "warn", message: `${pos.oppId}: ${s.name}=${s.value.toFixed(4)} past warn ${s.warnAt}`, dedupe: true });
+      actions.push({
+        type: "alert",
+        level: "warn",
+        message: `${pos.oppId}: ${s.name}=${s.value.toFixed(4)} past warn ${s.warnAt}`,
+        dedupeKey: `${pos.oppId}|signal|${s.name}`,
+      });
   if (usage >= cfg.liquidity.entry_max_frac_of_capacity)
-    actions.push({ type: "alert", level: "warn", message: `${pos.oppId}: uses ${pct(usage)} of exit capacity`, dedupe: true });
+    actions.push({
+      type: "alert",
+      level: "warn",
+      message: `${pos.oppId}: uses ${pct(usage)} of exit capacity`,
+      dedupeKey: `${pos.oppId}|usage`,
+    });
 
-  return { actions, pending };
+  return done(actions);
 }

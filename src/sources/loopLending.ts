@@ -82,7 +82,7 @@ export function loopOpportunity(
 ): Opportunity | null {
   const ll = ctx.cfg.sources.lending_loop;
   const ltv = Math.min(ll.target_ltv, m.openLtv * ll.max_ltv_frac_of_open);
-  if (!(ltv > 0) || m.totalSupplyUsd <= 0) return null;
+  if (!(ltv > 0) || !(m.totalSupplyUsd > 0) || !(m.totalBorrowUsd >= 0)) return null;
   const L = loopLeverage(ltv);
   const id = `${sourceId}:${m.protocol}:${m.symbol}`;
   const myE = ctx.myEquityByOpp[id] ?? 0;
@@ -239,10 +239,16 @@ export interface LoopFarmMarketStateLike {
   supplyRewardEndsAtMs?: number | null;
 }
 
+/**
+ * `myLtv`: pass the LTV of your open position (loop-farm's position health)
+ * so the router's health rule can deleverage / exit. Without it a held loop
+ * triggers the `health_missing` warning every cycle.
+ */
 export function fromLoopFarmMarket(
   ms: LoopFarmMarketStateLike,
   chain: string,
-  rewardToken: string
+  rewardToken: string,
+  myLtv?: number
 ): LoopMarket {
   const usd = (x: bigint) => (Number(x) / 10 ** ms.decimals) * ms.priceUsd;
   const pointOf = (p: unknown): [number, number] | null => {
@@ -272,5 +278,6 @@ export function fromLoopFarmMarket(
     supplyCapRemainingUsd: ms.supplyCapRemaining === null ? null : usd(ms.supplyCapRemaining),
     borrowCapRemainingUsd: ms.borrowCapRemaining === null ? null : usd(ms.borrowCapRemaining),
     irm: pts.length >= 2 ? { points: pts.sort((a, b) => a[0] - b[0]), reserveFactor: ms.irm?.supplySpreadFee ?? 0.15 } : undefined,
+    myLtv,
   };
 }

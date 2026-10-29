@@ -36,14 +36,16 @@ export function planRewards(ctx: DecisionContext): Action[] {
       const elapsedH = (ctx.nowMs - r.lastClaimAtMs) / HOUR;
       const normalMin = Math.max(tc.claim_min_usd, gas * cfg.rewards.claim_gas_multiple);
 
-      // Crash / over-cap skip the schedule but still respect gas economics.
+      // Crash / over-cap skip the schedule but still respect gas economics
+      // and a minimum spacing (otherwise a 24h crash window claims every cycle).
       const urgentMin = gas * cfg.rewards.claim_gas_multiple;
+      const urgentOk = elapsedH >= Math.min(tc.claim_interval_hours, cfg.rewards.urgent_claim_min_interval_hours);
       let claim = 0;
       let reason = "";
-      if (crash && r.unclaimedUsd >= urgentMin) {
+      if (crash && urgentOk && r.unclaimedUsd >= urgentMin) {
         claim = r.unclaimedUsd;
         reason = `${token} -${(tokenDrawdown24h(ctx.history, token, ctx.nowMs) * 100).toFixed(0)}% in 24h`;
-      } else if (overCap && r.unclaimedUsd >= urgentMin) {
+      } else if (overCap && urgentOk && r.unclaimedUsd >= urgentMin) {
         claim = r.unclaimedUsd;
         reason = `${token} exposure over ${(cfg.caps.per_reward_token_frac * 100).toFixed(1)}% cap`;
       } else if (elapsedH >= tc.claim_interval_hours && r.unclaimedUsd >= normalMin) {
@@ -77,8 +79,14 @@ export function planRewards(ctx: DecisionContext): Action[] {
     }
   }
 
+  // Hedges with no remaining exposure (last position closed, perp delisted,
+  // policy changed) must be closed, not orphaned.
+  for (const [token, cur] of Object.entries(ctx.hedges))
+    if (cur > 0 && hedgeTargets[token] === undefined) {
+      out.push({ type: "hedge", token, targetShortUsd: 0, reason: `close ${token} hedge: no exposure left` });
+    }
   for (const [token, target] of Object.entries(hedgeTargets)) {
-    const cur = hedgedNow[token] ?? 0;
+    const cur = ctx.hedges[token] ?? hedgedNow[token] ?? 0;
     const tol = Math.max(50, 0.1 * target);
     if (Math.abs(target - cur) > tol)
       out.push({ type: "hedge", token, targetShortUsd: target, reason: `hedge ${token}: ${Math.round(cur)} -> ${Math.round(target)} USD` });

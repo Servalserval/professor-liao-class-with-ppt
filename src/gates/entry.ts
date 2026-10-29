@@ -24,12 +24,25 @@ export function entryBlockers(opp: Opportunity, ctx: DecisionContext): string[] 
   const cd = ctx.cooldownUntil[opp.id];
   if (cd !== undefined && ctx.nowMs < cd) r.push(`re-entry cooldown until ${new Date(cd).toISOString()}`);
 
+  // `opp.flags` already includes the history-derived flags (capacity drain,
+  // spikes, emission cut): the router merges them in before planning.
   for (const f of opp.flags) r.push(`flag ${f.name}${f.detail ? ` (${f.detail})` : ""}`);
   for (const s of opp.signals) {
     const lvl = signalLevel(s);
     if (lvl !== "ok") r.push(`signal ${s.name}=${s.value.toFixed(4)} at ${lvl} level`);
   }
-  if (opp.health) r.push("health metric present on a non-held opportunity (source bug?)");
+
+  // Top-ups of something we already hold: never into a position that is
+  // being exited, under exit debounce, or drifting on health.
+  const held = ctx.positions.find((p) => p.oppId === opp.id);
+  if (held) {
+    if (held.forcedExit) r.push(`exit pending (${held.forcedExit.reason})`);
+    if (Object.values(held.pending).some((n) => n > 0)) r.push("exit rule under confirmation");
+    if (held.exitProbe.consecutiveFailures > 0) r.push("exit simulation failing");
+    const h = opp.health;
+    if (h && (h.direction === "above" ? h.value >= h.rebalanceAt : h.value <= h.rebalanceAt))
+      r.push(`health ${h.metric}=${h.value.toFixed(4)} past rebalance level`);
+  }
 
   const cap = effectiveCapacity(cfg, opp);
   if (cap < cfg.liquidity.min_capacity_usd)
@@ -71,6 +84,7 @@ export function checkSizedEntry(opp: Opportunity, fromUsd: number, toUsd: number
 
   const v = valueAt(opp, toUsd, ctx);
   const marginal = marginalNetApr(opp, fromUsd, toUsd, ctx);
+  if (!Number.isFinite(v.netApr) || !Number.isFinite(marginal)) r.push("valuation not finite (bad source data?)");
   if (opp.speculative) {
     // Points farm: pay at most max_cost_apr for the lottery ticket.
     if (!(v.speculativeApr > 0)) r.push("speculative opportunity without a points stream");

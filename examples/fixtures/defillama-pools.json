@@ -2,30 +2,59 @@
   "status": "success",
   "data": [
     {
-      "chain": "Sui", "project": "suilend", "symbol": "USDC", "tvlUsd": 12000000,
-      "apyBase": 6.1, "apyReward": 5.0, "apy": 11.1,
-      "rewardTokens": ["0xsend"], "pool": "suilend-usdc-sui", "poolMeta": "main market",
-      "apyBaseBorrow": 8.2, "apyRewardBorrow": 0.5,
-      "totalSupplyUsd": 52000000, "totalBorrowUsd": 40000000, "ltv": 0.77,
-      "stablecoin": true, "ilRisk": "no", "exposure": "single"
+      "chain": "Sui",
+      "project": "suilend",
+      "symbol": "USDC",
+      "tvlUsd": 12000000,
+      "apyBase": 6.1,
+      "apyReward": 5.0,
+      "apy": 11.1,
+      "rewardTokens": [
+        "0xsend"
+      ],
+      "pool": "suilend-usdc-sui",
+      "poolMeta": "main market",
+      "stablecoin": true,
+      "ilRisk": "no",
+      "exposure": "single"
     },
     {
-      "chain": "Ethereum", "project": "aave-v3", "symbol": "USDT", "tvlUsd": 900000000,
-      "apyBase": 4.2, "apyReward": null, "apy": 4.2,
+      "chain": "Ethereum",
+      "project": "aave-v3",
+      "symbol": "USDT",
+      "tvlUsd": 900000000,
+      "apyBase": 4.2,
+      "apyReward": null,
+      "apy": 4.2,
       "pool": "aave-v3-usdt-eth",
-      "apyBaseBorrow": 5.4, "apyRewardBorrow": null,
-      "totalSupplyUsd": 3900000000, "totalBorrowUsd": 3000000000, "ltv": 0.75,
-      "stablecoin": true, "ilRisk": "no", "exposure": "single"
+      "stablecoin": true,
+      "ilRisk": "no",
+      "exposure": "single"
     },
     {
-      "chain": "Base", "project": "example-dex", "symbol": "USDC-EXAMPLE", "tvlUsd": 3000000,
-      "apyBase": 12.0, "apyReward": 40.0, "apy": 52.0,
-      "rewardTokens": ["0xexample"], "pool": "example-dex-usdc-example",
-      "stablecoin": false, "ilRisk": "yes", "exposure": "multi"
+      "chain": "Base",
+      "project": "example-dex",
+      "symbol": "USDC-EXAMPLE",
+      "tvlUsd": 3000000,
+      "apyBase": 12.0,
+      "apyReward": 40.0,
+      "apy": 52.0,
+      "rewardTokens": [
+        "0xexample"
+      ],
+      "pool": "example-dex-usdc-example",
+      "stablecoin": false,
+      "ilRisk": "yes",
+      "exposure": "multi"
     },
     {
-      "chain": "Base", "project": "tiny-farm", "symbol": "USDC", "tvlUsd": 50000,
-      "apyBase": 2.0, "apyReward": 300.0, "pool": "tiny-farm-usdc"
+      "chain": "Base",
+      "project": "tiny-farm",
+      "symbol": "USDC",
+      "tvlUsd": 50000,
+      "apyBase": 2.0,
+      "apyReward": 300.0,
+      "pool": "tiny-farm-usdc"
     }
   ]
 }

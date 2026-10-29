@@ -1,0 +1,20 @@
+[
+  {
+    "pool": "suilend-usdc-sui",
+    "apyBaseBorrow": 8.2,
+    "apyRewardBorrow": 0.5,
+    "totalSupplyUsd": 52000000,
+    "totalBorrowUsd": 40000000,
+    "ltv": 0.77,
+    "borrowable": true
+  },
+  {
+    "pool": "aave-v3-usdt-eth",
+    "apyBaseBorrow": 5.4,
+    "apyRewardBorrow": null,
+    "totalSupplyUsd": 3900000000,
+    "totalBorrowUsd": 3000000000,
+    "ltv": 0.75,
+    "borrowable": true
+  }
+]
