@@ -1,0 +1,19 @@
+{
+  "name": "@incentive-router/live-runner",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Wires live adapters into the core Router: shadow (simulate-only) and live modes, verify stamp + live gate, balances, prices, CLI.",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@incentive-router/core": "*",
+    "@incentive-router/live-common": "*",
+    "@incentive-router/live-evm-base": "*",
+    "@incentive-router/live-evm": "*",
+    "@incentive-router/live-sui": "*",
+    "@incentive-router/live-bridges": "*",
+    "yaml": "^2.5.0"
+  }
+}
