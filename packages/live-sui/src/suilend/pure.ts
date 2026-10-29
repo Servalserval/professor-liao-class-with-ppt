@@ -289,6 +289,55 @@ export function claimableRewards(o: RawObligation, reserves: readonly RawReserve
 }
 
 // ---------------------------------------------------------------------------
+// Obligation roles: loop obligation vs dedicated (borrow-free) supply obligation
+// ---------------------------------------------------------------------------
+
+export interface ObligationSummary {
+  obligationId: string;
+  depositTypes: readonly string[];
+  borrowTypes: readonly string[];
+}
+
+/**
+ * Decide which of the wallet's obligations is the SUPPLY obligation and which
+ * the LOOP obligation. Configured ids always win. Otherwise:
+ *  - supply = the borrow-free obligation holding supply-asset deposits (exactly
+ *    one, else ambiguous), or else an empty obligation (lowest id), or none
+ *    (created on the first deposit). Never the configured loop obligation.
+ *  - loop = the single remaining obligation (ambiguous if several), or none.
+ * The supply obligation therefore never carries a borrow made by this adapter,
+ * which keeps its deposits eligible for Suilend liquidity-mining rewards.
+ */
+export function classifyObligations(
+  obls: readonly ObligationSummary[],
+  o: { loopId?: string; supplyId?: string; supplyAssets: ReadonlySet<string>; wantSupply: boolean; wantLoop: boolean }
+): { loop: string | null; supply: string | null } {
+  if (o.loopId !== undefined && o.supplyId !== undefined && o.loopId === o.supplyId) throw new Error("suilend: obligationId and supplyObligationId must differ");
+  let supply: string | null = o.supplyId ?? null;
+  if (supply === null && o.wantSupply) {
+    const cands = obls.filter((x) => x.obligationId !== o.loopId && x.borrowTypes.length === 0);
+    const withSupply = cands.filter((x) => x.depositTypes.some((t) => o.supplyAssets.has(t)));
+    if (withSupply.length > 1) {
+      throw new Error(`suilend: several borrow-free obligations hold supply deposits (${withSupply.map((x) => x.obligationId).join(", ")}); set supplyObligationId`);
+    }
+    supply = withSupply[0]?.obligationId ?? [...cands].filter((x) => x.depositTypes.length === 0).map((x) => x.obligationId).sort()[0] ?? null;
+  }
+  let loop: string | null = o.loopId ?? null;
+  if (loop === null && o.wantLoop) {
+    const rest = obls.filter((x) => x.obligationId !== supply);
+    if (rest.length > 1) throw new Error(`suilend: wallet holds ${rest.length} candidate loop obligations (${rest.map((x) => x.obligationId).join(", ")}); set obligationId`);
+    loop = rest[0]?.obligationId ?? null;
+  }
+  return { loop, supply };
+}
+
+/** Money an exit can take out right now: available liquidity (minus the protocol minimum) capped by the outflow limit. */
+export function withdrawableUsd(s: ReserveSnapshot, rateLimiterRemainingUsd: number): number {
+  const avail = fromUnits(s.availableAmount > MIN_AVAILABLE_AMOUNT ? s.availableAmount - MIN_AVAILABLE_AMOUNT : 0n, s.decimals) * s.price;
+  return Math.max(0, Math.min(avail, rateLimiterRemainingUsd));
+}
+
+// ---------------------------------------------------------------------------
 // LoopPair construction
 // ---------------------------------------------------------------------------
 

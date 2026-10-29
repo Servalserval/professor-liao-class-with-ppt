@@ -6,12 +6,13 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeStructTag } from "@mysten/sui/utils";
-import type { AssetRef, LiveContext } from "@incentive-router/live-common";
+import { normalizeStructTag, normalizeSuiAddress } from "@mysten/sui/utils";
+import { BroadcastUnconfirmedError, type AssetRef, type LiveContext } from "@incentive-router/live-common";
 import { Mutex, type PtbSwapper, type SuiEnv, type Transaction } from "../src/common.js";
 import { SuilendAdapter, planSuilendLoopSteps, suilendPure } from "../src/suilend/index.js";
 import {
   buildLoopPair,
+  classifyObligations,
   ctokensFor,
   pairLtvLimits,
   pairRewardIneligibility,
@@ -63,6 +64,8 @@ const MARKET_TYPE = "0x" + "f9".repeat(32) + "::suilend::MAIN_POOL";
 const OBL = "0x" + "0b".repeat(32);
 const CAP = "0x" + "ca".repeat(32);
 const ADDR = "0x" + "aa".repeat(32);
+const SOBL = "0x" + "5b".repeat(32);
+const SCAP = "0x" + "5c".repeat(32);
 
 const wadOf = (x: number) => ({ value: BigInt(Math.round(x * 1e9)) * 10n ** 9n });
 const tok = (x: number, dec: number) => BigInt(Math.round(x * 10 ** dec));
@@ -219,6 +222,32 @@ function obligationFixture(opts: { depositUsdc?: number; borrowUsdsui?: number; 
         lastUpdateTimeMs: BigInt(NOW),
         rewards: [{ poolRewardId: "0x" + "1".padStart(64, "0"), earnedRewards: { value: 100n * 10n ** 6n * WAD }, cumulativeRewardsPerShare: { value: 0n } }],
       },
+    ],
+  } as unknown as RawObligation;
+}
+
+/** Dedicated supply obligation: USDC deposit only (no borrows), 2 SUI of rewards earned. */
+function supplyObligationFixture(opts: { usdc?: number; borrow?: boolean } = {}): RawObligation {
+  const ctokens = tok((opts.usdc ?? 20_000) / 1.02, 6);
+  return {
+    id: SOBL,
+    lendingMarketId: MARKET,
+    deposits: [
+      { coinType: USDC_RAW, reserveArrayIndex: 0n, depositedCtokenAmount: ctokens, userRewardManagerIndex: 0n, marketValue: { value: 0n }, attributedBorrowValue: { value: 0n } },
+    ],
+    borrows: opts.borrow
+      ? [{ coinType: USDSUI_RAW, reserveArrayIndex: 1n, borrowedAmount: { value: tok(100, 6) * WAD }, cumulativeBorrowRate: { value: WAD }, userRewardManagerIndex: 1n, marketValue: { value: 0n } }]
+      : [],
+    userRewardManagers: [
+      {
+        poolRewardManagerId: "0x" + (200).toString(16).padStart(64, "0"),
+        share: ctokens,
+        lastUpdateTimeMs: BigInt(NOW),
+        rewards: [{ poolRewardId: "0x" + "1".padStart(64, "0"), earnedRewards: { value: 2n * 10n ** 9n * WAD }, cumulativeRewardsPerShare: { value: 0n } }],
+      },
+      ...(opts.borrow
+        ? [{ poolRewardManagerId: "0x" + (301).toString(16).padStart(64, "0"), share: tok(100, 6), lastUpdateTimeMs: BigInt(NOW), rewards: [{ poolRewardId: "0x" + "1".padStart(64, "0"), earnedRewards: { value: 0n }, cumulativeRewardsPerShare: { value: 0n } }] }]
+        : []),
     ],
   } as unknown as RawObligation;
 }
@@ -556,12 +585,13 @@ test("probeSwap / ctokensFor", async () => {
 // ---------------------------------------------------------------------------
 
 interface Rec {
+  borrowCaps?: string[];
   calls: string[];
   swaps: { fromType: string; toType: string; minOut: bigint }[];
   claimed?: unknown[];
 }
 
-function fakeClient(rec: Rec, obligation: RawObligation | null): SuilendClientLike {
+function fakeClient(rec: Rec, obligations: RawObligation[], hooks: { onDeposit?: () => void } = {}): SuilendClientLike {
   const res = (tx: Transaction, name: string, args: unknown[] = []) =>
     tx.moveCall({ target: `0x2::fake::${name}`, arguments: args as never });
   return {
@@ -582,25 +612,28 @@ function fakeClient(rec: Rec, obligation: RawObligation | null): SuilendClientLi
       rec.calls.push(`refreshAll(${o ? "obl" : "none"};${(types ?? []).length})`);
     },
     deposit: (_coin, t) => rec.calls.push(`deposit(${short(t)})`),
-    depositIntoObligation: async (_o, t, v) => {
-      rec.calls.push(`depositIntoObligation(${short(t)},${v})`);
+    depositIntoObligation: async (_o, t, v, _tx, cap) => {
+      hooks.onDeposit?.();
+      rec.calls.push(`depositIntoObligation(${short(t)},${v},${typeof cap === "string" ? cap.slice(0, 6) : "new"})`);
     },
     borrow: async (_c, _id, t, v, tx, refresh) => {
+      rec.borrowCaps = [...(rec.borrowCaps ?? []), String(_c)];
       rec.calls.push(`borrow(${short(t)},${v},${refresh})`);
       return res(tx, "borrow");
     },
     withdraw: async (_c, _id, t, v, tx, refresh) => {
-      rec.calls.push(`withdraw(${short(t)},${v === "18446744073709551615" ? "MAX" : v},${refresh})`);
+      rec.calls.push(`withdraw(${short(t)},${v === "18446744073709551615" ? "MAX" : v},${refresh}${_id === SOBL ? ",supply" : ""})`);
       return res(tx, "withdraw");
     },
     repay: (_id, t) => rec.calls.push(`repay(${short(t)})`),
     claimRewardsAndSendToUser: (_o, cap, rewards) => {
       rec.calls.push(`claim(${String(cap).slice(0, 6)},${rewards.length})`);
-      rec.claimed = rewards;
+      rec.claimed = [...((rec.claimed as unknown[]) ?? []), ...rewards];
     },
-    getObligation: async () => {
-      if (!obligation) throw new Error("no obligation");
-      return obligation;
+    getObligation: async (id) => {
+      const o = obligations.find((x) => x.id === normalizeSuiAddress(id));
+      if (!o) throw new Error(`no obligation ${id}`);
+      return o;
     },
   };
 }
@@ -642,20 +675,32 @@ function fakeEnv(simOk = true): SuiEnv {
 function makeAdapter(
   opts: {
     obligation?: RawObligation | null;
+    /** Extra obligations owned by the wallet (cap id = obligation id with 0xca prefix swap). */
+    more?: RawObligation[];
     assume?: boolean;
-    pairs?: "stable" | "sui";
+    pairs?: "stable" | "sui" | "none";
+    supply?: boolean;
+    supplyObligationId?: string;
     meta?: Record<string, { decimals: number; symbol: string }>;
     swapper?: (rec: Rec) => PtbSwapper | undefined;
+    env?: SuiEnv;
+    onDeposit?: () => void;
+    failLoad?: boolean;
   } = {}
 ) {
   const rec: Rec = { calls: [], swaps: [] };
   const obligation = opts.obligation === undefined ? obligationFixture() : opts.obligation;
+  const obligations = [...(obligation ? [obligation] : []), ...(opts.more ?? [])];
   const pairs =
-    opts.pairs === "sui"
-      ? [{ pairId: "USDC/SUI", collateral: A_USDC, debt: A_SUI }]
-      : [{ pairId: "USDC/USDsui", collateral: A_USDC, debt: A_USDSUI }];
+    opts.pairs === "none"
+      ? []
+      : opts.pairs === "sui"
+        ? [{ pairId: "USDC/SUI", collateral: A_USDC, debt: A_SUI }]
+        : [{ pairId: "USDC/USDsui", collateral: A_USDC, debt: A_USDSUI }];
   const adapter = new SuilendAdapter({
-    env: fakeEnv(),
+    supply: opts.supply ? [{ asset: A_USDC }, { asset: A_USDSUI, marketId: "USDsui-plain" }] : undefined,
+    supplyObligationId: opts.supplyObligationId,
+    env: opts.env ?? fakeEnv(),
     lendingMarket: MARKET,
     lendingMarketType: MARKET_TYPE,
     pairs,
@@ -664,9 +709,13 @@ function makeAdapter(
     stablecoinCoinTypes: [...STABLES],
     rewardPriceUsd: async (t) => (t === PTS ? 0.5 : undefined),
     deps: {
-      loadClient: async () => fakeClient(rec, obligation),
+      loadClient: async () => {
+        if (opts.failLoad) throw new Error("rpc down");
+        return fakeClient(rec, obligations, { onDeposit: opts.onDeposit });
+      },
       resolveMarketType: async () => MARKET_TYPE,
-      listObligationCaps: async () => (obligation ? [{ id: CAP, obligationId: OBL }] : []),
+      listObligationCaps: async () => obligations.map((o) => ({ id: o.id === OBL ? CAP : SCAP, obligationId: o.id })),
+      marketPaused: async () => false,
       coinMetadata: async (_e, t) => (opts.meta ?? { [USDC]: { decimals: 6, symbol: "USDC" }, [USDSUI]: { decimals: 6, symbol: "USDSUI" }, [SUI]: { decimals: 9, symbol: "SUI" }, [PTS]: { decimals: 6, symbol: "PTS" } })[t] ?? null,
       reserveConfidence: async () => undefined,
       nowMs: () => NOW,
@@ -786,7 +835,7 @@ test("adapter.open (dry-run, new obligation): one PTB, refresh before borrows, b
   const c = rec.calls;
   assert.equal(c[0], "createObligation");
   assert.equal(c[1], "refreshAll(none;2)");
-  assert.equal(c[2], "depositIntoObligation(USDC,10000000000)");
+  assert.equal(c[2], "depositIntoObligation(USDC,10000000000,new)");
   const borrows = c.filter((x) => x.startsWith("borrow("));
   assert.ok(borrows.length > 1 && borrows.length <= 12);
   assert.ok(borrows.every((b) => b.endsWith(",false)")), "refresh is done once, not per borrow");
@@ -880,4 +929,156 @@ test("adapter constructor validates pairs", () => {
     /duplicate/
   );
   assert.throws(() => new SuilendAdapter({ env: fakeEnv(), pairs: [{ pairId: "y", collateral: { ...A_USDC, chain: "base" }, debt: A_USDC }] }), /not sui/);
+});
+
+// ---------------------------------------------------------------------------
+// supply-only side (SupplyAdapter)
+// ---------------------------------------------------------------------------
+
+test("classifyObligations: borrow-free supply obligation, loop = the rest, configured ids win", () => {
+  const S = new Set([USDC]);
+  const loop = { obligationId: "L", depositTypes: [USDC], borrowTypes: [USDSUI] };
+  const sup = { obligationId: "S", depositTypes: [USDC], borrowTypes: [] };
+  const empty = { obligationId: "E", depositTypes: [], borrowTypes: [] };
+  const want = { supplyAssets: S, wantSupply: true, wantLoop: true };
+  assert.deepEqual(classifyObligations([loop, sup], want), { loop: "L", supply: "S" });
+  assert.deepEqual(classifyObligations([loop], want), { loop: "L", supply: null }, "supply created on first deposit, never the loop one");
+  assert.deepEqual(classifyObligations([loop, empty], want), { loop: "L", supply: "E" });
+  // a closed (empty) loop obligation next to the supply one
+  assert.deepEqual(classifyObligations([sup, empty], want), { loop: "E", supply: "S" });
+  assert.throws(() => classifyObligations([sup, { ...sup, obligationId: "S2" }], want), /supplyObligationId/);
+  assert.throws(() => classifyObligations([loop, { ...loop, obligationId: "L2" }], want), /set obligationId/);
+  assert.deepEqual(classifyObligations([loop, sup], { ...want, loopId: "S" }), { loop: "S", supply: null }, "configured loop id is never the supply");
+  assert.deepEqual(classifyObligations([loop, sup], { ...want, supplyId: "L" }), { loop: "S", supply: "L" });
+  assert.throws(() => classifyObligations([], { ...want, loopId: "X", supplyId: "X" }), /differ/);
+  assert.deepEqual(classifyObligations([sup], { supplyAssets: S, wantSupply: true, wantLoop: false }), { loop: null, supply: "S" });
+});
+
+test("supplyMarkets: deposit APR + eligible deposit rewards, withdrawable capped by outflow limit", async () => {
+  const { adapter } = makeAdapter({ supply: true, more: [supplyObligationFixture()] });
+  const ms = await adapter.supplyMarkets();
+  assert.equal(ms.length, 2);
+  const m = ms.find((x) => x.marketId === "USDC")!;
+  assert.equal(m.protocol, "suilend");
+  assert.equal(m.asset.assetId, USDC);
+  assert.ok(Math.abs(m.totalSupplyUsd - 90_000_000) < 1);
+  assert.ok(Math.abs(m.totalBorrowUsd - 40_000_000) < 1);
+  const s = reserveSnapshot(reservesFixture()[0]!);
+  assert.ok(Math.abs(m.supplyAprBase - s.supplyApr) < 1e-12);
+  assert.equal(m.rewards.length, 1, "borrow-free obligation keeps the SUI deposit reward");
+  assert.equal(m.rewards[0]!.token, "SUI");
+  const rl = 5_000_000 - (1_000_000 * 1799) / 3600 - 500_000;
+  assert.ok(Math.abs(m.withdrawableUsd! - rl) < 1e-3, "available $50M capped by the outflow limit");
+  assert.ok(Math.abs(m.myDepositUsd! - 20_000) < 0.01);
+  assert.equal(m.paused, false);
+  assert.equal(m.depositFeeFrac, 0);
+  assert.equal(m.irm!.points.length, 3);
+  assert.equal(m.dataAsOfMs, NOW);
+  assert.match(m.note!, /borrow-free obligation \(0x5b5b/);
+  assert.match(m.note!, /rewards eligible/);
+  const u = ms.find((x) => x.marketId === "USDsui-plain")!;
+  assert.equal(u.myDepositUsd, 0);
+  // the loop side is unaffected by the supply obligation
+  const [pair] = await adapter.markets();
+  assert.deepEqual(pair!.collateral.supplyRewards, [], "loop pair still stable/stable-ineligible");
+  assert.ok(pair!.myLtv! > 0.4 && pair!.myLtv! < 0.42, "loop obligation (not the supply one) measured");
+});
+
+test("supplyPosition: units, USD and rewards of that reserve's deposit only", async () => {
+  const { adapter } = makeAdapter({ supply: true, more: [supplyObligationFixture()] });
+  const v = await adapter.supplyPosition("USDC");
+  assert.ok(v);
+  assert.ok(Math.abs(v.depositUsd - 20_000) < 0.01);
+  assert.ok(v.units >= 19_999_999_000n && v.units <= 20_000_000_000n, `${v.units}`);
+  assert.equal(v.rewardsUnclaimed.length, 1);
+  assert.equal(v.rewardsUnclaimed[0]!.token, "SUI");
+  assert.ok(v.rewardsUnclaimed[0]!.amount >= 2n * 10n ** 9n - 1n);
+  assert.equal(await adapter.supplyPosition("USDsui-plain"), null);
+  assert.equal(await makeAdapter({ supply: true }).adapter.supplyPosition("USDC"), null, "no supply obligation yet");
+});
+
+test("deposit: into the dedicated supply obligation (created when absent), never the loop obligation", async () => {
+  const fresh = makeAdapter({ supply: true }); // only the loop obligation exists
+  const r = await fresh.adapter.deposit("USDC", 5_000_000_000n, ctx());
+  assert.ok(r.ok, r.detail);
+  assert.deepEqual(fresh.rec.calls, ["createObligation", "depositIntoObligation(USDC,5000000000,new)"]);
+  assert.match(r.detail!, /NEW supply obligation/);
+  assert.equal(r.amountUsd, 5_000);
+
+  const existing = makeAdapter({ supply: true, more: [supplyObligationFixture()] });
+  const r2 = await existing.adapter.deposit("USDC", 1_000_000n, ctx());
+  assert.ok(r2.ok, r2.detail);
+  assert.deepEqual(existing.rec.calls, [`depositIntoObligation(USDC,1000000,${SCAP.slice(0, 6)})`]);
+
+  // supply-only adapter (no pairs) with the user's loop obligation in the wallet: still a new obligation
+  const only = makeAdapter({ supply: true, pairs: "none" });
+  const r3 = await only.adapter.deposit("USDsui-plain", 1_000_000n, ctx());
+  assert.ok(r3.ok, r3.detail);
+  assert.equal(only.rec.calls[0], "createObligation");
+
+  // a configured supply obligation that borrows is refused
+  const bad = makeAdapter({ supply: true, supplyObligationId: OBL });
+  const r4 = await bad.adapter.deposit("USDC", 1_000_000n, ctx());
+  assert.equal(r4.ok, false);
+  assert.match(r4.detail!, /has borrows/);
+  assert.throws(() => new SuilendAdapter({ env: fakeEnv(), pairs: [], obligationId: OBL, supplyObligationId: OBL }), /must differ/);
+});
+
+test("withdraw: exact cTokens (fraction 1 = all, no dust), price refresh first; simulateWithdraw semantics", async () => {
+  const sup = supplyObligationFixture();
+  const all = makeAdapter({ supply: true, more: [sup] });
+  const r = await all.adapter.withdraw("USDC", 1, ctx());
+  assert.ok(r.ok, r.detail);
+  const ct = sup.deposits[0]!.depositedCtokenAmount;
+  assert.deepEqual(all.rec.calls, ["refreshAll(obl;1)", `withdraw(USDC,${ct},false,supply)`]);
+  const half = makeAdapter({ supply: true, more: [sup] });
+  assert.ok((await half.adapter.withdraw("USDC", 0.5, ctx())).ok);
+  assert.equal(half.rec.calls[1], `withdraw(USDC,${ct / 2n},false,supply)`);
+  const none = await makeAdapter({ supply: true }).adapter.withdraw("USDC", 1, ctx());
+  assert.ok(none.ok && none.txs.length === 0);
+
+  assert.equal(await makeAdapter({ supply: true, more: [sup] }).adapter.simulateWithdraw("USDC", ctx()), true);
+  assert.equal(await makeAdapter({ supply: true, more: [sup], env: fakeEnv(false) }).adapter.simulateWithdraw("USDC", ctx()), false);
+  // more than the outflow limit remaining => false (would revert), not a throw
+  const big = makeAdapter({ supply: true, more: [supplyObligationFixture({ usdc: 4_500_000 })] });
+  assert.equal(await big.adapter.simulateWithdraw("USDC", ctx()), false);
+  assert.equal((await big.adapter.withdraw("USDC", 1, ctx())).ok, false);
+  // read errors throw
+  await assert.rejects(makeAdapter({ supply: true, failLoad: true }).adapter.simulateWithdraw("USDC", ctx()), /rpc down/);
+});
+
+test("BroadcastUnconfirmedError => ok:false with an unconfirmed tx record (may have landed)", async () => {
+  const { adapter } = makeAdapter({
+    supply: true,
+    more: [supplyObligationFixture()],
+    onDeposit: () => {
+      throw new BroadcastUnconfirmedError("sui", "DIGEST123", "suilend supply deposit", "timeout");
+    },
+  });
+  const logs: string[] = [];
+  const r = await adapter.deposit("USDC", 1_000_000n, ctx(logs));
+  assert.equal(r.ok, false);
+  assert.equal(r.txs.length, 1);
+  assert.equal(r.txs[0]!.id, "DIGEST123");
+  assert.equal(r.txs[0]!.unconfirmed, true);
+  assert.equal(r.txs[0]!.simulated, false);
+  assert.match(r.detail!, /may have landed/);
+  assert.ok(logs.some((l) => l.startsWith("error")));
+});
+
+test("claimRewards is shared: both obligations by default, one when a pair / supply market is named", async () => {
+  const a = makeAdapter({ supply: true, more: [supplyObligationFixture()] });
+  const r = await a.adapter.claimRewards(ctx());
+  assert.ok(r.ok, r.detail);
+  assert.equal(r.txs.length, 1, "one PTB");
+  assert.deepEqual(a.rec.calls.filter((c) => c.startsWith("claim")), [`claim(${CAP.slice(0, 6)},2)`, `claim(${SCAP.slice(0, 6)},1)`]);
+  const sui = r.claimed.find((x) => x.token === "SUI")!;
+  assert.ok(sui.amount >= 7n * 10n ** 9n - 2n, "5 SUI (loop) + 2 SUI (supply)");
+  const b = makeAdapter({ supply: true, more: [supplyObligationFixture()] });
+  await b.adapter.claimRewards(ctx(), "USDC");
+  assert.deepEqual(b.rec.calls.filter((c) => c.startsWith("claim")), [`claim(${SCAP.slice(0, 6)},1)`]);
+  const c = makeAdapter({ supply: true, more: [supplyObligationFixture()] });
+  await c.adapter.claimRewards(ctx(), "USDC/USDsui");
+  assert.deepEqual(c.rec.calls.filter((x) => x.startsWith("claim")), [`claim(${CAP.slice(0, 6)},2)`]);
+  assert.equal((await c.adapter.claimRewards(ctx(), "nope")).ok, false);
 });

@@ -1,12 +1,18 @@
 /**
  * Live Suilend (Sui) lending adapter.
  *
- * Model: ONE Suilend obligation per adapter instance (config.obligationId, or
- * the single ObligationOwnerCap the wallet holds for the market; created on
- * first open). All configured pairs share it — Suilend computes health and
- * reward eligibility per obligation, so position() reports obligation-wide
- * LTV / health next to the pair's own amounts. Use one adapter (obligation)
- * per pair when pairs must stay isolated.
+ * Model: up to TWO Suilend obligations per adapter instance.
+ *  - LOOP obligation (config.obligationId, or the wallet's only other
+ *    obligation in the market; created on first open). All loop pairs share
+ *    it — Suilend computes health and reward eligibility per obligation, so
+ *    position() reports obligation-wide LTV / health next to the pair's own
+ *    amounts. Use one adapter (obligation) per pair when pairs must stay isolated.
+ *  - SUPPLY obligation (config.supplyObligationId, or the borrow-free
+ *    obligation holding supply deposits; created on first deposit) for the
+ *    SupplyAdapter side. It is never borrowed against, so its deposits keep
+ *    their liquidity-mining rewards (Suilend zeroes rewards of looped
+ *    obligations only). See classifyObligations (pure.ts). Production: set
+ *    both ids explicitly.
  *
  * Suilend has no native flash loan, so open / close / deleverage iterate
  * borrow -> (swap) -> deposit or withdraw -> (swap) -> repay inside ONE PTB,
@@ -26,9 +32,12 @@ import type {
   LoopPositionView,
   Logger,
   RewardRateQuery,
+  SupplyAdapter,
+  SupplyPositionView,
+  TxRecord,
 } from "@incentive-router/live-common";
-import { fromUnits, toUnits } from "@incentive-router/live-common";
-import type { LoopPair, RewardRate } from "@incentive-router/core";
+import { applyFraction, BroadcastUnconfirmedError, fromUnits, toUnits } from "@incentive-router/live-common";
+import type { LoopPair, RewardRate, SupplyMarket } from "@incentive-router/core";
 import {
   coinBalance,
   executePtb,
@@ -44,8 +53,10 @@ import {
 import {
   borrowCapRemainingUsd,
   buildLoopPair,
+  classifyObligations,
   ctokensFor,
   depositCapRemainingUsd,
+  MIN_AVAILABLE_AMOUNT,
   pairLtvLimits,
   pairPositionNumbers,
   pairRewardIneligibility,
@@ -53,8 +64,10 @@ import {
   planUnwindSteps,
   probeSwap,
   rateLimiterRemainingUsd,
+  rewardIneligibility,
   rewardsEligible,
   sideRewardRates,
+  withdrawableUsd,
   type LoopPlan,
   type PlanPrices,
   type RewardCoinInfo,
@@ -86,9 +99,13 @@ import type {
   SuilendAdapterConfig,
   SuilendClientLike,
   SuilendPairConfig,
+  SuilendSupplyConfig,
 } from "./types.js";
 
 const noopLog: Logger = () => {};
+
+/** Exit blocked by liquidity / outflow limit (simulateWithdraw -> false, not a read error). */
+class SupplyExitBlocked extends Error {}
 const SUI_GAS_RESERVE = 300_000_000n; // 0.3 SUI kept for gas when SUI is the collateral
 
 export interface SuilendPositionView extends LoopPositionView {
@@ -134,8 +151,15 @@ interface Loaded {
   snaps: Map<string, ReserveSnapshot>;
   rateLimiterUsd: number;
   pricesFromFeed: boolean;
+  /** Loop obligation. */
   obligation: ObligationRef | null;
+  /** Dedicated borrow-free supply obligation. */
+  supplyObligation: ObligationRef | null;
+  /** Market-level pause (undefined = unknown). */
+  paused: boolean | undefined;
 }
+
+type ClaimResult = LiveResult & { claimed: { token: string; amount: bigint; decimals: number }[] };
 
 interface PairCtx {
   p: SuilendPairConfig;
@@ -148,12 +172,13 @@ interface PairCtx {
 
 type Built = { tx: Transaction; detail: string; amountUsd: number } | { noop: string };
 
-export class SuilendAdapter implements LendingAdapter {
+export class SuilendAdapter implements LendingAdapter, SupplyAdapter {
   readonly id = "suilend";
   readonly chain = "sui";
   private readonly env: SuiEnv;
   private readonly deps: SuilendDeps;
   private readonly pairs = new Map<string, SuilendPairConfig>();
+  private readonly supply = new Map<string, { marketId: string; asset: AssetRef }>();
   private readonly stable: Set<string>;
   private readonly log: Logger;
   private market?: { id: string; type: string };
@@ -174,6 +199,15 @@ export class SuilendAdapter implements LendingAdapter {
         collateral: { ...p.collateral, address: normalizeStructTag(p.collateral.address) },
         debt: { ...p.debt, address: normalizeStructTag(p.debt.address) },
       });
+    }
+    for (const sc of cfg.supply ?? []) {
+      const marketId = sc.marketId ?? sc.asset.symbol;
+      if (this.supply.has(marketId)) throw new Error(`suilend: duplicate supply marketId ${marketId}`);
+      if (sc.asset.chain !== "sui") throw new Error(`suilend: supply ${marketId} asset ${sc.asset.symbol} is on ${sc.asset.chain}, not sui`);
+      this.supply.set(marketId, { marketId, asset: { ...sc.asset, address: normalizeStructTag(sc.asset.address) } });
+    }
+    if (cfg.obligationId && cfg.supplyObligationId && normalizeSuiAddress(cfg.obligationId) === normalizeSuiAddress(cfg.supplyObligationId)) {
+      throw new Error("suilend: obligationId and supplyObligationId must differ (supply deposits must not share the loop obligation)");
     }
     this.stable = new Set((cfg.stablecoinCoinTypes ?? DEFAULT_STABLECOIN_COINTYPES).map((t) => normalizeStructTag(t)));
   }
@@ -242,11 +276,204 @@ export class SuilendAdapter implements LendingAdapter {
   }
 
   // -------------------------------------------------------------------------
+  // SupplyAdapter (plain deposits in the dedicated borrow-free obligation)
+  // -------------------------------------------------------------------------
+
+  async supplyMarkets(): Promise<SupplyMarket[]> {
+    if (!this.supply.size) return [];
+    const L = await this.load();
+    const so = L.supplyObligation;
+    const types: string[] = [];
+    for (const m of this.supply.values()) {
+      const s = L.snaps.get(m.asset.address);
+      if (s) types.push(...s.depositRewards.map((r) => r.coinType));
+    }
+    const info = await this.rewardCoinInfo(L, types);
+    const maxAge = this.cfg.onChainPriceMaxAgeMs ?? 10 * 60_000;
+    const out: SupplyMarket[] = [];
+    for (const m of this.supply.values()) {
+      const s = this.snapOf(L, m.asset);
+      const { rates, unpriced } = sideRewardRates(s, "deposit", (t) => info.get(t), L.nowMs);
+      const extra = await this.extra({ protocol: "suilend", chain: "sui", asset: m.asset, side: "supply", marketId: L.marketId });
+      // A deposit-only obligation is never "looped": its reward shares are kept.
+      const reason = rewardIneligibility([...(so?.snap.deposits.map((d) => d.coinType) ?? []), s.coinType], so?.snap.borrows.map((b) => b.coinType) ?? [], this.stable);
+      const drop = reason !== null && !(this.cfg.assumeRewardsEligible === true);
+      const mine = so?.snap.deposits.find((d) => d.coinType === s.coinType);
+      const wUsd = withdrawableUsd(s, L.rateLimiterUsd);
+      const notes = [
+        `Suilend ${L.marketId === MAIN_LENDING_MARKET.id ? "Main" : L.marketId} market; deposits held in a dedicated borrow-free obligation (${so?.obligationId ?? "created on first deposit"})`,
+        drop
+          ? `deposit rewards DROPPED: ${reason}`
+          : "rewards eligible: Suilend zeroes liquidity-mining shares only for looped obligations (same reserve deposited+borrowed; docs also exclude stable-deposit+stable-borrow) and this obligation never borrows",
+        `withdrawable = available liquidity capped by the market outflow limit ($${L.rateLimiterUsd.toFixed(0)} remaining)`,
+        ...(unpriced.length ? [`unpriced reward coins skipped: ${[...new Set(unpriced)].join(", ")}`] : []),
+        ...(L.paused === undefined ? ["pause state unknown (market pause read failed); reserve-level pauses are not readable"] : []),
+      ];
+      const sm: SupplyMarket = {
+        protocol: "suilend",
+        chain: "sui",
+        marketId: m.marketId,
+        asset: { symbol: m.asset.symbol, assetId: s.coinType, priceUsd: s.price },
+        totalSupplyUsd: s.depositedTokens * s.price,
+        totalBorrowUsd: s.borrowedTokens * s.price,
+        supplyAprBase: s.supplyApr,
+        rewards: drop ? [] : [...rates, ...extra],
+        irm: s.irmPoints.length >= 2 ? { points: s.irmPoints.map((p) => [p[0], p[1]] as [number, number]), reserveFactor: s.spreadFeeFrac } : undefined,
+        withdrawableUsd: wUsd,
+        supplyCapRemainingUsd: depositCapRemainingUsd(s),
+        // SOURCE: suilend reserve.move — deposit_liquidity_and_mint_ctokens / redeem_ctokens charge no fee
+        depositFeeFrac: 0,
+        withdrawFeeFrac: 0,
+        myDepositUsd: mine?.usd ?? 0,
+        dataAsOfMs: L.pricesFromFeed || L.nowMs - s.priceUpdatedMs <= maxAge ? L.nowMs : s.priceUpdatedMs,
+        note: notes.join("; "),
+      };
+      if (L.paused !== undefined) sm.paused = L.paused;
+      out.push(sm);
+    }
+    return out;
+  }
+
+  async supplyPosition(marketId: string): Promise<SupplyPositionView | null> {
+    const m = this.supplyMarket(marketId);
+    const L = await this.load();
+    const so = L.supplyObligation;
+    if (!so) return null;
+    const s = this.snapOf(L, m.asset);
+    const d = so.snap.deposits.find((x) => x.coinType === s.coinType);
+    const rewards = so.snap.rewards.filter((r) => r.side === "deposit" && r.reserveArrayIndex === s.arrayIndex);
+    if (!d && !rewards.length) return null;
+    const info = await this.rewardCoinInfo(L, rewards.map((r) => r.coinType));
+    const agg = new Map<string, bigint>();
+    for (const r of rewards) agg.set(r.coinType, (agg.get(r.coinType) ?? 0n) + r.amount);
+    return {
+      marketId,
+      depositUsd: d?.usd ?? 0,
+      units: d ? BigInt(Math.floor(Number(d.ctokens) * s.ctokenRatio)) : 0n,
+      rewardsUnclaimed: [...agg.entries()].map(([t, amount]) => {
+        const i = info.get(t) ?? { symbol: tail(t), decimals: 0 };
+        return { token: i.symbol, amount, decimals: i.decimals, usd: i.priceUsd !== undefined ? fromUnits(amount, i.decimals) * i.priceUsd : 0 };
+      }),
+      asOfMs: L.nowMs,
+    };
+  }
+
+  async deposit(marketId: string, amount: bigint, ctx: LiveContext): Promise<LiveResult> {
+    return this.guard(ctx, `deposit ${marketId}`, async (): Promise<LiveResult> => {
+      const m = this.supplyMarket(marketId);
+      if (amount <= 0n) throw new Error("amount must be > 0");
+      const L = await this.load();
+      const s = this.snapOf(L, m.asset);
+      if (L.paused === true) throw new Error(`lending market ${L.marketId} is paused`);
+      const tokens = fromUnits(amount, s.decimals);
+      if (tokens * s.price > depositCapRemainingUsd(s)) throw new Error(`${m.asset.symbol} reserve deposit cap room $${depositCapRemainingUsd(s).toFixed(0)} < deposit`);
+      const bal = await this.walletBalance(m.asset);
+      const need = s.coinType === normalizeStructTag(SUI_TYPE) ? amount + SUI_GAS_RESERVE : amount;
+      if (bal < need) throw new Error(`wallet ${m.asset.symbol} balance ${bal} < ${need}`);
+      const so = L.supplyObligation;
+      if (so && !so.capId) throw new Error(`wallet does not own the ObligationOwnerCap of supply obligation ${so.obligationId}`);
+      if (so && L.obligation && so.obligationId === L.obligation.obligationId) throw new Error("supply obligation equals the loop obligation");
+      // the supply obligation must stay borrow-free (reward eligibility)
+      if (so && so.snap.borrows.length) {
+        throw new Error(`supply obligation ${so.obligationId} has borrows (${so.snap.borrows.map((b) => b.coinType).join(", ")}); refusing a plain deposit there`);
+      }
+      const tx = new Transaction();
+      tx.setSender(this.env.address);
+      let cap: unknown = so?.capId;
+      let created = false;
+      if (!so) {
+        const r = createObligationIfNoneExists(L.client as never, tx, undefined);
+        cap = r.obligationOwnerCapId;
+        created = r.didCreate;
+      }
+      // deposit_liquidity_and_mint_ctokens + deposit_ctokens_into_obligation (no price refresh needed for deposits)
+      await L.client.depositIntoObligation(this.env.address, s.coinType, amount.toString(), tx, cap);
+      if (created) sendObligationToUser(cap as never, this.env.address, tx);
+      const detail = `supply deposit ${tokens} ${m.asset.symbol} into ${created ? "a NEW supply obligation" : `supply obligation ${so!.obligationId}`}`;
+      const rec = await this.exec(ctx, tx, `suilend ${detail}`);
+      return { ok: true, txs: [rec], detail: withUnconfirmed(detail, rec), amountUsd: tokens * s.price };
+    }, {});
+  }
+
+  async withdraw(marketId: string, fraction: number, ctx: LiveContext): Promise<LiveResult> {
+    return this.guard(ctx, `withdraw ${marketId}`, async (): Promise<LiveResult> => {
+      if (!(fraction > 0 && fraction <= 1)) throw new Error(`fraction ${fraction} out of (0,1]`);
+      const b = await this.buildSupplyWithdraw(marketId, fraction);
+      if ("noop" in b) return { ok: true, txs: [], detail: b.noop };
+      const rec = await this.exec(ctx, b.tx, `suilend ${b.detail}`);
+      return { ok: true, txs: [rec], detail: withUnconfirmed(b.detail, rec), amountUsd: b.amountUsd };
+    }, {});
+  }
+
+  /** Full withdraw simulation: false = would revert / not enough liquidity or outflow room; throws on read errors. */
+  async simulateWithdraw(marketId: string, ctx: LiveContext): Promise<boolean> {
+    let b: Built;
+    try {
+      b = await this.buildSupplyWithdraw(marketId, 1, true);
+    } catch (e) {
+      if (e instanceof SupplyExitBlocked) {
+        ctx.log("warn", `suilend: simulateWithdraw ${marketId}: ${e.message}`);
+        return false;
+      }
+      throw e;
+    }
+    if ("noop" in b) return true;
+    b.tx.setSenderIfNotSet(this.env.address);
+    const sim = await this.env.grpc.core.simulateTransaction({ transaction: b.tx, include: { effects: true } });
+    if (sim.$kind === "FailedTransaction") ctx.log("warn", `suilend: simulateWithdraw ${marketId} reverted: ${JSON.stringify(sim.FailedTransaction.status)}`);
+    return sim.$kind === "Transaction";
+  }
+
+  private supplyMarket(marketId: string): { marketId: string; asset: AssetRef } {
+    const m = this.supply.get(marketId);
+    if (!m) throw new Error(`suilend: unknown supply market ${marketId}`);
+    return m;
+  }
+
+  /**
+   * Withdraw `fraction` of the supply deposit: exact cTokens (fraction 1 =
+   * every cToken: max semantics without U64_MAX's silent partial fill), price
+   * refresh first (withdraw refreshes the obligation on-chain).
+   */
+  private async buildSupplyWithdraw(marketId: string, fraction: number, strictLiquidity = false): Promise<Built> {
+    const m = this.supplyMarket(marketId);
+    const L = await this.load();
+    const so = L.supplyObligation;
+    if (!so) return { noop: "no supply obligation" };
+    const s = this.snapOf(L, m.asset);
+    const d = so.snap.deposits.find((x) => x.coinType === s.coinType);
+    if (!d || d.ctokens === 0n) return { noop: `no ${marketId} deposit` };
+    if (!so.capId) throw new Error(`wallet does not own the ObligationOwnerCap of supply obligation ${so.obligationId}`);
+    const ctokens = fraction >= 1 ? d.ctokens : applyFraction(d.ctokens, fraction);
+    if (ctokens <= 0n) return { noop: "withdraw amount rounds to 0" };
+    const tokens = (Number(ctokens) * s.ctokenRatio) / 10 ** s.decimals;
+    const usdHigh = tokens * s.priceHigh;
+    const liquidity = fromUnits(s.availableAmount > MIN_AVAILABLE_AMOUNT ? s.availableAmount - MIN_AVAILABLE_AMOUNT : 0n, s.decimals);
+    if (tokens > liquidity) {
+      const e = `${marketId}: reserve available liquidity ${liquidity} < withdraw ${tokens} ${m.asset.symbol}`;
+      if (strictLiquidity) throw new SupplyExitBlocked(e);
+      throw new Error(e);
+    }
+    if (usdHigh > L.rateLimiterUsd) {
+      const e = `${marketId}: withdraw $${usdHigh.toFixed(0)} exceeds the market outflow limit remaining $${L.rateLimiterUsd.toFixed(0)}`;
+      if (strictLiquidity) throw new SupplyExitBlocked(e);
+      throw new Error(e);
+    }
+    const tx = new Transaction();
+    tx.setSender(this.env.address);
+    await L.client.refreshAll(tx, so.raw, [s.coinType]);
+    const coin = first(await L.client.withdraw(so.capId, so.obligationId, s.coinType, ctokens.toString(), tx, false));
+    tx.transferObjects([coin], this.env.address);
+    const detail = `supply withdraw ${(fraction * 100).toFixed(1)}% (${tokens} ${m.asset.symbol}, ${ctokens} cTokens) from supply obligation ${so.obligationId}`;
+    return { tx, detail, amountUsd: tokens * s.price };
+  }
+
+  // -------------------------------------------------------------------------
   // LendingAdapter: writes
   // -------------------------------------------------------------------------
 
   async open(pairId: string, equity: bigint, targetLtv: number, ctx: LiveContext): Promise<LiveResult> {
-    return this.guard(ctx, `open ${pairId}`, async () => {
+    return this.guard(ctx, `open ${pairId}`, async (): Promise<LiveResult> => {
       const w = await this.pairCtx(pairId, ctx);
       const { p, L, coll, debt, same, prices } = w;
       if (equity <= 0n) throw new Error("equity must be > 0");
@@ -343,23 +570,23 @@ export class SuilendAdapter implements LendingAdapter {
       const detail =
         `open ${pairId}: equity ${equityTokens} ${p.collateral.symbol}, ${plan.steps.length} loop steps, planned LTV ${plan.finalLtv.toFixed(4)}` +
         ` (target ${targetLtv}, limited by ${plan.limitedBy})${created ? ", new obligation" : ""}${rateNote}${reason ? `; rewards ineligible: ${reason}` : ""}`;
-      const rec = await executePtb(this.env, ctx, tx, `suilend ${detail}`);
-      return { ok: true, txs: [rec], detail, amountUsd: equityTokens * coll.price };
-    });
+      const rec = await this.exec(ctx, tx, `suilend ${detail}`);
+      return { ok: true, txs: [rec], detail: withUnconfirmed(detail, rec), amountUsd: equityTokens * coll.price };
+    }, {});
   }
 
   async close(pairId: string, fraction: number, ctx: LiveContext): Promise<LiveResult> {
     return this.guard(ctx, `close ${pairId}`, async () => {
       if (!(fraction > 0 && fraction <= 1)) throw new Error(`fraction ${fraction} out of (0,1]`);
       return this.runBuilt(await this.buildUnwind(pairId, { kind: "close", fraction }, ctx), ctx);
-    });
+    }, {});
   }
 
   async deleverage(pairId: string, targetLtv: number, ctx: LiveContext): Promise<LiveResult> {
     return this.guard(ctx, `deleverage ${pairId}`, async () => {
       if (!(targetLtv >= 0 && targetLtv < 1)) throw new Error(`targetLtv ${targetLtv} out of [0,1)`);
       return this.runBuilt(await this.buildUnwind(pairId, { kind: "deleverage", targetLtv }, ctx), ctx);
-    });
+    }, {});
   }
 
   async simulateClose(pairId: string, ctx: LiveContext): Promise<boolean> {
@@ -373,34 +600,53 @@ export class SuilendAdapter implements LendingAdapter {
     }
   }
 
-  async claimRewards(ctx: LiveContext, pairId?: string): Promise<LiveResult & { claimed: { token: string; amount: bigint; decimals: number }[] }> {
-    try {
-      if (pairId !== undefined) this.pair(pairId); // validates; rewards are claimed per obligation
+  /**
+   * Claim every claimable pool reward. `id` = a loop pairId (loop obligation),
+   * a supply marketId (supply obligation) or undefined (both). Rewards are
+   * claimed per obligation (all reserves of it), in one PTB.
+   */
+  async claimRewards(ctx: LiveContext, id?: string): Promise<ClaimResult> {
+    return this.guard(ctx, "claimRewards", async (): Promise<ClaimResult> => {
+      const isPair = id !== undefined && this.pairs.has(id);
+      const isSupply = id !== undefined && this.supply.has(id);
+      if (id !== undefined && !isPair && !isSupply) throw new Error(`suilend: unknown pair / supply market ${id}`);
       const L = await this.load();
-      const o = L.obligation;
-      if (!o) return { ok: true, txs: [], claimed: [], detail: "no obligation" };
-      if (!o.capId) throw new Error(`wallet does not own the ObligationOwnerCap of obligation ${o.obligationId}`);
+      const targets = [
+        ...(id === undefined || isPair ? [L.obligation] : []),
+        ...(id === undefined || isSupply ? [L.supplyObligation] : []),
+      ].filter((o): o is ObligationRef => o !== null);
       const skip = new Set((this.cfg.skipRewardCoinTypes ?? []).map((t) => normalizeStructTag(t)));
-      const rewards = o.snap.rewards.filter((r) => !(this.cfg.skipRewardCoinTypes ? skip.has(r.coinType) : isDefaultSkippedReward(r.coinType)));
-      if (!rewards.length) return { ok: true, txs: [], claimed: [], detail: "nothing claimable" };
+      const keep = (t: string) => !(this.cfg.skipRewardCoinTypes ? skip.has(t) : isDefaultSkippedReward(t));
       const tx = new Transaction();
       tx.setSender(this.env.address);
-      L.client.claimRewardsAndSendToUser(
-        this.env.address,
-        o.capId,
-        rewards.map((r) => ({ reserveArrayIndex: r.reserveArrayIndex, rewardIndex: BigInt(r.rewardIndex), rewardCoinType: r.coinType, side: toSdkSide(r.side) })),
-        tx
-      );
-      const info = await this.rewardCoinInfo(L, rewards.map((r) => r.coinType));
+      const all: ObligationSnapshot["rewards"] = [];
+      const used: string[] = [];
+      for (const o of targets) {
+        const rewards = o.snap.rewards.filter((r) => keep(r.coinType));
+        if (!rewards.length) continue;
+        if (!o.capId) throw new Error(`wallet does not own the ObligationOwnerCap of obligation ${o.obligationId}`);
+        L.client.claimRewardsAndSendToUser(
+          this.env.address,
+          o.capId,
+          rewards.map((r) => ({ reserveArrayIndex: r.reserveArrayIndex, rewardIndex: BigInt(r.rewardIndex), rewardCoinType: r.coinType, side: toSdkSide(r.side) })),
+          tx
+        );
+        all.push(...rewards);
+        used.push(o.obligationId);
+      }
+      if (!all.length) return { ok: true, txs: [], claimed: [], detail: targets.length ? "nothing claimable" : "no obligation" };
+      const info = await this.rewardCoinInfo(L, all.map((r) => r.coinType));
       const agg = new Map<string, bigint>();
-      for (const r of rewards) agg.set(r.coinType, (agg.get(r.coinType) ?? 0n) + r.amount);
+      for (const r of all) agg.set(r.coinType, (agg.get(r.coinType) ?? 0n) + r.amount);
       const claimed = [...agg.entries()].map(([t, amount]) => ({ token: info.get(t)?.symbol ?? tail(t), amount, decimals: info.get(t)?.decimals ?? 0 }));
-      const rec = await executePtb(this.env, ctx, tx, `suilend claim ${rewards.length} rewards (obligation ${o.obligationId})`);
-      return { ok: true, txs: [rec], claimed, detail: "claimed amounts are the pre-trade estimate (on-chain includes accrual until execution)" };
-    } catch (e) {
-      ctx.log("error", `suilend: claimRewards failed: ${msg(e)}`);
-      return { ok: false, txs: [], claimed: [], detail: msg(e) };
-    }
+      const rec = await this.exec(ctx, tx, `suilend claim ${all.length} rewards (obligations ${used.join(", ")})`);
+      return {
+        ok: true,
+        txs: [rec],
+        claimed,
+        detail: withUnconfirmed("claimed amounts are the pre-trade estimate (on-chain includes accrual until execution)", rec),
+      };
+    }, { claimed: [] });
   }
 
   // -------------------------------------------------------------------------
@@ -412,6 +658,7 @@ export class SuilendAdapter implements LendingAdapter {
     const problems: string[] = [];
     const assets = new Map<string, AssetRef>();
     for (const p of this.pairs.values()) for (const a of [p.collateral, p.debt]) assets.set(a.address, a);
+    for (const m of this.supply.values()) assets.set(m.asset.address, m.asset);
     for (const a of assets.values()) {
       try {
         const m = await this.deps.coinMetadata(env, a.address);
@@ -441,6 +688,15 @@ export class SuilendAdapter implements LendingAdapter {
         const c = byType.get(p.collateral.address);
         if (c?.config.element && c.config.element.openLtvPct === 0) problems.push(`${p.pairId}: ${p.collateral.symbol} has openLtv 0 (not usable as collateral)`);
         if (p.collateral.address !== p.debt.address && !this.cfg.swapper) problems.push(`${p.pairId}: two-asset pair needs a swapper`);
+      }
+      if (this.cfg.supplyObligationId) {
+        try {
+          const o = await client.getObligation(this.cfg.supplyObligationId);
+          if (normalizeSuiAddress(o.lendingMarketId) !== normalizeSuiAddress(market!.id)) problems.push(`supply obligation ${this.cfg.supplyObligationId} belongs to market ${o.lendingMarketId}`);
+          if (o.borrows.length) problems.push(`supply obligation ${this.cfg.supplyObligationId} has borrows: its deposits would not be a plain, reward-eligible supply`);
+        } catch (e) {
+          problems.push(`supply obligation ${this.cfg.supplyObligationId} read failed: ${msg(e)}`);
+        }
       }
       if (this.cfg.obligationId) {
         try {
@@ -492,29 +748,57 @@ export class SuilendAdapter implements LendingAdapter {
     if (this.cfg.priceUpdateSource) client.pythConnection = this.cfg.priceUpdateSource;
     const nowMs = this.deps.nowMs();
 
-    // obligation (raw) first, so its reserves join the set that gets fresh prices / confidence
-    let rawObl: { capId: string | null; obligationId: string; raw: RawObligation } | null = null;
+    // obligations (raw) first, so their reserves join the set that gets fresh prices / confidence
+    type RawRef = { capId: string | null; obligationId: string; raw: RawObligation };
     const caps = await this.deps.listObligationCaps(this.env, this.env.address, marketType);
-    if (this.cfg.obligationId) {
-      const want = normalizeSuiAddress(this.cfg.obligationId);
-      const cap = caps.find((c) => normalizeSuiAddress(c.obligationId) === want);
-      rawObl = { capId: cap?.id ?? null, obligationId: want, raw: await client.getObligation(want) };
-    } else if (caps.length === 1) {
-      rawObl = { capId: caps[0]!.id, obligationId: normalizeSuiAddress(caps[0]!.obligationId), raw: await client.getObligation(caps[0]!.obligationId) };
-    } else if (caps.length > 1) {
-      throw new Error(`suilend: wallet holds ${caps.length} obligations in market ${marketId} (${caps.map((c) => c.obligationId).join(", ")}); set obligationId`);
+    const raws = new Map<string, RawRef>();
+    await Promise.all(
+      caps.map(async (c) => {
+        const id = normalizeSuiAddress(c.obligationId);
+        raws.set(id, { capId: c.id, obligationId: id, raw: await client.getObligation(c.obligationId) });
+      })
+    );
+    const loopId = this.cfg.obligationId ? normalizeSuiAddress(this.cfg.obligationId) : undefined;
+    const supplyId = this.cfg.supplyObligationId ? normalizeSuiAddress(this.cfg.supplyObligationId) : undefined;
+    for (const id of [loopId, supplyId]) {
+      // configured but not owned by this wallet: read-only
+      if (id && !raws.has(id)) raws.set(id, { capId: null, obligationId: id, raw: await client.getObligation(id) });
     }
-    if (rawObl && normalizeSuiAddress(rawObl.raw.lendingMarketId) !== normalizeSuiAddress(marketId)) {
-      throw new Error(`suilend: obligation ${rawObl.obligationId} belongs to market ${rawObl.raw.lendingMarketId}, not ${marketId}`);
+    for (const r of raws.values()) {
+      if (normalizeSuiAddress(r.raw.lendingMarketId) !== normalizeSuiAddress(marketId)) {
+        if (r.obligationId === loopId || r.obligationId === supplyId) {
+          throw new Error(`suilend: obligation ${r.obligationId} belongs to market ${r.raw.lendingMarketId}, not ${marketId}`);
+        }
+        raws.delete(r.obligationId);
+      }
     }
+    const roles = classifyObligations(
+      [...raws.values()].map((r) => ({
+        obligationId: r.obligationId,
+        depositTypes: r.raw.deposits.map((d) => normalizeStructTag(d.coinType)),
+        borrowTypes: r.raw.borrows.map((b) => normalizeStructTag(b.coinType)),
+      })),
+      {
+        loopId,
+        supplyId,
+        supplyAssets: new Set([...this.supply.values()].map((m) => m.asset.address)),
+        wantSupply: this.supply.size > 0,
+        wantLoop: this.pairs.size > 0 || this.supply.size === 0,
+      }
+    );
+    const rawObl = roles.loop ? raws.get(roles.loop)! : null;
+    const rawSupply = roles.supply ? raws.get(roles.supply)! : null;
 
     const interest = new Set<string>();
     for (const p of this.pairs.values()) {
       interest.add(p.collateral.address);
       interest.add(p.debt.address);
     }
-    for (const d of rawObl?.raw.deposits ?? []) interest.add(normalizeStructTag(d.coinType));
-    for (const b of rawObl?.raw.borrows ?? []) interest.add(normalizeStructTag(b.coinType));
+    for (const m of this.supply.values()) interest.add(m.asset.address);
+    for (const o of [rawObl, rawSupply]) {
+      for (const d of o?.raw.deposits ?? []) interest.add(normalizeStructTag(d.coinType));
+      for (const b of o?.raw.borrows ?? []) interest.add(normalizeStructTag(b.coinType));
+    }
 
     let reserves = compoundReserves(client.lendingMarket.reserves, nowMs);
     let pricesFromFeed = false;
@@ -547,9 +831,14 @@ export class SuilendAdapter implements LendingAdapter {
       const t = normalizeStructTag(r.coinType);
       snaps.set(t, reserveSnapshot(r, confidence.get(t)));
     }
-    const obligation: ObligationRef | null = rawObl
-      ? { ...rawObl, snap: obligationSnapshot(rawObl.raw, reserves, nowMs, confidence.size ? confidence : undefined) }
-      : null;
+    const toRef = (r: RawRef | null): ObligationRef | null =>
+      r ? { ...r, snap: obligationSnapshot(r.raw, reserves, nowMs, confidence.size ? confidence : undefined) } : null;
+    let paused: boolean | undefined;
+    try {
+      paused = await this.deps.marketPaused(this.env, marketId, marketType);
+    } catch (e) {
+      this.log("warn", `suilend: market pause read failed: ${msg(e)}`);
+    }
     return {
       client,
       marketId,
@@ -559,7 +848,9 @@ export class SuilendAdapter implements LendingAdapter {
       snaps,
       rateLimiterUsd: rateLimiterRemainingUsd(client.lendingMarket.rateLimiter, Math.floor(nowMs / 1000)),
       pricesFromFeed,
-      obligation,
+      obligation: toRef(rawObl),
+      supplyObligation: toRef(rawSupply),
+      paused,
     };
   }
 
@@ -695,6 +986,7 @@ export class SuilendAdapter implements LendingAdapter {
         dataAsOfMs,
         myLtv,
       });
+      if (L.paused !== undefined) pair.paused = L.paused;
       out.push({
         pair,
         diag: {
@@ -897,16 +1189,34 @@ export class SuilendAdapter implements LendingAdapter {
 
   private async runBuilt(b: Built, ctx: LiveContext): Promise<LiveResult> {
     if ("noop" in b) return { ok: true, txs: [], detail: b.noop };
-    const rec = await executePtb(this.env, ctx, b.tx, `suilend ${b.detail}`);
-    return { ok: true, txs: [rec], detail: b.detail, amountUsd: b.amountUsd };
+    const rec = await this.exec(ctx, b.tx, `suilend ${b.detail}`);
+    return { ok: true, txs: [rec], detail: withUnconfirmed(b.detail, rec), amountUsd: b.amountUsd };
   }
 
-  private async guard(ctx: LiveContext, what: string, fn: () => Promise<LiveResult>): Promise<LiveResult> {
+  /** executePtb; an executed-but-unconfirmed record is logged (callers must re-read state before acting again). */
+  private async exec(ctx: LiveContext, tx: Transaction, description: string): Promise<TxRecord> {
+    const rec = await executePtb(this.env, ctx, tx, description);
+    if (rec.unconfirmed) ctx.log("warn", `suilend: ${description} executed as ${rec.id} but checkpoint confirmation is pending; re-read state before retrying`);
+    return rec;
+  }
+
+  /**
+   * Error boundary for writes. BroadcastUnconfirmedError = signed + submitted,
+   * fate unknown: it MAY HAVE LANDED, so the digest is returned as an
+   * unconfirmed TxRecord (never "nothing happened"); callers re-read state.
+   */
+  private async guard<R extends LiveResult>(ctx: LiveContext, what: string, fn: () => Promise<R>, empty: Omit<R, keyof LiveResult>): Promise<R> {
     try {
       return await fn();
     } catch (e) {
+      if (e instanceof BroadcastUnconfirmedError) {
+        const detail = `suilend: ${what}: broadcast unconfirmed (may have landed) digest=${e.id}: ${e.message}`;
+        ctx.log("error", detail);
+        const txs: TxRecord[] = [{ chain: "sui", id: e.id, description: e.description, simulated: false, unconfirmed: true }];
+        return { ...empty, ok: false, txs, detail } as unknown as R;
+      }
       ctx.log("error", `suilend: ${what} failed: ${msg(e)}`);
-      return { ok: false, txs: [], detail: msg(e) };
+      return { ...empty, ok: false, txs: [], detail: msg(e) } as unknown as R;
     }
   }
 }
@@ -919,6 +1229,10 @@ function first(res: unknown): TransactionObjectArgument {
   const x = (res as TransactionObjectArgument[])[0];
   if (!x) throw new Error("suilend: SDK call returned no result");
   return x;
+}
+
+function withUnconfirmed(detail: string, rec: TxRecord): string {
+  return rec.unconfirmed ? `${detail} [UNCONFIRMED: executed as ${rec.id}, checkpoint wait failed; re-read state]` : detail;
 }
 
 function tail(coinType: string): string {

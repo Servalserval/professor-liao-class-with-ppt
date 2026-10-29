@@ -12,6 +12,7 @@ export {
   rewardsEligible as suilendRewardsEligible,
   rateLimiterRemainingUsd as suilendRateLimiterRemainingUsd,
   buildLoopPair as buildSuilendLoopPair,
+  classifyObligations as classifySuilendObligations,
   REWARD_RULE_DOCS as SUILEND_REWARD_RULE_DOCS,
   type LoopPlan as SuilendLoopPlan,
   type LoopPlanInput as SuilendLoopPlanInput,
@@ -29,6 +30,7 @@ export {
 export type {
   SuilendAdapterConfig,
   SuilendPairConfig,
+  SuilendSupplyConfig,
   ReserveSnapshot as SuilendReserveSnapshot,
   ObligationSnapshot as SuilendObligationSnapshot,
   PriceUpdateDataSourceLike as SuilendPriceUpdateSource,

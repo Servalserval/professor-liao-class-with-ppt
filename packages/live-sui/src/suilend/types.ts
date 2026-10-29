@@ -282,17 +282,29 @@ export interface SuilendClientLike {
   getObligation(obligationId: string): Promise<RawObligation>;
 }
 
+/** Plain (borrow-free) deposit market. */
+export interface SuilendSupplyConfig {
+  asset: AssetRef;
+  /** SupplyMarket.marketId (default asset.symbol). */
+  marketId?: string;
+}
+
 export interface SuilendAdapterConfig {
   env: import("../common.js").SuiEnv;
+  /** Supply-only markets (SupplyAdapter). Deposits live in a dedicated borrow-free obligation, never the loop obligation. */
+  supply?: SuilendSupplyConfig[];
+  /** Dedicated supply obligation. Absent: the wallet's borrow-free obligation (see adapter header), created on first deposit. */
+  supplyObligationId?: string;
   /** "main" (default; SDK constant LENDING_MARKET_ID/TYPE) or a lending market object id (type is read on-chain). */
   lendingMarket?: "main" | string;
   /** Lending market type arg when `lendingMarket` is an id (optional; read from chain when absent and cross-checked by verifyConfig). */
   lendingMarketType?: string;
+  /** Loop pairs (may be empty for a supply-only adapter). */
   pairs: SuilendPairConfig[];
   /** Required for pairs whose collateral != debt (stable pairs). */
   swapper?: import("../common.js").PtbSwapper;
   extraRewards?: import("@incentive-router/live-common").RewardRateProvider;
-  /** Obligation to use. Absent: the single ObligationOwnerCap the wallet holds for this market (created on first open). */
+  /** Loop obligation. Absent: the wallet's only obligation in the market other than the supply obligation (created on first open). */
   obligationId?: string;
   /**
    * Liquidity-mining eligibility. Suilend zeroes ALL reward shares of an

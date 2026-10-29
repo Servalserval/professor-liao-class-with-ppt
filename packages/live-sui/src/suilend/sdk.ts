@@ -18,11 +18,12 @@ import { SuilendClient, LENDING_MARKET_ID, LENDING_MARKET_TYPE } from "@suilend/
 import { PACKAGE_ID } from "@suilend/sdk/_generated/suilend";
 import * as simulate from "@suilend/sdk/utils/simulate";
 import { createObligationIfNoneExists, sendObligationToUser } from "@suilend/sdk/lib/transactions";
+import { isMarketPaused } from "@suilend/sdk/_generated/suilend/lending-market/functions";
 import { Side } from "@suilend/sdk/lib/types";
 import { NORMALIZED_STABLECOIN_COINTYPES, isSendPoints, isSteammPoints } from "@suilend/sui-core/lib/coinType";
 import { MAX_U64 } from "@suilend/sui-core/lib/constants";
 import { normalizeStructTag, normalizeSuiAddress, parseStructTag } from "@mysten/sui/utils";
-import type { Transaction } from "@mysten/sui/transactions";
+import { Transaction } from "@mysten/sui/transactions";
 import { fromUnits } from "@incentive-router/live-common";
 import type { SuiEnv } from "../common.js";
 import { claimableRewards, irmFromConfig, normType } from "./pure.js";
@@ -65,6 +66,8 @@ export interface SuilendDeps {
   listObligationCaps(env: SuiEnv, owner: string, marketType: string): Promise<{ id: string; obligationId: string }[]>;
   coinMetadata(env: SuiEnv, coinType: string): Promise<{ decimals: number; symbol: string } | null>;
   reserveConfidence(env: SuiEnv, reserve: RawReserve): Promise<ReserveConfidence | undefined>;
+  /** lending_market::is_market_paused (v8) via simulation; undefined = could not tell. Reserve-level pauses are not readable this way. */
+  marketPaused(env: SuiEnv, marketId: string, marketType: string): Promise<boolean | undefined>;
   nowMs(): number;
 }
 
@@ -101,6 +104,16 @@ export const defaultDeps: SuilendDeps = {
     if (simulate.isRefreshedFromFeed(reserve)) return { share: undefined, kBps };
     const share = await SuilendClient.getReserveConfidenceShare(env.grpc, reserve.id);
     return { share, kBps };
+  },
+  async marketPaused(env, marketId, marketType) {
+    // Must run after SuilendClient.initialize (it sets the published-at package used for the target).
+    const tx = new Transaction();
+    tx.setSender(env.address);
+    isMarketPaused(tx, marketType, marketId);
+    const r = await env.grpc.core.simulateTransaction({ transaction: tx, include: { commandResults: true } });
+    if (r.$kind !== "Transaction") return undefined;
+    const b = r.commandResults?.[0]?.returnValues?.[0]?.bcs;
+    return b && b.length === 1 ? b[0] === 1 : undefined;
   },
   nowMs: () => Date.now(),
 };
@@ -259,4 +272,4 @@ export function asClientLike(c: SuilendClient): SuilendClientLike {
   return c as unknown as SuilendClientLike;
 }
 
-export type { Transaction };
+
