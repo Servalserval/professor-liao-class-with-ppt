@@ -1,0 +1,120 @@
+# incentive-router default config
+# All APRs are yearly fractions (0.05 = 5%). All caps are fractions of TOTAL equity.
+# Anything omitted falls back to DEFAULT_CONFIG in src/config.ts.
+#
+# Mapping from loop-farm config/default.yaml is in docs/design.md §7.
+
+# What idle money earns elsewhere (T-bill / sUSDS). Thresholds are premia on top of it.
+baseline_apr: 0.045
+hold_horizon_days: 21          # one-off costs are amortized over this; reward time-weight uses it
+poll_seconds: 60
+
+thresholds:
+  entry_premium_by_tier: {1: 0.03, 2: 0.06, 3: 0.12}   # enter if net >= baseline + premium
+  exit_premium_by_tier:  {1: 0.00, 2: 0.02, 3: 0.05}   # leave if net <  baseline + premium (hysteresis)
+  hard_floor_apr: 0.0          # below this: close fully instead of trimming
+  spread_reduce_step: 0.5      # trim size per confirmed spread breach
+  confirm_cycles: 2            # non-urgent reasons must persist this many cycles
+
+# The generalized 1/10 -> 1/5 rule. "capacity" = what can get out (lending: available
+# liquidity; LP: depth for the volatile side; perp: min book depth of both venues).
+liquidity:
+  entry_max_frac_of_capacity: 0.10
+  exit_frac_of_capacity: 0.20          # >= -> FULL EXIT, never debounced
+  min_capacity_usd: 200000
+  capacity_drop_exit_frac: 0.30        # capacity -30% within the window -> FULL EXIT (bank run)
+  capacity_drop_window_minutes: 60
+  estimated_capacity_haircut: 0.5      # discovery data guesses capacity; halve it
+
+rewards:
+  default_realizable: 0.5              # loop-farm's flat haircut, used only for unknown tokens
+  min_realizable: 0.1
+  max_realizable: 0.95
+  ending_hours: 12                     # campaign ending soon -> exit if the edge needs it
+  claim_gas_multiple: 5                # never claim < 5x gas (crash: 1x)
+  vol_penalty_k: 1.0
+  price_crash_frac: 0.25               # reward token -25% in 24h -> claim and dump
+  emission_drop_frac: 0.5              # pool reward APR halves within the window -> warn
+  emission_drop_window_hours: 24
+  default_token: {policy: sell_on_claim, max_hold_usd: 0, claim_interval_hours: 24, claim_min_usd: 50}
+  tokens:
+    # SEND:  {policy: sell_on_claim, claim_interval_hours: 12}
+    # 1INCH: {policy: hedge}          # needs tokens.1INCH.perpAvailable: true in the token profile feed
+    # NAVX:  {policy: hold, max_hold_usd: 500}
+
+points:
+  max_cost_apr: 0.03          # pay at most 3%/yr of the position for a points lottery ticket
+  budget_frac: 0.10           # at most 10% of equity in points-driven positions
+
+funding:
+  realizable: 0.7             # positive funding valued at 70% (it flips); negative counted in full
+
+spike_rules:                  # metric jump between two cycles -> FULL EXIT
+  borrow_apr: 0.10            # loop-farm: borrow APR +10pp
+  # funding_flip_apr: 0.50    # perp hedges: funding diff collapses by 50pp annualized
+
+caps:
+  per_venue_frac_by_tier: {1: 0.40, 2: 0.15, 3: 0.05}
+  per_chain_frac: {default: 0.60}
+  per_token_frac: 0.80
+  per_reward_token_frac: 0.05         # unclaimed + held - hedged of any single reward token
+  per_kind_frac: {lending_loop: 0.80, lp_incentive: 0.40, delta_neutral_perp: 0.40, deposit: 0.50}
+  per_opportunity_frac: 0.30
+  max_concurrent_positions: 8
+  min_position_usd: 500
+  max_position_usd: 100000
+  min_idle_frac: 0.05
+  reentry_cooldown_hours: 6
+  urgent_reentry_cooldown_hours: 48   # after a liquidity / stress exit
+
+allocator:
+  chunk_frac: 0.02            # water-fill in 2%-of-equity chunks
+  min_chunk_usd: 500
+  max_new_positions_per_cycle: 2
+  min_rebalance_usd: 1000
+
+exit_probe:                   # devInspect / eth_call of the full unwind
+  max_age_minutes: 30
+  max_consecutive_failures: 2
+
+portfolio:
+  kill_drawdown_frac: 0.05    # equity -5% within the window -> exit all, pause
+  kill_window_hours: 24
+  blind_alert_cycles: 3       # source missing a held opportunity
+  blind_exit_cycles: 10
+  alert_repeat_hours: 6       # status alerts are deduped (numbers ignored) within this window
+
+tiers:                        # see src/tiers.ts for the score
+  tier1_min_score: 7
+  tier2_min_score: 4
+
+gas_usd: {default: 0.5, ethereum: 8, sui: 0.05, arbitrum: 0.1, base: 0.05}
+
+venues:
+  navi:     {enabled: true, tier: 1, chain: sui}
+  suilend:  {enabled: true, tier: 1, chain: sui}
+  aave-v3:  {enabled: true, tier: 1}
+  hyperliquid: {enabled: true, tier: 1}
+  # A new venue without a tier is scored from meta (unknown -> tier 3):
+  # some-new-lender: {enabled: true, meta: {audits: 1, age_days: 40, tvl_usd: 30000000, admin_multisig: true, timelock_hours: 0, upgradeable: true}}
+
+sources:
+  lending_loop:
+    target_ltv: 0.70
+    max_ltv_frac_of_open: 0.85
+    deleverage_at_ltv: 0.78
+    critical_ltv_frac_of_close: 0.95
+    utilization_warn: 0.90
+    utilization_exit: 0.95
+    footprint: gross          # gross: L x equity must fit (conservative); net: flashloan exit
+    rate_uncertainty_mult: 1.30
+    txs_per_entry: 1
+    txs_per_exit: 1
+  discovery:
+    min_tvl_usd: 1000000
+    chains: []
+    assumed_withdrawable_frac: 0.3
+
+telegram:
+  bot_token_env: TG_BOT_TOKEN
+  chat_id_env: TG_CHAT_ID

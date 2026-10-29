@@ -1,0 +1,15 @@
+# Reward-token profiles feeding the haircut model (src/valuation.ts rewardRealizable).
+# In production these come from a price/depth feed; here they are illustrative.
+tokens:
+  SEND:
+    priceUsd: 0.5
+    depth2pctUsd: 150000
+    vol: 1.0
+    trendApr: -0.5
+  XPL:
+    priceUsd: 0.1
+    depth2pctUsd: 400000
+    vol: 1.2
+    trendApr: -0.9        # the 2025-26 path: -94% from ATH
+    perpAvailable: true
+    hedgeCostApr: 0.15

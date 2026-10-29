@@ -1,0 +1,71 @@
+# Liquidity drains out of a newer lender, an exit path stops simulating,
+# and a source goes dark. Illustrative numbers.
+name: Bank run / dead exit path / blind source
+start_equity_usd: 100000
+step_minutes: 60
+steps: 70
+config:
+  venues:
+    newlend: {enabled: true, tier: 2}
+    suilend: {enabled: true, tier: 1}
+    navi: {enabled: true, tier: 1}
+  caps:
+    per_venue_frac_by_tier: {1: 0.3, 2: 0.25, 3: 0.05}
+    per_chain_frac: {default: 1.0}
+tokens:
+  NEW: {priceUsd: 1.0, depth2pctUsd: 500000, vol: 1.2, trendApr: -0.5}
+  SEND: {priceUsd: 0.5, depth2pctUsd: 150000, vol: 1.0, trendApr: -0.3}
+opportunities:
+  - id: newlend-usdc
+    name: NewLend USDC loop (tier 2)
+    kind: lending_loop
+    venue: newlend
+    chain: sui
+    token: USDC
+    capacity_usd: 20000000
+    footprint_per_equity: 3.33
+    streams:
+      - {label: supply_base, kind: base, apr: 0.20}
+      - {label: borrow_base, kind: borrow_cost, apr: -0.1867}
+      - {label: new, kind: reward, apr: 0.09, reward_token: NEW, pool_usd: 80000000, gross_per_equity: 3.33}
+    signals:
+      - {name: utilization, value: 0.80, warn_at: 0.90, exit_at: 0.95}
+    metrics: {borrow_apr: 0.08}
+  - id: suilend-usdc
+    name: Suilend USDC loop
+    kind: lending_loop
+    venue: suilend
+    chain: sui
+    token: USDC
+    capacity_usd: 10000000
+    footprint_per_equity: 3.33
+    streams:
+      - {label: supply_base, kind: base, apr: 0.20}
+      - {label: borrow_base, kind: borrow_cost, apr: -0.1867}
+      - {label: send, kind: reward, apr: 0.04, reward_token: SEND, pool_usd: 50000000, gross_per_equity: 3.33}
+    metrics: {borrow_apr: 0.08}
+  - id: navi-usdc
+    name: Navi USDC loop
+    kind: lending_loop
+    venue: navi
+    chain: sui
+    token: USDC
+    capacity_usd: 15000000
+    footprint_per_equity: 3.33
+    streams:
+      - {label: supply_base, kind: base, apr: 0.18}
+      - {label: borrow_base, kind: borrow_cost, apr: -0.16}
+      - {label: navx, kind: reward, apr: 0.035, reward_token: SEND, pool_usd: 60000000, gross_per_equity: 3.33}
+    metrics: {borrow_apr: 0.07}
+events:
+  - at: 12
+    note: whales pull liquidity from NewLend (-45% in an hour)
+    patch:
+      newlend-usdc: {capacity_usd: 11000000}
+  - at: 30
+    note: Suilend unwind simulation starts failing
+    fail_exit_sim: [suilend-usdc]
+  - at: 45
+    note: Navi data source goes dark
+    patch:
+      navi-usdc: {hidden: true}

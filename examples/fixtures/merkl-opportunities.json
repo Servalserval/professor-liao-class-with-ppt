@@ -1,0 +1,48 @@
+[
+  {
+    "id": "1150283456789012345",
+    "chainId": 8453,
+    "type": "UNISWAP_V4",
+    "identifier": "0x1111111111111111111111111111111111111111",
+    "name": "Provide liquidity to USDC-EXAMPLE 0.05%",
+    "status": "LIVE",
+    "action": "POOL",
+    "tvl": 4200000,
+    "apr": 34.76,
+    "dailyRewards": 4000,
+    "latestCampaignStart": 1793000000,
+    "latestCampaignEnd": 1793900000,
+    "depositUrl": "https://example.org/pool",
+    "chain": { "id": 8453, "name": "Base" },
+    "protocol": { "id": "uniswap", "name": "Uniswap" },
+    "tokens": [{ "symbol": "USDC" }, { "symbol": "EXAMPLE" }],
+    "rewardsRecord": { "total": 4000, "breakdowns": [{ "token": { "symbol": "EXAMPLE", "price": 0.42 }, "amount": "9523", "value": 4000 }] }
+  },
+  {
+    "id": "2250283456789012345",
+    "chainId": 42161,
+    "type": "EULER",
+    "identifier": "0x2222222222222222222222222222222222222222",
+    "name": "Supply USDC on Euler",
+    "status": "LIVE",
+    "tvl": 18000000,
+    "apr": 6.08,
+    "dailyRewards": 3000,
+    "latestCampaignEnd": 1795000000,
+    "chain": { "id": 42161, "name": "Arbitrum" },
+    "protocol": { "id": "euler", "name": "Euler" },
+    "tokens": [{ "symbol": "USDC" }],
+    "rewardsRecord": { "total": 3000, "breakdowns": [{ "token": { "symbol": "rEUL" }, "value": 3000 }] }
+  },
+  {
+    "id": "3350283456789012345",
+    "chainId": 1,
+    "type": "ERC20",
+    "identifier": "0x3333333333333333333333333333333333333333",
+    "name": "Hold OLD token (ended)",
+    "status": "PAST",
+    "tvl": 900000,
+    "apr": 0,
+    "dailyRewards": 0
+  }
+]

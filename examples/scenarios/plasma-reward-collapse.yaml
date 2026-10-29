@@ -1,0 +1,56 @@
+# What would the router have done with a Plasma-style incentive farm?
+# Reward token sells off, emissions get cut, then the campaign end is announced.
+# Illustrative numbers. Run: npx tsx src/cli.ts sim examples/scenarios/plasma-reward-collapse.yaml
+name: Plasma-style reward collapse
+start_equity_usd: 100000
+step_minutes: 60
+steps: 80
+config:
+  venues:
+    aave-plasma: {enabled: true, tier: 2}
+    suilend: {enabled: true, tier: 1}
+  caps:
+    per_venue_frac_by_tier: {1: 0.4, 2: 0.3, 3: 0.05}
+    per_chain_frac: {default: 0.6}
+tokens:
+  XPL: {priceUsd: 1.0, depth2pctUsd: 2000000, vol: 1.0, trendApr: 0}
+  SEND: {priceUsd: 0.5, depth2pctUsd: 150000, vol: 1.0, trendApr: -0.3}
+opportunities:
+  - id: plasma-usdt0
+    name: Aave on Plasma USDT0 + XPL
+    kind: deposit
+    venue: aave-plasma
+    chain: plasma
+    token: USDT0
+    capacity_usd: 400000000
+    costs: {entry_frac: 0.0005, exit_frac: 0.0005}
+    streams:
+      - {label: base, kind: base, apr: 0.04}
+      - {label: xpl, kind: reward, apr: 0.30, reward_token: XPL, pool_usd: 2000000000}
+  - id: suilend-usdc
+    name: Suilend USDC loop (boring tier 1)
+    kind: lending_loop
+    venue: suilend
+    chain: sui
+    token: USDC
+    capacity_usd: 10000000
+    footprint_per_equity: 3.33
+    streams:
+      - {label: supply_base, kind: base, apr: 0.20}
+      - {label: borrow_base, kind: borrow_cost, apr: -0.1867}
+      - {label: send, kind: reward, apr: 0.03, reward_token: SEND, pool_usd: 50000000, gross_per_equity: 3.33}
+    signals:
+      - {name: utilization, value: 0.80, warn_at: 0.90, exit_at: 0.95}
+    metrics: {borrow_apr: 0.08}
+events:
+  - at: 20
+    note: XPL -35% in a day
+    tokens: {XPL: {priceUsd: 0.65, trendApr: -3.0}}
+  - at: 40
+    note: emissions cut to a third
+    patch:
+      plasma-usdt0: {streams: {xpl: {apr: 0.10}}}
+  - at: 60
+    note: campaign end announced for step 68
+    patch:
+      plasma-usdt0: {streams: {xpl: {ends_in_hours: 68}}}

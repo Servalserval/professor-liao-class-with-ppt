@@ -1,0 +1,50 @@
+# Hand-written opportunities for `scan` / `plan` / `run --paper`.
+# Numbers are ILLUSTRATIVE, not live market data.
+opportunities:
+  - id: suilend-usdc-loop
+    name: Suilend USDC loop @70% (illustrative)
+    kind: lending_loop
+    venue: suilend
+    chain: sui
+    token: USDC
+    capacity_usd: 10000000          # available liquidity
+    footprint_per_equity: 3.33      # gross supply per equity at 70% LTV
+    costs: {fixed_entry_usd: 0.05, fixed_exit_usd: 0.05}
+    streams:
+      - {label: supply_base, kind: base, apr: 0.20}          # 3.33 x 6%
+      - {label: borrow_base, kind: borrow_cost, apr: -0.1867} # -2.33 x 8%
+      - {label: supply_reward, kind: reward, apr: 0.06, reward_token: SEND, pool_usd: 50000000, gross_per_equity: 3.33}
+    signals:
+      - {name: utilization, value: 0.80, warn_at: 0.90, exit_at: 0.95}
+    metrics: {borrow_apr: 0.08}
+
+  - id: plasma-aave-usdt0
+    name: Aave on Plasma USDT0 + XPL (illustrative)
+    kind: deposit
+    venue: aave-plasma
+    chain: plasma
+    token: USDT0
+    capacity_usd: 8000000
+    costs: {entry_frac: 0.0005, exit_frac: 0.0005}
+    streams:
+      - {label: base, kind: base, apr: 0.04}
+      - {label: xpl, kind: reward, apr: 0.12, reward_token: XPL, pool_usd: 200000000, ends_in_hours: 336}
+
+  - id: btc-hl-vs-paradex
+    name: BTC long Hyperliquid / short Paradex x3, points (illustrative)
+    kind: delta_neutral_perp
+    venue: paradex
+    chain: offchain
+    token: USDC
+    legs:
+      - {venue: hyperliquid, chain: offchain, token: USDC, equity_frac: 0.5}
+      - {venue: paradex, chain: offchain, token: USDC, equity_frac: 0.5}
+    capacity_usd: 3000000
+    footprint_per_equity: 1.5
+    speculative: true
+    costs: {entry_frac: 0.0006, exit_frac: 0.0006, ongoing_apr: 0.036}
+    streams:
+      - {label: funding_diff, kind: funding, apr: 0.02}
+      - {label: points, kind: points, apr: 0.10}
+    signals:
+      - {name: venue_basis_bps, value: 4, warn_at: 30, exit_at: 100}
