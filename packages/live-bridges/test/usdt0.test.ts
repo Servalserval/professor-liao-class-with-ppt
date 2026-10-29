@@ -75,6 +75,10 @@ describe("usdt0 encoding", () => {
     assert.equal(D.optimism!.eid, 30111);
     assert.equal(D.plasma!.eid, 30383);
     assert.equal(D.hyperevm!.eid, 30367);
+    assert.equal(D.monad!.eid, 30390);
+    assert.equal(D.monad!.oft, "0x9151434b16b9763660705744891fA906F660EcC5");
+    assert.equal(D.xlayer!.eid, 30274);
+    assert.equal(D.mantle!.eid, 30181);
     assert.equal(D.ethereum!.adapter, true);
     assert.ok(Object.entries(D).every(([c, d]) => c === "ethereum" || !d.adapter));
     assert.equal(D.base, undefined);
@@ -163,7 +167,7 @@ describe("Usdt0OftAdapter", () => {
     assert.equal(p.extraOptions, "0x");
     assert.equal(fee.nativeFee, s.value);
     assert.equal(refund, getAddress(ME));
-    assert.equal(res.handle, `usdt0_oft:ethereum:arbitrum:${sendTxHash}:${guid}:777:2000000`);
+    assert.equal(res.handle, `usdt0_oft:ethereum:arbitrum:${sendTxHash}:${guid}:777:2000000:2000000`);
   });
 
   it("send(): dry-run with a missing approval simulates the approve only", async () => {
@@ -202,7 +206,9 @@ describe("Usdt0OftAdapter", () => {
     const guid = pad("0xbeef");
     const h = `usdt0_oft:ethereum:arbitrum:${pad("0x01")}:${guid}:777:2000000`;
     const ctx = mockCtx();
-    assert.deepEqual(await adapter.status(h, ctx), { state: "pending" }); // scan 404
+    const s404 = await adapter.status(h, ctx); // scan 404 -> no message -> unconfirmed
+    assert.equal(s404.state, "pending");
+    assert.match((s404 as { unconfirmed?: string }).unconfirmed!, /no message/);
 
     const scanWith = (name: string) =>
       f.route("/messages/tx/", () => ({ status: 200, body: { data: [{ guid, status: { name }, destination: { tx: { txHash: pad("0xee") } } }] } }));
@@ -216,8 +222,12 @@ describe("Usdt0OftAdapter", () => {
     const rec = await adapter.status(h, ctx);
     assert.equal(rec.state, "failed");
     assert.match((rec as { detail: string }).detail, /^recoverable:/);
+    scanWith("SOMETHING_NEW");
+    assert.match(((await adapter.status(h, ctx)) as { unconfirmed?: string }).unconfirmed!, /not understood/);
     f.route("/messages/tx/", () => ({ status: 500, body: "boom" }));
-    assert.deepEqual(await adapter.status(h, ctx), { state: "pending" });
+    const down = await adapter.status(h, ctx);
+    assert.equal(down.state, "pending");
+    assert.match((down as { unconfirmed?: string }).unconfirmed!, /unreachable/);
   });
 
   it("scan parsing is defensive", () => {
@@ -254,5 +264,67 @@ describe("verifyUsdt0", () => {
     const issues = await verifyUsdt0({ envs: { arbitrum: arb.env, plasma: plasma.env } });
     assert.ok(issues.some((i) => i.includes("endpoint.eid() = 30999")));
     assert.ok(issues.some((i) => i.includes("peers(30383 plasma)")));
+  });
+});
+
+describe("Usdt0OftAdapter send/status robustness", () => {
+  function sentLog(oft: Hex, guid: Hex, amount: bigint, txHash: Hex) {
+    return {
+      address: oft,
+      topics: encodeEventTopics({ abi: oftAbi, eventName: "OFTSent", args: { guid, fromAddress: ME } }),
+      data: encodeAbiParameters([{ type: "uint32" }, { type: "uint256" }, { type: "uint256" }], [30383, amount, amount]),
+      blockNumber: 1n,
+      transactionHash: txHash,
+      logIndex: 0,
+      blockHash: pad("0x01"),
+      transactionIndex: 0,
+      removed: false,
+    };
+  }
+
+  it("receipt wait times out after broadcast -> ok:true, guid unknown ('-') in the handle", async () => {
+    const { adapter, arb } = setup();
+    arb.receiptWait = "timeout";
+    const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, true, res.detail);
+    assert.equal(res.handle, `usdt0_oft:arbitrum:plasma:0x${"1".padStart(64, "0")}:-:1000:1000000:1000000`);
+  });
+
+  it("OFTSent lookup failing after a confirmed send still returns ok:true", async () => {
+    const { adapter, arb } = setup(); // no receipt registered -> getTransactionReceipt throws
+    const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, true, res.detail);
+    assert.match(res.handle!, /:-:1000:1000000:1000000$/);
+    assert.equal(arb.sent.length, 1);
+  });
+
+  it("OFT send reverted on-chain -> ok:false", async () => {
+    const { adapter, arb } = setup();
+    arb.receiptWait = "reverted";
+    const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, false);
+  });
+
+  it("status() with guid '-': recovers the guid from the receipt, then finds OFTReceived", async () => {
+    const { adapter, arb, plasma } = setup();
+    const tx = pad("0x51");
+    const guid = pad("0xfeed");
+    arb.receipts[tx] = { logs: [sentLog(D.arbitrum!.oft, guid, 1_000_000n, tx)] };
+    plasma.logs = [{ args: { guid, srcEid: 30110, toAddress: ME, amountReceivedLD: 1_000_000n }, transactionHash: pad("0xd6") }];
+    const st = await adapter.status(`usdt0_oft:arbitrum:plasma:${tx}:-:1000:1000000:1000000`, mockCtx());
+    assert.deepEqual(st, { state: "completed", dstTx: pad("0xd6"), received: 1_000_000n });
+  });
+
+  it("status() with guid '-': reverted source -> failed + refunded; missing receipt -> unconfirmed", async () => {
+    const { adapter, arb } = setup();
+    const tx = pad("0x52");
+    const h = `usdt0_oft:arbitrum:plasma:${tx}:-:1000:1000000:1000000`;
+    const missing = await adapter.status(h, mockCtx());
+    assert.equal(missing.state, "pending");
+    assert.match((missing as { unconfirmed?: string }).unconfirmed!, /not found/);
+    arb.receipts[tx] = { logs: [], status: "reverted" };
+    const st = await adapter.status(h, mockCtx());
+    assert.equal(st.state, "failed");
+    assert.equal((st as { refunded?: bigint }).refunded, 1_000_000n);
   });
 });

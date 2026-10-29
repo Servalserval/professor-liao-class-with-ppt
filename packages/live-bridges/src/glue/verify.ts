@@ -23,7 +23,7 @@ export function staticBridgeChecks(): string[] {
   for (const [c, d] of Object.entries(CCTP_DOMAINS)) {
     if (seenDomains.has(d)) issues.push(`cctp: domain ${d} used by ${seenDomains.get(d)} and ${c}`);
     seenDomains.set(d, c);
-    if (c !== "monad" && !CHAINS[c]) issues.push(`cctp: chain ${c} not in live-common CHAINS`);
+    if (!CHAINS[c]) issues.push(`cctp: chain ${c} not in live-common CHAINS`);
   }
   const seenEids = new Map<number, string>();
   for (const [c, d] of Object.entries(USDT0_DEPLOYMENTS)) {

@@ -7,21 +7,31 @@
  * (or the Sui burn PTB) -> status via Iris /v2/messages + destination nonce
  * check -> complete() = receiveMessage on the destination (EVM sendTx / Sui
  * executePtb), always simulated first; dry-run never broadcasts.
+ *
+ * send() contract (core BridgeExecutor): ok:false only when nothing left the
+ * wallet. Once the burn is broadcast we always return ok:true + handle, even if
+ * the receipt wait fails (status() then finds the tx via Iris / the receipt).
+ * Expired attestations (expirationBlock, ~24h) are re-attested once via Iris;
+ * if that does not help the status turns "recoverable:" (core: stuck).
  */
-import type { AssetRef, BridgeAdapter, BridgeQuote, BridgeStatus, LiveContext, LiveResult, TxRecord } from "@incentive-router/live-common";
+import type { AssetRef, BridgeAdapter, BridgeQuote, LiveContext, LiveResult, TxRecord } from "@incentive-router/live-common";
 import { fromUnits, unitsToUsd } from "@incentive-router/live-common";
 import { encodeFunctionData, isAddress, zeroHash, type Address, type Hex } from "viem";
 import { ensureAllowance, erc20Balance, sendTx, type EvmEnv } from "@incentive-router/live-evm-base";
 import { coinBalance, executePtb, normalizeStructTag, normalizeSuiAddress, type SuiEnv } from "@incentive-router/live-sui";
 import {
+  captureBroadcasts,
   decodeHandle,
   encodeHandle,
   errMsg,
   evmAddressToBytes32,
   gasToUsd,
+  isOnChainFailure,
+  RECOVERABLE,
   sameEvmAddress,
   suiAddressToBytes32,
   type FetchLike,
+  type LiveBridgeStatus,
 } from "../common.js";
 import { messageTransmitterV2Abi, tokenMessengerV2Abi } from "./abi.js";
 import {
@@ -68,6 +78,9 @@ export interface CctpV2AdapterOptions {
   contracts?: CctpEvmContracts;
   /** Allow sending to an address other than our own env account on the destination (default false). */
   allowForeignRecipient?: boolean;
+  /** After a re-attest request, how long an expired attestation may persist before "recoverable" (default 15 min). */
+  reattestGraceMs?: number;
+  now?: () => number;
 }
 
 const DEFAULT_GAS: CctpGasUnits = { approve: 60_000n, depositForBurn: 200_000n, receiveMessage: 250_000n };
@@ -82,6 +95,20 @@ interface Handle {
   src: string;
   dst: string;
   tx: string;
+  /** Burned amount (absent in handles from before this field existed). */
+  amount?: bigint;
+}
+
+/** Message + causes, so revert reasons nested in viem errors are visible. */
+function fullErr(e: unknown): string {
+  const parts: string[] = [];
+  let cur: unknown = e;
+  for (let i = 0; cur && i < 6; i++) {
+    const c = cur as { message?: unknown; shortMessage?: unknown; details?: unknown; cause?: unknown };
+    for (const k of [c.shortMessage, c.message, c.details]) if (typeof k === "string") parts.push(k);
+    cur = c.cause;
+  }
+  return parts.join(" | ") || String(e);
 }
 
 export class CctpV2Adapter implements BridgeAdapter {
@@ -93,6 +120,8 @@ export class CctpV2Adapter implements BridgeAdapter {
   private readonly marginBps: number;
   private readonly threshold: number;
   private readonly suiCfg: SuiCctpConfig;
+  /** nonce -> when we asked Iris to re-attest (once per process). */
+  private readonly reattested = new Map<string, number>();
 
   constructor(private readonly o: CctpV2AdapterOptions) {
     this.kind = o.mode === "fast" ? "cctp_v2_fast" : "cctp_v2_standard";
@@ -244,10 +273,19 @@ export class CctpV2Adapter implements BridgeAdapter {
           maxFee: q.maxFee,
           minFinalityThreshold: this.threshold,
         });
-        const rec = await executePtb(sui.env, ctx, tx, `${this.kind} burn ${amount} USDC sui -> ${to.chain}`);
+        const desc = `${this.kind} burn ${amount} USDC sui -> ${to.chain}`;
+        const cap = captureBroadcasts(ctx);
+        let rec: TxRecord;
+        try {
+          rec = await executePtb(sui.env, cap.ctx, tx, desc);
+        } catch (e) {
+          const sent = this.afterBroadcastFailure(e, cap.ids, "sui", desc, from.chain, to.chain, amount, txs, ctx);
+          if (sent) return sent;
+          throw e;
+        }
         txs.push(rec);
         if (ctx.dryRun || !rec.id) return { ok: true, txs, detail: "dry-run: burn PTB simulated" };
-        return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id]) };
+        return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id, amount]) };
       }
 
       const env = this.o.envs[from.chain]!;
@@ -265,22 +303,57 @@ export class CctpV2Adapter implements BridgeAdapter {
         functionName: "depositForBurn",
         args: [amount, q.dstDomain, mintRecipient, token, zeroHash, q.maxFee, this.threshold],
       });
-      const rec = await sendTx(env, ctx, { to: spender, data, description: `${this.kind} depositForBurn ${amount} USDC ${from.chain} -> ${to.chain}` });
+      const desc = `${this.kind} depositForBurn ${amount} USDC ${from.chain} -> ${to.chain}`;
+      const cap = captureBroadcasts(ctx);
+      let rec: TxRecord;
+      try {
+        rec = await sendTx(env, cap.ctx, { to: spender, data, description: desc });
+      } catch (e) {
+        const sent = this.afterBroadcastFailure(e, cap.ids, from.chain, desc, from.chain, to.chain, amount, txs, ctx);
+        if (sent) return sent;
+        throw e;
+      }
       txs.push(rec);
       if (ctx.dryRun || !rec.id) return { ok: true, txs, detail: "dry-run: depositForBurn simulated" };
-      return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id]) };
+      return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id, amount]) };
     } catch (e) {
       return { ok: false, txs, detail: `${this.kind}: ${errMsg(e)}` };
     }
+  }
+
+  /**
+   * The burn tx was broadcast (hash captured) but the receipt wait failed. Unless
+   * the tx itself failed on-chain (nothing moved), report success with a handle.
+   */
+  private afterBroadcastFailure(
+    e: unknown,
+    ids: string[],
+    chain: string,
+    description: string,
+    src: string,
+    dst: string,
+    amount: bigint,
+    txs: TxRecord[],
+    ctx: LiveContext
+  ): (LiveResult & { handle: string }) | undefined {
+    const id = ids[ids.length - 1];
+    if (!id || isOnChainFailure(e)) return undefined;
+    ctx.log("warn", `${this.kind}: ${description} broadcast as ${id} but confirmation failed; tracking it`, { err: errMsg(e) });
+    txs.push({ chain, id, description, simulated: false });
+    return { ok: true, txs, handle: encodeHandle(this.kind, [src, dst, id, amount]), detail: `broadcast ${id}; confirmation pending (${errMsg(e)})` };
   }
 
   // -------------------------------------------------------------------------
   // status / complete
   // -------------------------------------------------------------------------
 
+  private now(): number {
+    return this.o.now ? this.o.now() : Date.now();
+  }
+
   private parse(handle: string): Handle {
-    const [src, dst, tx] = decodeHandle(this.kind, handle, 3);
-    return { src: src!, dst: dst!, tx: tx! };
+    const [src, dst, tx, amount] = decodeHandle(this.kind, handle, 3, 4);
+    return { src: src!, dst: dst!, tx: tx!, amount: amount !== undefined ? BigInt(amount) : undefined };
   }
 
   private async fetchMessage(h: Handle): Promise<IrisMessage | undefined> {
@@ -304,15 +377,86 @@ export class CctpV2Adapter implements BridgeAdapter {
     return used > 0n;
   }
 
-  async status(handle: string, _ctx: LiveContext): Promise<BridgeStatus> {
+  /** "reverted" = the burn tx failed on-chain (nothing left the wallet). */
+  private async sourceTxState(h: Handle): Promise<"ok" | "reverted" | "unknown"> {
+    try {
+      if (h.src === "sui") {
+        const r = await this.o.sui!.env.grpc.core.getTransaction({ digest: h.tx, include: { effects: true } });
+        return r.$kind === "FailedTransaction" ? "reverted" : "ok";
+      }
+      const env = this.o.envs[h.src];
+      if (!env) return "unknown";
+      const r = await env.publicClient.getTransactionReceipt({ hash: h.tx as Hex });
+      return r.status === "reverted" ? "reverted" : "ok";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /**
+   * Expired = receiveMessage would revert with "Message expired and must be re-signed".
+   * EVM: decided by an eth_call of receiveMessage (Arbitrum-stack chains compare an L1
+   * block number, so we let the chain decide). Sui: expiration is ms since epoch.
+   * SOURCE: evm-cctp-contracts src/v2/TokenMessengerV2.sol _validatedReceivedMessage;
+   *         sui-cctp handle_receive_message.move (EExpiredMessage, clock.timestamp_ms() < expiration)
+   */
+  private async isExpired(h: Handle, m: IrisMessage & { message: Hex; attestation: Hex }, expirationBlock: bigint): Promise<boolean> {
+    if (expirationBlock === 0n) return false;
+    if (h.dst === "sui") return expirationBlock <= BigInt(this.now());
+    const env = this.o.envs[h.dst];
+    if (!env) return false;
+    try {
+      await env.publicClient.call({
+        account: env.account,
+        to: this.contracts.messageTransmitterV2,
+        data: encodeFunctionData({ abi: messageTransmitterV2Abi, functionName: "receiveMessage", args: [m.message, m.attestation] }),
+      });
+      return false;
+    } catch (e) {
+      return /expired/i.test(fullErr(e));
+    }
+  }
+
+  private async onExpired(nonceKey: string, ctx: LiveContext): Promise<LiveBridgeStatus> {
+    const at = this.reattested.get(nonceKey);
+    if (at === undefined) {
+      this.reattested.set(nonceKey, this.now());
+      try {
+        const r = await this.iris.reattest(nonceKey);
+        ctx.log("warn", `${this.kind}: attestation expired; re-attestation requested`, { nonce: nonceKey, reply: r?.message });
+      } catch (e) {
+        ctx.log("warn", `${this.kind}: attestation expired; re-attest request failed`, { nonce: nonceKey, err: errMsg(e) });
+      }
+      return { state: "pending" };
+    }
+    const waited = this.now() - at;
+    if (waited < (this.o.reattestGraceMs ?? 15 * 60_000)) return { state: "pending" };
+    return {
+      state: "failed",
+      detail: `${RECOVERABLE} attestation expired; re-attest requested ${Math.round(waited / 60_000)} min ago but Iris still serves an expired attestation (nonce ${nonceKey}); retry POST /v2/reattest`,
+    };
+  }
+
+  async status(handle: string, ctx: LiveContext): Promise<LiveBridgeStatus> {
     const h = this.parse(handle);
-    const m = await this.fetchMessage(h);
-    if (!m || !isAttested(m)) return { state: "pending" };
+    let m: IrisMessage | undefined;
+    try {
+      m = await this.fetchMessage(h);
+    } catch (e) {
+      return { state: "pending", unconfirmed: `iris: ${errMsg(e)}` };
+    }
+    if (!m) {
+      const src = await this.sourceTxState(h);
+      if (src === "reverted") return { state: "failed", detail: `source tx ${h.tx} failed on-chain; nothing was burned`, refunded: h.amount };
+      return { state: "pending", unconfirmed: src === "unknown" ? `source tx ${h.tx} not found; Iris has no message` : `Iris has no message for mined burn ${h.tx}` };
+    }
+    if (!isAttested(m)) return { state: "pending" };
     const d = decodeCctpMessage(m.message);
     if (d.destinationDomain !== this.domains[h.dst]) return { state: "failed", detail: `message destination domain ${d.destinationDomain} != ${h.dst}` };
     if (await this.nonceUsed(h.dst, d.nonce)) {
       return { state: "completed", dstTx: m.destinationMintTxHash, received: receivedFromMessage(m) };
     }
+    if (await this.isExpired(h, m, d.body?.expirationBlock ?? 0n)) return this.onExpired(m.eventNonce ?? d.nonce, ctx);
     return { state: "claimable", detail: `attested; nonce ${d.nonce} not yet received on ${h.dst}` };
   }
 

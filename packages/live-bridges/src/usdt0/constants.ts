@@ -7,7 +7,7 @@
  * SOURCE (eids cross-check): npm @layerzerolabs/lz-definitions@3.1.15 EndpointId.<CHAIN>_V2_MAINNET
  *
  * Not deployed per the deployments page: base, sui, sonic, bsc, avalanche, linea, gnosis.
- * Deployed but not in live-common CHAINS yet: ink 30339, sei 30280, monad 30390, berachain, flare, ...
+ * Deployed but not in live-common CHAINS yet: ink 30339, sei 30280, berachain, flare, ...
  */
 import type { Address } from "viem";
 
@@ -43,6 +43,10 @@ export const USDT0_DEPLOYMENTS: Readonly<Record<string, Usdt0Deployment>> = {
   plasma: { eid: 30383, oft: "0x02ca37966753bDdDf11216B73B16C1dE756A7CF9", token: "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb", adapter: false, symbol: "USDT0" },
   // SOURCE: docs.usdt0.to deployments — HyperEVM (eid 30367 = HYPERLIQUID_V2_MAINNET in lz-definitions)
   hyperevm: { eid: 30367, oft: "0x904861a24F30EC96ea7CFC3bE9EA4B476d237e98", token: "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb", adapter: false, symbol: "USDT0" },
+  // SOURCE: docs.usdt0.to deployments — Monad (eid 30390 = MONAD_V2_MAINNET in lz-definitions)
+  monad: { eid: 30390, oft: "0x9151434b16b9763660705744891fA906F660EcC5", token: "0xe7cd86e13AC4309349F30B3435a9d337750fC82D", adapter: false, symbol: "USDT0" },
+  // SOURCE: docs.usdt0.to deployments — XLayer (eid 30274 = XLAYER_V2_MAINNET); docs list the OFT lowercase, checksummed here with viem getAddress
+  xlayer: { eid: 30274, oft: "0x94BCCa6bdfd6A61817Ab0E960bFedE4984505554", token: "0x779Ded0c9e1022225f8E0630b35a9b54bE713736", adapter: false, symbol: "USDT0" },
 };
 
 /** OFTCore msg type for a plain send (enforcedOptions key). SOURCE: devtools/packages/oft-evm/contracts/OFTCore.sol `SEND = 1` */

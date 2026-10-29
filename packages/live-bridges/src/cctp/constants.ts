@@ -21,8 +21,7 @@ export const CCTP_V2_EVM_MAINNET: CctpEvmContracts = {
 };
 
 /**
- * CCTP domain ids, keyed by live-common chain id. Only chains in CHAINS (plus
- * monad for when it is added) are listed.
+ * CCTP domain ids, keyed by live-common chain id. Only chains in CHAINS are listed.
  * NOT listed on purpose: bsc (domain 17 carries USYC only, not USDC), gnosis and mantle (no CCTP).
  */
 // SOURCE: https://developers.circle.com/cctp/concepts/supported-chains-and-domains
@@ -37,9 +36,10 @@ export const CCTP_DOMAINS: Readonly<Record<string, number>> = {
   unichain: 10, // SOURCE: supported-chains-and-domains
   linea: 11, // SOURCE: supported-chains-and-domains
   sonic: 13, // SOURCE: supported-chains-and-domains
-  monad: 15, // SOURCE: supported-chains-and-domains (not yet in live-common CHAINS)
+  monad: 15, // SOURCE: supported-chains-and-domains (Fast Transfer column: N/A -> standard only)
   hyperevm: 19, // SOURCE: supported-chains-and-domains
   plasma: 33, // SOURCE: supported-chains-and-domains
+  xlayer: 37, // SOURCE: supported-chains-and-domains (Fast Transfer: yes); shared V2 addresses per contract-addresses page
 };
 
 /**
@@ -47,7 +47,7 @@ export const CCTP_DOMAINS: Readonly<Record<string, number>> = {
  * standard attestation is already fast, so only cctp_v2_standard is offered.
  */
 // SOURCE: https://developers.circle.com/cctp/concepts/supported-chains-and-domains (Fast Transfer column)
-export const CCTP_FAST_SOURCES: ReadonlySet<string> = new Set(["ethereum", "optimism", "arbitrum", "base", "unichain", "linea"]);
+export const CCTP_FAST_SOURCES: ReadonlySet<string> = new Set(["ethereum", "optimism", "arbitrum", "base", "unichain", "linea", "xlayer"]);
 
 /**
  * Fast Transfer fee by source chain, bps, as published. PLANNING ONLY: the
@@ -62,6 +62,7 @@ export const CCTP_FAST_FEE_BPS_DOCS: Readonly<Record<string, number>> = {
   optimism: 1.3,
   unichain: 2,
   linea: 13,
+  xlayer: 1.3,
 };
 
 // SOURCE: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/v2/FinalityThresholds.sol
@@ -93,5 +94,6 @@ export const CCTP_ETA_STANDARD_S: Readonly<Record<string, number>> = {
   monad: 30,
   plasma: 30,
   sui: 30,
+  xlayer: 6 * 3600, // UNVERIFIED: fast-capable source => standard finality is slow; pessimistic
 };
 export const CCTP_ETA_FAST_S = 60;

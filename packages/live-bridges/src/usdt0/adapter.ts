@@ -10,12 +10,30 @@
  * status: destination OFTReceived(guid) log = completed (authoritative);
  *        LayerZero Scan only to detect failed / blocked messages.
  * No destination tx is needed (the LayerZero executor delivers), so no complete().
+ *
+ * send() contract: ok:false only when nothing left the wallet. After the OFT
+ * send is broadcast we return ok:true + handle even if the receipt wait / the
+ * OFTSent lookup fails (guid "-" in the handle; status() recovers it from the receipt).
+ * Handle: usdt0_oft:<src>:<dst>:<txHash>:<guid|->:<dstFromBlock>:<expectedReceivedLD>:<amountSentLD>
  */
-import type { AssetRef, BridgeAdapter, BridgeQuote, BridgeStatus, LiveContext, LiveResult, TxRecord } from "@incentive-router/live-common";
+import type { AssetRef, BridgeAdapter, BridgeQuote, LiveContext, LiveResult, TxRecord } from "@incentive-router/live-common";
 import { fromUnits, unitsToUsd } from "@incentive-router/live-common";
 import { ensureAllowance, erc20Balance, sendTx, type EvmEnv } from "@incentive-router/live-evm-base";
 import { encodeFunctionData, getAbiItem, isAddress, parseEventLogs, type Address, type Hex } from "viem";
-import { decodeHandle, encodeHandle, errMsg, evmAddressToBytes32, gasToUsd, plusBpsCeil, sameEvmAddress, type FetchLike } from "../common.js";
+import {
+  captureBroadcasts,
+  decodeHandle,
+  encodeHandle,
+  errMsg,
+  evmAddressToBytes32,
+  gasToUsd,
+  isOnChainFailure,
+  plusBpsCeil,
+  RECOVERABLE,
+  sameEvmAddress,
+  type FetchLike,
+  type LiveBridgeStatus,
+} from "../common.js";
 import { oftAbi } from "./abi.js";
 import { LZ_SCAN_MAINNET, USDT0_DEPLOYMENTS, USDT0_ETA_S, type Usdt0Deployment } from "./constants.js";
 import { LzScanClient } from "./scan.js";
@@ -214,23 +232,35 @@ export class Usdt0OftAdapter implements BridgeAdapter {
           return { ok: true, txs, detail: "dry-run: approve simulated; OFT send needs the allowance on-chain so it was not simulated" };
       }
       const dstFromBlock = await dstEnv.publicClient.getBlockNumber();
-      const rec = await sendTx(env, ctx, {
-        to: src.oft,
-        data: encodeOftSend(q.sendParam, q.fee, env.account),
-        value: q.fee.nativeFee,
-        description: `usdt0_oft send ${amount} ${from.chain} -> ${to.chain}`,
-      });
+      const desc = `usdt0_oft send ${amount} ${from.chain} -> ${to.chain}`;
+      const expected = q.sendParam.minAmountLD;
+      const cap = captureBroadcasts(ctx);
+      let rec: TxRecord;
+      try {
+        rec = await sendTx(env, cap.ctx, { to: src.oft, data: encodeOftSend(q.sendParam, q.fee, env.account), value: q.fee.nativeFee, description: desc });
+      } catch (e) {
+        const id = cap.ids[cap.ids.length - 1];
+        if (!id || isOnChainFailure(e)) throw e; // nothing moved
+        ctx.log("warn", `usdt0_oft: ${desc} broadcast as ${id} but confirmation failed; tracking it`, { err: errMsg(e) });
+        txs.push({ chain: from.chain, id, description: desc, simulated: false });
+        return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, id, "-", dstFromBlock, expected, amount]), detail: `broadcast ${id}; confirmation pending` };
+      }
       txs.push(rec);
       if (ctx.dryRun || !rec.id) return { ok: true, txs, detail: "dry-run: OFT send simulated" };
 
-      const receipt = await env.publicClient.getTransactionReceipt({ hash: rec.id as Hex });
-      const sent = parseEventLogs({ abi: oftAbi, eventName: "OFTSent", logs: receipt.logs }).find((l) => sameEvmAddress(l.address, src.oft));
-      if (!sent) return { ok: false, txs, detail: `usdt0_oft: no OFTSent event in ${rec.id}` };
-      return {
-        ok: true,
-        txs,
-        handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id, sent.args.guid, dstFromBlock, sent.args.amountReceivedLD]),
-      };
+      // From here on the money has left: never return ok:false / throw.
+      let guid = "-";
+      let received = expected;
+      try {
+        const sent = await this.oftSent(from.chain, rec.id as Hex);
+        if (sent !== "reverted" && sent !== "unknown") {
+          guid = sent.guid;
+          received = sent.received;
+        }
+      } catch (e) {
+        ctx.log("warn", `usdt0_oft: OFTSent lookup failed for ${rec.id}; will retry in status()`, { err: errMsg(e) });
+      }
+      return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id, guid, dstFromBlock, received, amount]) };
     } catch (e) {
       return { ok: false, txs, detail: `usdt0_oft: ${errMsg(e)}` };
     }
@@ -258,8 +288,40 @@ export class Usdt0OftAdapter implements BridgeAdapter {
     return undefined;
   }
 
-  async status(handle: string, ctx: LiveContext): Promise<BridgeStatus> {
-    const [_src, dst, tx, guid, fromBlock, expected] = decodeHandle(this.kind, handle, 6);
+  /** OFTSent(guid, amountReceivedLD) from the source receipt; "reverted" = nothing left; "unknown" = no receipt yet. */
+  private async oftSent(chain: string, tx: Hex): Promise<{ guid: string; received: bigint } | "reverted" | "unknown"> {
+    const env = this.o.envs[chain];
+    if (!env) return "unknown";
+    let receipt;
+    try {
+      receipt = await env.publicClient.getTransactionReceipt({ hash: tx });
+    } catch {
+      return "unknown";
+    }
+    if (receipt.status === "reverted") return "reverted";
+    const oft = this.deps[chain]!.oft;
+    const sent = parseEventLogs({ abi: oftAbi, eventName: "OFTSent", logs: receipt.logs }).find((l) => sameEvmAddress(l.address, oft));
+    if (!sent) throw new Error(`no OFTSent event from ${oft} in ${tx}`);
+    return { guid: sent.args.guid, received: sent.args.amountReceivedLD };
+  }
+
+  async status(handle: string, ctx: LiveContext): Promise<LiveBridgeStatus> {
+    const [src, dst, tx, guidField, fromBlock, expectedField, sentField] = decodeHandle(this.kind, handle, 6, 7);
+    let guid = guidField!;
+    let expected = BigInt(expectedField!);
+    if (guid === "-") {
+      let r: Awaited<ReturnType<Usdt0OftAdapter["oftSent"]>>;
+      try {
+        r = await this.oftSent(src!, tx as Hex);
+      } catch (e) {
+        return { state: "pending", unconfirmed: `source receipt: ${errMsg(e)}` };
+      }
+      if (r === "reverted")
+        return { state: "failed", detail: `source tx ${tx} reverted on-chain; nothing was sent`, refunded: sentField !== undefined ? BigInt(sentField) : undefined };
+      if (r === "unknown") return { state: "pending", unconfirmed: `source tx ${tx} not found yet` };
+      guid = r.guid;
+      expected = r.received;
+    }
     try {
       const got = await this.findReceived(dst!, guid as Hex, BigInt(fromBlock!));
       if (got) return { state: "completed", dstTx: got.tx, received: got.amount };
@@ -270,21 +332,22 @@ export class Usdt0OftAdapter implements BridgeAdapter {
     try {
       msgs = await this.scan.byTx(tx!);
     } catch (e) {
-      ctx.log("warn", `usdt0_oft: LayerZero Scan unavailable`, { err: errMsg(e) });
-      return { state: "pending" };
+      return { state: "pending", unconfirmed: `LayerZero Scan unreachable: ${errMsg(e)}` };
     }
-    const m = msgs.find((x) => x.guid?.toLowerCase() === guid!.toLowerCase()) ?? (msgs.length === 1 ? msgs[0] : undefined);
-    if (!m) return { state: "pending" };
+    const m = msgs.find((x) => x.guid?.toLowerCase() === guid.toLowerCase()) ?? (msgs.length === 1 ? msgs[0] : undefined);
+    if (!m) return { state: "pending", unconfirmed: "LayerZero Scan has no message for this tx" };
     switch (m.state) {
       case "delivered":
         // Scan says delivered but our log scan missed it (RPC window). Trust Scan, report the OFTSent amount.
-        return { state: "completed", dstTx: m.dstTxHash, received: BigInt(expected!) };
+        return { state: "completed", dstTx: m.dstTxHash, received: expected };
+      case "inflight":
+        return { state: "pending" };
       case "failed":
         return { state: "failed", detail: `LayerZero ${m.statusName}${m.message ? `: ${m.message}` : ""}` };
       case "recoverable":
-        return { state: "failed", detail: `recoverable: LayerZero ${m.statusName} (retry lzReceive / unblock pathway; funds not lost)` };
+        return { state: "failed", detail: `${RECOVERABLE} LayerZero ${m.statusName} (retry lzReceive / unblock pathway; funds not lost)` };
       default:
-        return { state: "pending" };
+        return { state: "pending", unconfirmed: `LayerZero Scan status "${m.statusName}" not understood` };
     }
   }
 }

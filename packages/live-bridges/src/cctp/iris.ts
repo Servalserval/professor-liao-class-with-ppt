@@ -76,6 +76,16 @@ export class IrisClient {
     return BigInt(Math.floor(a * 1e6 + 1e-6));
   }
 
+  /**
+   * Ask Circle to re-sign an expired burn (POST /v2/reattest/{nonce}); poll /v2/messages afterwards.
+   * SOURCE: https://developers.circle.com/api-reference/cctp/all/reattest-message
+   * SOURCE: https://developers.circle.com/cctp/technical-guide (expired burns "must be re-signed"; no deadline while the burn tx exists)
+   * Nonce format is not stated (bytes32 per the guide's header) -> VERIFY_LIVE.
+   */
+  async reattest(nonce: string): Promise<{ message?: string; nonce?: string } | null> {
+    return this.http.post<{ message?: string; nonce?: string }>(`/v2/reattest/${encodeURIComponent(nonce)}`);
+  }
+
   /** Messages for a source tx; [] when Iris has not indexed it yet (404). */
   async messages(srcDomain: number, txHash: string): Promise<IrisMessage[]> {
     const j = await this.http.get<unknown>(`/v2/messages/${srcDomain}?transactionHash=${encodeURIComponent(txHash)}`);

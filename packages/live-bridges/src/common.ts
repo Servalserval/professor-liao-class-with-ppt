@@ -3,6 +3,7 @@
  * JSON client, 32-byte address padding, handle codecs and integer math.
  * No chain SDK imports here.
  */
+import type { LiveContext } from "@incentive-router/live-common";
 import { isAddress, pad, type Hex } from "viem";
 
 // ---------------------------------------------------------------------------
@@ -54,6 +55,14 @@ export class JsonClient {
   }
 
   async get<T = unknown>(path: string): Promise<T | null> {
+    return this.request<T>("GET", path);
+  }
+
+  async post<T = unknown>(path: string, body?: unknown): Promise<T | null> {
+    return this.request<T>("POST", path, body);
+  }
+
+  private async request<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T | null> {
     const url = `${this.baseUrl.replace(/\/+$/, "")}${path}`;
     if (this.now() < this.blockedUntil) throw new HttpError(`${url}: rate-limited until ${new Date(this.blockedUntil).toISOString()}`, 429);
     // serialize + space requests
@@ -68,7 +77,9 @@ export class JsonClient {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), this.opts.timeoutMs ?? 15_000);
     try {
-      const res = await this.fetchFn(url, { method: "GET", headers: { accept: "application/json" }, signal: ctl.signal });
+      const headers: Record<string, string> = { accept: "application/json" };
+      if (body !== undefined) headers["content-type"] = "application/json";
+      const res = await this.fetchFn(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), signal: ctl.signal });
       if (res.status === 404) return null;
       if (res.status === 429) {
         this.blockedUntil = this.now() + (this.opts.blockOn429Ms ?? 5 * 60_000);
@@ -150,10 +161,56 @@ export function encodeHandle(prefix: string, fields: (string | number | bigint)[
   return [prefix, ...parts].join(":");
 }
 
-export function decodeHandle(prefix: string, handle: string, n: number): string[] {
+export function decodeHandle(prefix: string, handle: string, n: number, maxN: number = n): string[] {
   const parts = handle.split(":");
-  if (parts[0] !== prefix || parts.length !== n + 1) throw new Error(`bad ${prefix} handle: ${handle}`);
+  if (parts[0] !== prefix || parts.length < n + 1 || parts.length > maxN + 1) throw new Error(`bad ${prefix} handle: ${handle}`);
   return parts.slice(1);
+}
+
+// ---------------------------------------------------------------------------
+// status extensions (structurally assignable to live-common BridgeStatus)
+// ---------------------------------------------------------------------------
+
+/**
+ * BridgeStatus plus optional extras the glue understands:
+ *  - pending.unconfirmed: the adapter could not confirm progress (API down / unknown shape / tx not found);
+ *    the glue escalates to "stuck" after 2x the route ETA.
+ *  - failed.refunded: base units that provably never left / came back to the source wallet.
+ *  - failed.detail starting with "recoverable:" -> core "stuck" (funds not lost, needs action).
+ */
+export type LiveBridgeStatus =
+  | { state: "pending"; unconfirmed?: string }
+  | { state: "claimable"; detail?: string }
+  | { state: "completed"; dstTx?: string; received?: bigint }
+  | { state: "failed"; detail: string; refunded?: bigint };
+
+export const RECOVERABLE = "recoverable:";
+
+// ---------------------------------------------------------------------------
+// broadcast capture
+// ---------------------------------------------------------------------------
+
+/**
+ * Wrap ctx so tx hashes / digests that sendTx / executePtb log right after
+ * broadcasting are captured (sendTx logs `{ hash }` before waiting for the
+ * receipt; executePtb logs `{ digest }` before waitForTransaction). Lets an
+ * adapter return ok:true + a handle when a receipt wait times out after the
+ * tx already left. Prototype-based so class-instance contexts keep their methods.
+ */
+export function captureBroadcasts(ctx: LiveContext): { ctx: LiveContext; ids: string[] } {
+  const ids: string[] = [];
+  const wrapped = Object.create(ctx) as LiveContext;
+  wrapped.log = (level, msg, data) => {
+    const id = data?.hash ?? data?.digest;
+    if (typeof id === "string" && id.length > 0) ids.push(id);
+    ctx.log(level, msg, data);
+  };
+  return { ctx: wrapped, ids };
+}
+
+/** sendTx / executePtb error after broadcast meaning the tx itself failed (so funds did not move). */
+export function isOnChainFailure(e: unknown): boolean {
+  return /reverted on-chain|failed on-chain/.test(errMsg(e));
 }
 
 export function errMsg(e: unknown): string {

@@ -15,10 +15,13 @@ export interface MockEvm {
   reads: { address: string; functionName: string; args: readonly unknown[] }[];
   setRead(fn: string, h: ReadHandler): void;
   logs: unknown[];
-  receipts: Record<string, { logs: unknown[] }>;
+  receipts: Record<string, { logs: unknown[]; status?: "success" | "reverted" }>;
   blockNumber: bigint;
   /** Make eth_call simulation revert for calldata starting with this selector. */
   revertSelector?: string;
+  revertMessage?: string;
+  /** What waitForTransactionReceipt does after a broadcast. */
+  receiptWait: "ok" | "timeout" | "reverted";
 }
 
 export function mockEvm(chain: string, account: Hex, opts: { readOnly?: boolean } = {}): MockEvm {
@@ -33,6 +36,7 @@ export function mockEvm(chain: string, account: Hex, opts: { readOnly?: boolean 
     logs: [],
     receipts: {},
     blockNumber: 1_000n,
+    receiptWait: "ok",
   };
   const publicClient = {
     async getChainId() {
@@ -40,7 +44,7 @@ export function mockEvm(chain: string, account: Hex, opts: { readOnly?: boolean 
     },
     async call(req: { to: string; data: Hex; value?: bigint }) {
       m.calls.push({ to: req.to, data: req.data, value: req.value });
-      if (m.revertSelector && req.data.startsWith(m.revertSelector)) throw new Error("execution reverted: mock");
+      if (m.revertSelector && req.data.startsWith(m.revertSelector)) throw new Error(m.revertMessage ?? "execution reverted: mock");
       return { data: "0x" };
     },
     async estimateGas() {
@@ -50,7 +54,8 @@ export function mockEvm(chain: string, account: Hex, opts: { readOnly?: boolean 
       return 1_000_000_000n; // 1 gwei
     },
     async waitForTransactionReceipt() {
-      return { status: "success", gasUsed: 100_000n, effectiveGasPrice: 1_000_000_000n };
+      if (m.receiptWait === "timeout") throw new Error("Timed out while waiting for transaction receipt");
+      return { status: m.receiptWait === "reverted" ? "reverted" : "success", gasUsed: 100_000n, effectiveGasPrice: 1_000_000_000n };
     },
     async readContract(req: { address: string; functionName: string; args?: readonly unknown[] }) {
       m.reads.push({ address: req.address, functionName: req.functionName, args: req.args ?? [] });
@@ -67,7 +72,7 @@ export function mockEvm(chain: string, account: Hex, opts: { readOnly?: boolean 
     async getTransactionReceipt(req: { hash: string }) {
       const r = m.receipts[req.hash];
       if (!r) throw new Error(`mock ${chain}: no receipt ${req.hash}`);
-      return r;
+      return { status: "success", ...r };
     },
     async getCode() {
       return "0x6001";
@@ -102,10 +107,12 @@ export interface MockSui {
   nonceUsed: boolean;
   digest: string;
   objectTypes: Record<string, string>;
+  /** getTransaction result kind per digest (missing -> throws "not found"). */
+  txKinds: Record<string, "Transaction" | "FailedTransaction">;
 }
 
 export function mockSui(address: string): MockSui {
-  const m: MockSui = { env: undefined as unknown as SuiEnv, simulated: [], executed: [], balance: 0n, nonceUsed: false, digest: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin", objectTypes: {} };
+  const m: MockSui = { env: undefined as unknown as SuiEnv, simulated: [], executed: [], balance: 0n, nonceUsed: false, digest: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin", objectTypes: {}, txKinds: {} };
   const gasUsed = { computationCost: "1000000", storageCost: "2000000", storageRebate: "1000000", nonRefundableStorageFee: "0" };
   const core = {
     async simulateTransaction(o: { transaction: unknown; include?: { commandResults?: boolean } }) {
@@ -123,6 +130,11 @@ export function mockSui(address: string): MockSui {
     },
     async waitForTransaction() {
       return {};
+    },
+    async getTransaction(o: { digest: string }) {
+      const k = m.txKinds[o.digest];
+      if (!k) throw new Error(`mock sui: tx ${o.digest} not found`);
+      return { $kind: k, [k]: { digest: o.digest } };
     },
     async getBalance() {
       return { balance: { balance: m.balance.toString() } };
@@ -145,19 +157,25 @@ export function mockSui(address: string): MockSui {
 export interface MockFetch {
   fetch: FetchLike;
   urls: string[];
-  route(prefix: string, h: (url: string) => { status: number; body?: unknown }): void;
+  /** "METHOD url" for every request. */
+  requests: string[];
+  route(prefix: string, h: (url: string, method: string) => { status: number; body?: unknown }): void;
 }
 
 export function mockFetch(): MockFetch {
-  const routes: [string, (url: string) => { status: number; body?: unknown }][] = [];
+  const routes: [string, (url: string, method: string) => { status: number; body?: unknown }][] = [];
   const urls: string[] = [];
+  const requests: string[] = [];
   return {
     urls,
+    requests,
     route: (p, h) => routes.unshift([p, h]),
-    fetch: async (url) => {
+    fetch: async (url, init) => {
+      const method = init?.method ?? "GET";
       urls.push(url);
+      requests.push(`${method} ${url}`);
       const r = routes.find(([p]) => url.includes(p));
-      const res = r ? r[1](url) : { status: 404 };
+      const res = r ? r[1](url, method) : { status: 404 };
       return {
         ok: res.status >= 200 && res.status < 300,
         status: res.status,

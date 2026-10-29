@@ -1,20 +1,24 @@
 /**
  * Core BridgeExecutor (USD interface) on top of live BridgeAdapters.
  *
- * send(t):  hop = t.path[t.hop]; kind -> adapter; (chain, symbol) -> AssetRef via the
- *           registry; USD -> units with ctx.priceUsd; recipient = our own address on
- *           the destination; returns the adapter handle as `ref`.
+ * send(t):  hop = t.path[t.hop]; amount = t.receivedUsd ?? t.amountUsd; kind -> adapter;
+ *           (chain, symbol) -> AssetRef via the registry; USD -> units with ctx.priceUsd,
+ *           clamped to the wallet balance (hop > 0 always; hop 0 only within 0.5%);
+ *           recipient = our own address on the destination; returns the adapter handle as `ref`.
+ *           ok:false only when nothing left the wallet (adapters guarantee ok:true + handle
+ *           once anything was broadcast).
  * poll(t):  adapter.status(t.ref):
- *             pending   -> in_flight
+ *             pending   -> in_flight (pending + `unconfirmed` for > 2x route ETA -> stuck)
  *             claimable -> complete() (simulated first; dry-run stays claimable)
  *                          -> re-check: completed | in_flight
  *             completed -> completed, receivedUsd from the received units
- *             failed    -> failed ("recoverable: ..." details -> stuck: retryable, funds not lost)
+ *             failed    -> failed (+ refundedUsd when the adapter proved nothing left)
+ *                          "recoverable: ..." details -> stuck (retryable, funds not lost)
  */
-import type { BridgeExecutor, InFlightTransfer, RouteKind, RouteSpec, TransferState } from "@incentive-router/core";
-import type { AssetRef, BridgeAdapter, BridgeStatus, LiveContext } from "@incentive-router/live-common";
+import type { BridgeExecutor, BridgePollResult, InFlightTransfer, RouteKind, RouteSpec } from "@incentive-router/core";
+import type { AssetRef, BridgeAdapter, LiveContext } from "@incentive-router/live-common";
 import { unitsToUsd, usdToUnits } from "@incentive-router/live-common";
-import { errMsg } from "../common.js";
+import { errMsg, RECOVERABLE, type LiveBridgeStatus } from "../common.js";
 
 /** (chain, canonical symbol) -> AssetRef. */
 export type AssetRegistry = (chain: string, symbol: string) => AssetRef | undefined;
@@ -29,6 +33,11 @@ export interface LiveBridgeExecutorOptions {
   /** Our own address per chain (see recipientsFromEnvs). */
   recipients: Record<string, string>;
   ctx: LiveContext;
+  /** Wallet balance of an asset (base units). Enables clamping the send amount to what we hold. */
+  balance?: (asset: AssetRef) => Promise<bigint>;
+  /** Hop 0: clamp to the balance when it is at most this far below the request (default 50 bps = 0.5%). */
+  hop0ClampBps?: number;
+  now?: () => number;
 }
 
 /** Our address per chain from EVM envs (+ optional Sui env). */
@@ -39,7 +48,7 @@ export function recipientsFromEnvs(evm: Record<string, { account: string }>, sui
   return out;
 }
 
-export type PollResult = { state: TransferState; ref?: string; detail?: string; receivedUsd?: number };
+export type PollResult = BridgePollResult;
 
 export class LiveBridgeExecutor implements BridgeExecutor {
   private readonly adapters = new Map<string, BridgeAdapter>();
@@ -51,6 +60,10 @@ export class LiveBridgeExecutor implements BridgeExecutor {
     this.registry = typeof o.registry === "function" ? o.registry : registryFromTable(o.registry);
   }
 
+  private now(): number {
+    return this.o.now ? this.o.now() : Date.now();
+  }
+
   private resolve(hop: RouteSpec): { adapter: BridgeAdapter; from: AssetRef; to: AssetRef } | string {
     const adapter = this.adapters.get(hop.kind);
     if (!adapter) return `no live adapter for route kind "${hop.kind}" (${hop.id})`;
@@ -59,6 +72,20 @@ export class LiveBridgeExecutor implements BridgeExecutor {
     if (!from) return `unknown asset ${hop.from.chain}:${hop.from.asset}`;
     if (!to) return `unknown asset ${hop.to.chain}:${hop.to.asset}`;
     return { adapter, from, to };
+  }
+
+  /** Requested units, clamped to the wallet balance (hop > 0 always; hop 0 only within hop0ClampBps). */
+  private async sendUnits(t: InFlightTransfer, from: AssetRef, requested: bigint): Promise<{ units: bigint; note?: string } | string> {
+    if (!this.o.balance) return { units: requested };
+    const bal = await this.o.balance(from);
+    if (bal >= requested) return { units: requested };
+    if (t.hop > 0) {
+      if (bal <= 0n) return `hop ${t.hop}: no ${from.symbol} on ${from.chain} to send`;
+      return { units: bal, note: `clamped to balance ${bal} (requested ${requested})` };
+    }
+    const floor = (requested * BigInt(10_000 - Math.round(this.o.hop0ClampBps ?? 50))) / 10_000n;
+    if (bal >= floor && bal > 0n) return { units: bal, note: `clamped to balance ${bal} (requested ${requested}, within tolerance)` };
+    return `insufficient ${from.symbol} on ${from.chain}: balance ${bal} < requested ${requested}`;
   }
 
   async send(t: InFlightTransfer): Promise<{ ok: boolean; ref?: string; detail?: string }> {
@@ -72,37 +99,63 @@ export class LiveBridgeExecutor implements BridgeExecutor {
     const recipient = this.o.recipients[to.chain];
     if (!recipient) return { ok: false, detail: `no own address configured for ${to.chain}` };
     if (!adapter.supports(from, to)) return { ok: false, detail: `${adapter.kind} does not support ${from.chain}:${from.symbol} -> ${to.chain}:${to.symbol}` };
-    if (!(t.amountUsd > 0)) return { ok: false, detail: `bad amountUsd ${t.amountUsd}` };
+    const amountUsd = t.receivedUsd ?? t.amountUsd;
+    if (!(amountUsd > 0)) return { ok: false, detail: `bad amount ${amountUsd} USD` };
     const { ctx } = this.o;
+
+    // Everything before adapter.send moves no money: errors -> ok:false.
+    let price: number;
+    let units: bigint;
+    let note: string | undefined;
     try {
-      const price = await ctx.priceUsd(from);
-      const units = usdToUnits(t.amountUsd, price, from.decimals);
+      price = await ctx.priceUsd(from);
+      const requested = usdToUnits(amountUsd, price, from.decimals);
+      const s = await this.sendUnits(t, from, requested);
+      if (typeof s === "string") return { ok: false, detail: s };
+      units = s.units;
+      note = s.note;
       if (units <= 0n) return { ok: false, detail: `amount rounds to 0 units` };
-      const res = await adapter.send(from, to, units, recipient, ctx);
-      if (!res.ok) return { ok: false, detail: res.detail ?? `${adapter.kind} send failed` };
-      if (ctx.dryRun) return { ok: true, detail: `dry-run: ${res.detail ?? "simulated"}` };
-      if (!res.handle) return { ok: false, detail: `${adapter.kind} sent but returned no handle (txs: ${res.txs.map((x) => x.id).join(",")})` };
-      return { ok: true, ref: res.handle, detail: res.detail };
     } catch (e) {
-      return { ok: false, detail: `${adapter.kind} send: ${errMsg(e)}` };
+      return { ok: false, detail: `${adapter.kind} pre-send: ${errMsg(e)}` };
     }
+    const sentUsd = unitsToUsd(units, price, from.decimals);
+    const what = `sent ${sentUsd.toFixed(6)} USD (${units} units ${from.symbol} ${from.chain} -> ${to.chain})${note ? `; ${note}` : ""}`;
+
+    let res;
+    try {
+      res = await adapter.send(from, to, units, recipient, ctx);
+    } catch (e) {
+      // Adapters must not throw (they return ok:false before broadcast, ok:true + handle after).
+      return { ok: false, detail: `${adapter.kind} send threw (adapter contract violation): ${errMsg(e)}` };
+    }
+    if (!res.ok) return { ok: false, detail: res.detail ?? `${adapter.kind} send failed` };
+    if (ctx.dryRun) return { ok: true, detail: `dry-run: ${res.detail ?? "simulated"}; would have ${what}` };
+    if (!res.handle) {
+      const ids = res.txs.filter((x) => !x.simulated && x.id).map((x) => x.id);
+      // Something was broadcast (or the adapter says ok): never report ok:false here; poll() marks it stuck.
+      return { ok: true, detail: `${what}; adapter returned no handle (txs: ${ids.join(",") || "none"}) — check manually` };
+    }
+    return { ok: true, ref: res.handle, detail: res.detail ? `${what}; ${res.detail}` : what };
   }
 
-  async poll(t: InFlightTransfer): Promise<PollResult> {
+  async poll(t: InFlightTransfer): Promise<BridgePollResult> {
     const hop = t.path[t.hop];
     if (!hop) return { state: "failed", ref: t.ref, detail: `no hop ${t.hop}` };
-    if (t.ref === "noop") return { state: "completed", ref: t.ref, receivedUsd: t.amountUsd };
-    if (!t.ref) return { state: t.state, detail: "no bridge handle (not sent, or dry-run)" };
+    if (t.ref === "noop") return { state: "completed", ref: t.ref, receivedUsd: t.receivedUsd ?? t.amountUsd };
+    if (!t.ref) {
+      if (this.o.ctx.dryRun || t.state === "planned") return { state: t.state, detail: "no bridge handle (not sent, or dry-run)" };
+      return { state: "stuck", detail: `${RECOVERABLE} hop ${t.hop} has no bridge handle; check the source wallet / explorer manually` };
+    }
     const r = this.resolve(hop);
     if (typeof r === "string") return { state: t.state, ref: t.ref, detail: r };
-    const { adapter, to } = r;
+    const { adapter, from, to } = r;
     const { ctx } = this.o;
 
-    let st: BridgeStatus;
+    let st: LiveBridgeStatus;
     try {
-      st = await adapter.status(t.ref, ctx);
+      st = (await adapter.status(t.ref, ctx)) as LiveBridgeStatus;
     } catch (e) {
-      return { state: "in_flight", ref: t.ref, detail: `status error: ${errMsg(e)}` };
+      return this.pendingResult(t, hop, `status error: ${errMsg(e)}`);
     }
 
     if (st.state === "claimable") {
@@ -116,7 +169,7 @@ export class LiveBridgeExecutor implements BridgeExecutor {
       if (!res.ok) return { state: "claimable", ref: t.ref, detail: res.detail ?? "complete failed" };
       if (ctx.dryRun) return { state: "claimable", ref: t.ref, detail: `dry-run: ${res.detail ?? "complete simulated"}` };
       try {
-        st = await adapter.status(t.ref, ctx);
+        st = (await adapter.status(t.ref, ctx)) as LiveBridgeStatus;
       } catch (e) {
         return { state: "in_flight", ref: t.ref, detail: `completed on destination; status re-check failed: ${errMsg(e)}` };
       }
@@ -125,28 +178,44 @@ export class LiveBridgeExecutor implements BridgeExecutor {
         return { state: "in_flight", ref: t.ref, detail: `destination tx ${dst || "sent"}; waiting for confirmation` };
       }
     }
-    return this.mapFinal(st, t, to);
+    return this.mapFinal(st, t, hop, from, to);
   }
 
-  private async mapFinal(st: BridgeStatus, t: InFlightTransfer, to: AssetRef): Promise<PollResult> {
+  /** pending: in_flight, or stuck when progress could not be confirmed for > 2x the route ETA. */
+  private pendingResult(t: InFlightTransfer, hop: RouteSpec, unconfirmed?: string): BridgePollResult {
+    if (!unconfirmed) return { state: "in_flight", ref: t.ref };
+    const started = t.hopStartedAtMs ?? (t.hop === 0 ? t.createdAtMs : undefined);
+    const limitMs = 2 * Math.max(1, hop.etaMinutes) * 60_000;
+    if (started !== undefined && this.now() - started > limitMs) {
+      const mins = Math.round((this.now() - started) / 60_000);
+      return { state: "stuck", ref: t.ref, detail: `${RECOVERABLE} no confirmed progress for ${mins} min (> 2x ETA ${hop.etaMinutes} min): ${unconfirmed}` };
+    }
+    return { state: "in_flight", ref: t.ref, detail: unconfirmed };
+  }
+
+  private async usd(units: bigint, asset: AssetRef): Promise<number | undefined> {
+    try {
+      return unitsToUsd(units, await this.o.ctx.priceUsd(asset), asset.decimals);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async mapFinal(st: LiveBridgeStatus, t: InFlightTransfer, hop: RouteSpec, from: AssetRef, to: AssetRef): Promise<BridgePollResult> {
     switch (st.state) {
       case "pending":
-        return { state: "in_flight", ref: t.ref };
+        return this.pendingResult(t, hop, st.unconfirmed);
       case "claimable":
         return { state: "claimable", ref: t.ref, detail: st.detail };
       case "completed": {
-        let receivedUsd: number | undefined;
-        if (st.received !== undefined) {
-          try {
-            receivedUsd = unitsToUsd(st.received, await this.o.ctx.priceUsd(to), to.decimals);
-          } catch {
-            receivedUsd = undefined;
-          }
-        }
+        const receivedUsd = st.received !== undefined ? await this.usd(st.received, to) : undefined;
         return { state: "completed", ref: t.ref, receivedUsd, detail: st.dstTx ? `dst tx ${st.dstTx}` : undefined };
       }
-      case "failed":
-        return { state: st.detail.startsWith("recoverable:") ? "stuck" : "failed", ref: t.ref, detail: st.detail };
+      case "failed": {
+        const refundedUsd = st.refunded !== undefined ? await this.usd(st.refunded, from) : undefined;
+        const state = st.detail.startsWith(RECOVERABLE) ? "stuck" : "failed";
+        return refundedUsd !== undefined ? { state, ref: t.ref, detail: st.detail, refundedUsd } : { state, ref: t.ref, detail: st.detail };
+      }
     }
   }
 }

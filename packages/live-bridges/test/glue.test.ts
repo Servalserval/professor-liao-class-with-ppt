@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { InFlightTransfer, RouteSpec } from "@incentive-router/core";
-import type { AssetRef, BridgeAdapter, BridgeStatus, LiveContext, LiveResult } from "@incentive-router/live-common";
+import type { AssetRef, BridgeAdapter, LiveContext, LiveResult } from "@incentive-router/live-common";
+import type { LiveBridgeStatus } from "../src/common.js";
 import { LiveBridgeExecutor, recipientsFromEnvs } from "../src/glue/index.js";
 import { mockCtx } from "./mocks.js";
 
@@ -13,7 +14,7 @@ const ME_SUI = "0x" + "ab".repeat(32);
 class FakeAdapter implements BridgeAdapter {
   readonly kind = "cctp_v2_standard";
   sends: { from: AssetRef; to: AssetRef; amount: bigint; recipient: string; dryRun: boolean }[] = [];
-  statuses: BridgeStatus[] = [];
+  statuses: LiveBridgeStatus[] = [];
   completes = 0;
   completeResult: LiveResult = { ok: true, txs: [{ chain: "sui", id: "DIGEST", description: "receive", simulated: false }] };
   supports(from: AssetRef, to: AssetRef) {
@@ -52,15 +53,20 @@ function transfer(over: Partial<InFlightTransfer> = {}): InFlightTransfer {
   return { id: "t1", path: [ROUTE], hop: 0, amountUsd: 1000, costUsd: 0.1, state: "planned", createdAtMs: 0, updatedAtMs: 0, ...over };
 }
 
-function make(ctx: LiveContext) {
+const T0 = Date.UTC(2026, 9, 29, 12);
+
+function make(ctx: LiveContext, opts: { balance?: bigint; clock?: { t: number } } = {}) {
   const fake = new FakeAdapter();
+  const clock = opts.clock ?? { t: T0 };
   const ex = new LiveBridgeExecutor({
     adapters: [fake],
     registry: { arbitrum: { USDC: USDC_ARB }, sui: { USDC: USDC_SUI } },
     recipients: recipientsFromEnvs({ arbitrum: { account: ME_EVM } }, { address: ME_SUI }),
     ctx,
+    balance: opts.balance === undefined ? undefined : async () => opts.balance!,
+    now: () => clock.t,
   });
-  return { fake, ex };
+  return { fake, ex, clock };
 }
 
 describe("LiveBridgeExecutor.send", () => {
@@ -73,6 +79,41 @@ describe("LiveBridgeExecutor.send", () => {
     assert.equal(fake.sends[0]!.recipient, ME_SUI);
     assert.equal(fake.sends[0]!.from, USDC_ARB);
     assert.equal(fake.sends[0]!.to, USDC_SUI);
+  });
+
+  it("uses t.receivedUsd (what arrived at the end of the previous hop) when set", async () => {
+    const { fake, ex } = make(mockCtx(false, 1));
+    const r = await ex.send(transfer({ hop: 1, path: [ROUTE, ROUTE], amountUsd: 1000, receivedUsd: 999.5 }));
+    assert.equal(r.ok, true);
+    assert.equal(fake.sends[0]!.amount, 999_500_000n);
+    assert.match(r.detail!, /^sent 999\.500000 USD/);
+  });
+
+  it("hop > 0 clamps to the wallet balance and reports the sent USD", async () => {
+    const { fake, ex } = make(mockCtx(false, 1), { balance: 998_000_000n });
+    const r = await ex.send(transfer({ hop: 1, path: [ROUTE, ROUTE], receivedUsd: 999.5 }));
+    assert.equal(r.ok, true);
+    assert.equal(fake.sends[0]!.amount, 998_000_000n);
+    assert.match(r.detail!, /^sent 998\.000000 USD .*clamped to balance/);
+    const none = await make(mockCtx(false, 1), { balance: 0n }).ex.send(transfer({ hop: 1, path: [ROUTE, ROUTE] }));
+    assert.equal(none.ok, false);
+  });
+
+  it("hop 0 clamps only within 0.5% of the request, otherwise fails before sending", async () => {
+    const near = make(mockCtx(false, 1), { balance: 996_000_000n }); // -0.4%
+    const r1 = await near.ex.send(transfer());
+    assert.equal(r1.ok, true);
+    assert.equal(near.fake.sends[0]!.amount, 996_000_000n);
+
+    const far = make(mockCtx(false, 1), { balance: 990_000_000n }); // -1%
+    const r2 = await far.ex.send(transfer());
+    assert.equal(r2.ok, false);
+    assert.match(r2.detail!, /insufficient/);
+    assert.equal(far.fake.sends.length, 0);
+
+    const plenty = make(mockCtx(false, 1), { balance: 5_000_000_000n });
+    await plenty.ex.send(transfer());
+    assert.equal(plenty.fake.sends[0]!.amount, 1_000_000_000n);
   });
 
   it("dry-run returns ok without a ref", async () => {
@@ -155,9 +196,36 @@ describe("LiveBridgeExecutor.poll", () => {
     assert.equal(r.receivedUsd, undefined);
   });
 
-  it("no ref keeps the current state", async () => {
-    const { ex } = make(mockCtx());
-    const r = await ex.poll(transfer({ state: "submitted" }));
-    assert.equal(r.state, "submitted");
+  it("no ref: dry-run keeps the state; live in-flight without a handle -> stuck", async () => {
+    assert.equal((await make(mockCtx(true)).ex.poll(transfer({ state: "submitted" }))).state, "submitted");
+    const live = await make(mockCtx(false)).ex.poll(transfer({ state: "submitted" }));
+    assert.equal(live.state, "stuck");
+    assert.match(live.detail!, /^recoverable:/);
+  });
+
+  it("failed with refunded units -> refundedUsd at the source price", async () => {
+    const { fake, ex } = make(mockCtx(false, 0.999));
+    fake.statuses = [{ state: "failed", detail: "source tx reverted", refunded: 1_000_000_000n }];
+    const r = await ex.poll(sent);
+    assert.equal(r.state, "failed");
+    assert.ok(Math.abs(r.refundedUsd! - 999) < 1e-9);
+  });
+
+  it("unconfirmed pending -> in_flight within 2x ETA, stuck (recoverable) after", async () => {
+    const { fake, ex, clock } = make(mockCtx());
+    const t = { ...sent, hopStartedAtMs: T0 };
+    fake.statuses = [{ state: "pending", unconfirmed: "LayerZero Scan unreachable" }];
+    clock.t = T0 + 39 * 60_000; // ETA 20 min -> limit 40 min
+    const a = await ex.poll(t);
+    assert.equal(a.state, "in_flight");
+    assert.equal(a.detail, "LayerZero Scan unreachable");
+    fake.statuses = [{ state: "pending", unconfirmed: "LayerZero Scan unreachable" }];
+    clock.t = T0 + 41 * 60_000;
+    const b = await ex.poll(t);
+    assert.equal(b.state, "stuck");
+    assert.match(b.detail!, /^recoverable: no confirmed progress for 41 min/);
+    // plain pending never escalates
+    fake.statuses = [{ state: "pending" }];
+    assert.equal((await ex.poll(t)).state, "in_flight");
   });
 });

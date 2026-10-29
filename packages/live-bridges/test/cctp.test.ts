@@ -15,6 +15,7 @@ import {
   suiNonceUsed,
   tokenMessengerV2Abi,
   verifyCctp,
+  CCTP_FAST_SOURCES,
 } from "../src/cctp/index.js";
 import { bytes32ToEvmAddress, evmAddressToBytes32, suiAddressToBytes32 } from "../src/common.js";
 import { staticBridgeChecks } from "../src/glue/index.js";
@@ -40,7 +41,7 @@ function makeMessage(a: { src: number; dst: number; nonce: Hex; mintRecipient: H
   ) as Hex;
 }
 
-function setup(mode: "fast" | "standard", feeBps = { fast: 1.4, std: 0 }) {
+function setup(mode: "fast" | "standard", feeBps = { fast: 1.4, std: 0 }, clock = { t: Date.UTC(2026, 9, 29) }) {
   const arb = mockEvm("arbitrum", ME);
   const base = mockEvm("base", ME);
   const sui = mockSui(SUI_ME);
@@ -61,8 +62,9 @@ function setup(mode: "fast" | "standard", feeBps = { fast: 1.4, std: 0 }) {
     usdc: { arbitrum: USDC_ARB, base: USDC_BASE, sui: USDC_SUI },
     sui: { env: sui.env },
     fetch: f.fetch,
+    now: () => clock.t,
   });
-  return { arb, base, sui, f, adapter };
+  return { arb, base, sui, f, adapter, clock };
 }
 
 describe("cctp constants", () => {
@@ -75,6 +77,10 @@ describe("cctp constants", () => {
     assert.equal(CCTP_DOMAINS.base, 6);
     assert.equal(CCTP_DOMAINS.sui, 8);
     assert.equal(CCTP_DOMAINS.plasma, 33);
+    assert.equal(CCTP_DOMAINS.monad, 15);
+    assert.equal(CCTP_DOMAINS.xlayer, 37);
+    assert.equal(CCTP_FAST_SOURCES.has("monad"), false); // Fast Transfer N/A as a source
+    assert.equal(CCTP_FAST_SOURCES.has("xlayer"), true);
     assert.equal(CCTP_DOMAINS.bsc, undefined);
   });
 });
@@ -165,7 +171,7 @@ describe("CctpV2Adapter", () => {
     const d = decodeFunctionData({ abi: tokenMessengerV2Abi, data: dep.data });
     assert.equal(d.functionName, "depositForBurn");
     assert.deepEqual(d.args, [1_000_000_000n, 6, evmAddressToBytes32(ME), getAddress(USDC_ARB.address), zeroHash, 168_000n, 1000]);
-    assert.match(res.handle!, /^cctp_v2_fast:arbitrum:base:0x[0-9a-f]{64}$/);
+    assert.match(res.handle!, /^cctp_v2_fast:arbitrum:base:0x[0-9a-f]{64}:1000000000$/);
   });
 
   it("send(): standard uses threshold 2000 and maxFee 0", async () => {
@@ -194,7 +200,9 @@ describe("CctpV2Adapter", () => {
     const { adapter, f, base } = setup("fast");
     const ctx = mockCtx();
     const h = "cctp_v2_fast:arbitrum:base:0x" + "12".repeat(32);
-    assert.deepEqual(await adapter.status(h, ctx), { state: "pending" });
+    const first = await adapter.status(h, ctx);
+    assert.equal(first.state, "pending");
+    assert.match((first as { unconfirmed?: string }).unconfirmed!, /not found/); // Iris 404 + no receipt -> unconfirmed
 
     f.route("/v2/messages/3", () => ({ status: 200, body: { messages: [{ message: "0x", attestation: "PENDING", status: "pending_confirmations" }] } }));
     assert.deepEqual(await adapter.status(h, ctx), { state: "pending" });
@@ -286,7 +294,7 @@ describe("CCTP on Sui", () => {
     const res = await adapter.send(USDC_SUI, USDC_ARB, 5_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
     assert.equal(sui.executed.length, 1);
-    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}`);
+    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}:5000000`);
     assert.ok(f.urls.some((u) => u.endsWith("/v2/burn/USDC/fees/8/3")));
     await adapter.status(res.handle!, mockCtx());
     assert.ok(f.urls.some((u) => u.includes(`/v2/messages/8?transactionHash=${sui.digest}`)));
@@ -358,5 +366,88 @@ describe("verifyCctp", () => {
     assert.ok(issues.some((i) => i.includes("localDomain() = 99")), issues.join("\n"));
     assert.ok(issues.some((i) => i.includes("getLocalToken(base USDC")), issues.join("\n"));
     assert.ok(issues.some((i) => i.includes("usdcTreasury")), issues.join("\n"));
+  });
+});
+
+describe("CCTP send/status robustness", () => {
+  const RECEIVE_SEL = toFunctionSelector("receiveMessage(bytes,bytes)");
+
+  it("receipt wait times out after broadcast -> ok:true with a handle (never ok:false once money left)", async () => {
+    const { adapter, arb } = setup("standard");
+    arb.setRead("allowance", () => 10n ** 12n);
+    arb.receiptWait = "timeout";
+    const res = await adapter.send(USDC_ARB, USDC_BASE, 5_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, true, res.detail);
+    assert.equal(arb.sent.length, 1);
+    assert.match(res.handle!, /^cctp_v2_standard:arbitrum:base:0x0{63}1:5000000$/);
+    assert.match(res.detail!, /confirmation pending/);
+  });
+
+  it("burn reverted on-chain -> ok:false (nothing left the wallet)", async () => {
+    const { adapter, arb } = setup("standard");
+    arb.setRead("allowance", () => 10n ** 12n);
+    arb.receiptWait = "reverted";
+    const res = await adapter.send(USDC_ARB, USDC_BASE, 5_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, false);
+    assert.match(res.detail!, /reverted on-chain/);
+  });
+
+  it("status(): Iris has nothing and the source receipt reverted -> failed with refunded amount", async () => {
+    const { adapter, arb } = setup("standard");
+    const tx = "0x" + "9a".repeat(32);
+    arb.receipts[tx] = { logs: [], status: "reverted" };
+    const st = await adapter.status(`cctp_v2_standard:arbitrum:base:${tx}:5000000`, mockCtx());
+    assert.equal(st.state, "failed");
+    assert.equal((st as { refunded?: bigint }).refunded, 5_000_000n);
+  });
+
+  it("status(): Sui source tx failed -> failed with refunded amount", async () => {
+    const { adapter, sui } = setup("standard");
+    sui.txKinds["BadDigest111"] = "FailedTransaction";
+    const st = await adapter.status("cctp_v2_standard:sui:arbitrum:BadDigest111:7000000", mockCtx());
+    assert.deepEqual(st, { state: "failed", detail: "source tx BadDigest111 failed on-chain; nothing was burned", refunded: 7_000_000n });
+  });
+
+  it("expired attestation: re-attest once, keep polling, then recoverable; fresh attestation -> claimable", async () => {
+    const { adapter, f, base, clock } = setup("fast");
+    const nonce = pad("0x77");
+    const expired = makeMessage({ src: 3, dst: 6, nonce, mintRecipient: evmAddressToBytes32(ME), amount: 10n ** 9n, maxFee: 1n, feeExecuted: 1n });
+    // put a non-zero expirationBlock into the body (last 32 bytes before hookData)
+    const withExp = (expired.slice(0, expired.length - 64) + (123n).toString(16).padStart(64, "0")) as Hex;
+    assert.equal(decodeCctpMessage(withExp).body?.expirationBlock, 123n);
+    f.route("/v2/messages/3", () => ({ status: 200, body: { messages: [{ message: withExp, eventNonce: nonce, attestation: "0xabcd", status: "complete" }] } }));
+    f.route("/v2/reattest/", (_u, method) => {
+      assert.equal(method, "POST");
+      return { status: 200, body: { message: "Re-attestation successfully requested for nonce.", nonce } };
+    });
+    base.revertSelector = RECEIVE_SEL;
+    base.revertMessage = "execution reverted: Message expired and must be re-signed";
+    const h = "cctp_v2_fast:arbitrum:base:0x" + "ab".repeat(32) + ":1000000000";
+    const ctx = mockCtx();
+
+    assert.deepEqual(await adapter.status(h, ctx), { state: "pending" });
+    assert.equal(f.requests.filter((r) => r.startsWith("POST") && r.endsWith(`/v2/reattest/${nonce}`)).length, 1);
+    clock.t += 5 * 60_000;
+    assert.deepEqual(await adapter.status(h, ctx), { state: "pending" });
+    assert.equal(f.requests.filter((r) => r.startsWith("POST")).length, 1); // only once
+    clock.t += 20 * 60_000;
+    const st = await adapter.status(h, ctx);
+    assert.equal(st.state, "failed");
+    assert.match((st as { detail: string }).detail, /^recoverable: attestation expired/);
+
+    base.revertSelector = undefined; // Iris now serves a re-signed message
+    assert.equal((await adapter.status(h, ctx)).state, "claimable");
+  });
+
+  it("Sui destination: expirationBlock is ms since epoch", async () => {
+    const { adapter, f, clock, sui } = setup("standard");
+    const msg = makeMessage({ src: 3, dst: 8, nonce: pad("0x0b"), mintRecipient: suiAddressToBytes32(SUI_ME), amount: 10n ** 7n, maxFee: 0n, feeExecuted: 0n });
+    const exp = BigInt(clock.t - 1);
+    const withExp = (msg.slice(0, msg.length - 64) + exp.toString(16).padStart(64, "0")) as Hex;
+    f.route("/v2/messages/3", () => ({ status: 200, body: { messages: [{ message: withExp, attestation: "0xabcd", status: "complete" }] } }));
+    f.route("/v2/reattest/", () => ({ status: 200, body: {} }));
+    sui.nonceUsed = false;
+    assert.deepEqual(await adapter.status("cctp_v2_standard:arbitrum:sui:0x" + "cd".repeat(32), mockCtx()), { state: "pending" });
+    assert.ok(f.requests.some((r) => r.startsWith("POST") && r.includes("/v2/reattest/")));
   });
 });
