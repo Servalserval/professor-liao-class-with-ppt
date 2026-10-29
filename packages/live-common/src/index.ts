@@ -187,3 +187,22 @@ export interface RewardClaimer {
   claimable(owner: string): Promise<{ token: AssetRef; amount: bigint }[]>;
   claim(owner: string, ctx: LiveContext): Promise<LiveResult>;
 }
+
+// ---------------------------------------------------------------------------
+// External reward rates (Merkl campaigns etc.) injected into lending market data
+// ---------------------------------------------------------------------------
+
+import type { RewardRate } from "@incentive-router/core";
+
+export interface RewardRateQuery {
+  /** Lending protocol id as used by the core venue (e.g. "aave-v3", "morpho", "euler-v2"). */
+  protocol: string;
+  chain: string;
+  asset: AssetRef;
+  side: "supply" | "borrow" | "collateral";
+  /** Protocol market identifier when assets alone are ambiguous (Morpho market id, Euler vault ...). */
+  marketId?: string;
+}
+
+/** Returns extra reward streams (APR on the side's pool, yearly fraction) for a market side. */
+export type RewardRateProvider = (q: RewardRateQuery) => Promise<RewardRate[]>;

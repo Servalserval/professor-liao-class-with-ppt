@@ -140,3 +140,35 @@ export async function coinBalance(env: SuiEnv, coinType: string, owner: string =
   const r = await env.grpc.core.getBalance({ owner, coinType: normalizeStructTag(coinType) });
   return BigInt(r.balance.balance);
 }
+
+// ---------------------------------------------------------------------------
+// Swaps inside a PTB (stable-pair loops convert debt -> collateral in the same tx)
+// ---------------------------------------------------------------------------
+
+import type { TransactionObjectArgument } from "@mysten/sui/transactions";
+export type { TransactionObjectArgument };
+
+export interface PtbSwapQuote {
+  amountIn: bigint;
+  amountOut: bigint;
+  /** Fees + price impact vs mid, bps. */
+  costBps: number;
+  /** Opaque route data for appendSwap (must be from this quote). */
+  routeData: unknown;
+}
+
+/**
+ * Implemented by the Cetus aggregator module (src/swap). Lending adapters take
+ * one by injection and never call an aggregator API directly.
+ */
+export interface PtbSwapper {
+  quote(fromType: string, toType: string, amountIn: bigint): Promise<PtbSwapQuote>;
+  /**
+   * Append swap commands to `tx` consuming `coinIn` and return the output coin
+   * argument. `minOut` must be enforced on-chain (the PTB aborts below it).
+   */
+  appendSwap(
+    tx: Transaction,
+    args: { fromType: string; toType: string; coinIn: TransactionObjectArgument; quote: PtbSwapQuote; minOut: bigint }
+  ): Promise<TransactionObjectArgument>;
+}
