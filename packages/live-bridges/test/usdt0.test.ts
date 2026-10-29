@@ -171,7 +171,7 @@ describe("Usdt0OftAdapter", () => {
     assert.equal(p.extraOptions, "0x");
     assert.equal(fee.nativeFee, s.value);
     assert.equal(refund, getAddress(ME));
-    assert.equal(res.handle, `usdt0_oft:ethereum:arbitrum:${sendTxHash}:${guid}:777:2000000:2000000:${NOW}`);
+    assert.equal(res.handle, `usdt0_oft:ethereum:arbitrum:${sendTxHash}:${guid}:777:2000000:2000000:${NOW}:n2`);
   });
 
   it("send(): dry-run with a missing approval simulates the approve only", async () => {
@@ -294,7 +294,7 @@ describe("Usdt0OftAdapter send/status robustness", () => {
     arb.receiptWait = "timeout";
     const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
-    assert.equal(res.handle, `usdt0_oft:arbitrum:plasma:${mockHash(1)}:-:1000:1000000:1000000:${NOW}`);
+    assert.equal(res.handle, `usdt0_oft:arbitrum:plasma:${mockHash(1)}:-:1000:1000000:1000000:${NOW}:n0`);
     assert.equal(res.txs.at(-1)!.unconfirmed, true);
   });
 
@@ -302,7 +302,7 @@ describe("Usdt0OftAdapter send/status robustness", () => {
     const { adapter, arb } = setup(); // no receipt registered -> getTransactionReceipt throws
     const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
-    assert.match(res.handle!, new RegExp(`:-:1000:1000000:1000000:${NOW}$`));
+    assert.match(res.handle!, new RegExp(`:-:1000:1000000:1000000:${NOW}:n0$`));
     assert.equal(arb.sent.length, 1);
   });
 
@@ -424,9 +424,13 @@ describe("Usdt0OftAdapter unconfirmed broadcasts", () => {
     arb.submitError = "HTTP 503";
     const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
-    assert.equal(res.handle, `usdt0_oft:arbitrum:plasma:${mockHash(1)}:-:1000:1000000:1000000:${NOW}`);
+    assert.equal(res.handle, `usdt0_oft:arbitrum:plasma:${mockHash(1)}:-:1000:1000000:1000000:${NOW}:n0`);
     assert.equal((await adapter.status(res.handle!, mockCtx())).state, "pending");
     now += 16 * 60_000;
+    const possible = await adapter.status(res.handle!, mockCtx());
+    assert.equal(possible.state, "pending"); // nonce 0 not passed yet
+    assert.match((possible as { unconfirmed?: string }).unconfirmed!, /could still land/);
+    arb.confirmedNonce = 1;
     const st = await adapter.status(res.handle!, mockCtx());
     assert.equal(st.state, "failed");
     assert.equal((st as { refunded?: bigint }).refunded, 1_000_000n);

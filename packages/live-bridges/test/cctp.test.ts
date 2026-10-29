@@ -171,7 +171,7 @@ describe("CctpV2Adapter", () => {
     const d = decodeFunctionData({ abi: tokenMessengerV2Abi, data: dep.data });
     assert.equal(d.functionName, "depositForBurn");
     assert.deepEqual(d.args, [1_000_000_000n, 6, evmAddressToBytes32(ME), getAddress(USDC_ARB.address), zeroHash, 168_000n, 1000]);
-    assert.match(res.handle!, /^cctp_v2_fast:arbitrum:base:0x[0-9a-f]{64}:1000000000:\d+$/);
+    assert.match(res.handle!, /^cctp_v2_fast:arbitrum:base:0x[0-9a-f]{64}:1000000000:\d+:n1$/);
   });
 
   it("send(): standard uses threshold 2000 and maxFee 0", async () => {
@@ -294,7 +294,7 @@ describe("CCTP on Sui", () => {
     const res = await adapter.send(USDC_SUI, USDC_ARB, 5_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
     assert.equal(sui.executed.length, 1);
-    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}:5000000:${clock.t}`);
+    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}:5000000:${clock.t}:-`);
     assert.ok(f.urls.some((u) => u.endsWith("/v2/burn/USDC/fees/8/3")));
     await adapter.status(res.handle!, mockCtx());
     assert.ok(f.urls.some((u) => u.includes(`/v2/messages/8?transactionHash=${sui.digest}`)));
@@ -379,7 +379,7 @@ describe("CCTP send/status robustness", () => {
     const res = await adapter.send(USDC_ARB, USDC_BASE, 5_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
     assert.equal(arb.sent.length, 1);
-    assert.equal(res.handle, `cctp_v2_standard:arbitrum:base:${mockHash(1)}:5000000:${Date.UTC(2026, 9, 29)}`);
+    assert.equal(res.handle, `cctp_v2_standard:arbitrum:base:${mockHash(1)}:5000000:${Date.UTC(2026, 9, 29)}:n0`);
     assert.match(res.detail!, /confirmation pending/);
     assert.equal(res.txs.at(-1)!.unconfirmed, true);
   });
@@ -469,15 +469,24 @@ describe("CCTP unconfirmed broadcasts (BroadcastUnconfirmedError)", () => {
     arb.submitError = "fetch failed: 502 Bad Gateway";
     const res = await adapter.send(USDC_ARB, USDC_BASE, 5_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
-    assert.equal(res.handle, `cctp_v2_standard:arbitrum:base:${mockHash(1)}:5000000:${clock.t}`);
+    assert.equal(res.handle, `cctp_v2_standard:arbitrum:base:${mockHash(1)}:5000000:${clock.t}:n0`);
     const early = await adapter.status(res.handle!, mockCtx());
     assert.equal(early.state, "pending");
     assert.match((early as { unconfirmed?: string }).unconfirmed!, /not found/);
     clock.t += 16 * 60_000;
+    // nonce 0 not yet used by any confirmed tx: the signed tx could still land -> no refund
+    const stillPossible = await adapter.status(res.handle!, mockCtx());
+    assert.equal(stillPossible.state, "pending");
+    assert.match((stillPossible as { unconfirmed?: string }).unconfirmed!, /could still land \(guard not passed\)/);
+    arb.confirmedNonce = 1; // another tx consumed nonce 0
     const late = await adapter.status(res.handle!, mockCtx());
     assert.equal(late.state, "failed");
     assert.equal((late as { refunded?: bigint }).refunded, 5_000_000n);
-    assert.match((late as { detail: string }).detail, /never landed/);
+    assert.match((late as { detail: string }).detail, /can no longer land \(account nonce passed 0\)/);
+    // an old handle without a guard is never auto-refunded
+    const old = await adapter.status(res.handle!.replace(/:n0$/, ""), mockCtx());
+    assert.equal(old.state, "pending");
+    assert.match((old as { unconfirmed?: string }).unconfirmed!, /no replay guard/);
   });
 
   it("ambiguous submit error but the tx is in the mempool -> tracked, never refunded", async () => {
@@ -496,15 +505,21 @@ describe("CCTP unconfirmed broadcasts (BroadcastUnconfirmedError)", () => {
 
   it("Sui: execute transport error -> ok:true; digest unknown for > 15 min -> refunded; failed effects -> ok:false", async () => {
     const { adapter, sui, clock } = setup("standard");
+    const GAS = "0x" + "9e".repeat(32);
     sui.balance = 10_000_000n;
+    sui.gasRef = { objectId: GAS, version: "5", digest: sui.digest };
     sui.executeError = "socket hang up";
     const res = await adapter.send(USDC_SUI, USDC_ARB, 5_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
-    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}:5000000:${clock.t}`);
+    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}:5000000:${clock.t}:o${GAS}@5`);
     clock.t += 16 * 60_000;
+    sui.objectVersions[GAS] = "5"; // gas coin untouched: the signed tx could still execute
+    assert.equal((await adapter.status(res.handle!, mockCtx())).state, "pending");
+    sui.objectVersions[GAS] = "6"; // gas coin used by another tx: ours can never execute
     const st = await adapter.status(res.handle!, mockCtx());
     assert.equal(st.state, "failed");
     assert.equal((st as { refunded?: bigint }).refunded, 5_000_000n);
+    assert.match((st as { detail: string }).detail, /moved past version 5/);
 
     const b = setup("standard");
     b.sui.balance = 10_000_000n;
