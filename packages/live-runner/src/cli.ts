@@ -64,11 +64,12 @@ const pct = (x: number) => (Number.isFinite(x) ? `${(x * 100).toFixed(2)}%` : "n
 const usd = (x: number) => `$${Math.round(x).toLocaleString("en-US")}`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function makeNotifier(): { notifier: Notifier; tg?: TelegramNotifier } {
+function makeNotifier(stateDir: string): { notifier: Notifier; tg?: TelegramNotifier } {
   const tok = process.env.TG_BOT_TOKEN;
   const chat = process.env.TG_CHAT_ID;
   if (tok && chat) {
-    const tg = new TelegramNotifier(tok, chat);
+    // Offset persisted so commands (e.g. /resume) are not re-run after a restart.
+    const tg = new TelegramNotifier(tok, chat, fetch, { offsetPath: join(stateDir, "telegram-offset.json") });
     return { notifier: new MultiNotifier([new ConsoleNotifier(), tg]), tg };
   }
   return { notifier: new ConsoleNotifier() };
@@ -280,7 +281,7 @@ async function cmdRun(rt: Runtime, f: Flags): Promise<number> {
       rt.log("info", `shadow: seeded idle buckets from wallet (${usd(st.idleUsd)})`);
     }
   }
-  const { notifier, tg } = makeNotifier();
+  const { notifier, tg } = makeNotifier(rt.cfg.state_dir);
   const router = new Router({
     cfg: rt.routerCfg,
     sources: rt.sources,
@@ -358,7 +359,8 @@ const HELP = `incentive-router live runner
   run [--cycles N] [--interval sec]
                        mode from config: shadow (simulate) | live (needs fresh verify + LIVE_CONFIRM=yes)
   status               positions, idle buckets, transfers, 24h cross-chain costs, stamp
-  rewards              run the reward keeper once now`;
+  rewards              run the reward keeper once now
+  cmd "/<command> ..." same commands as Telegram, e.g. cmd "/transfer <id> arrived 1000"`;
 
 async function main(): Promise<number> {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
@@ -386,6 +388,25 @@ async function main(): Promise<number> {
       return cmdRun(rt, flags);
     case "status":
       return cmdStatus(rt);
+    case "cmd": {
+      // Same commands as Telegram (/status /pause /resume /exit <id> /exitall /transfer <id> arrived|failed|refunded [usd]),
+      // for operators without a bot. Takes the lock: state is mutated.
+      const text = process.argv.slice(3).find((a) => a.startsWith("/"));
+      if (!text) {
+        console.error('usage: cmd "/transfer <id> arrived 1000" [--config ...]');
+        return 1;
+      }
+      const release = takeLock(cfg.state_dir);
+      try {
+        const st = storeFor(rt);
+        const router = new Router({ cfg: rt.routerCfg, sources: [], executors: {}, store: st, notifier: new ConsoleNotifier(), tokens: rt.tokens });
+        const [c, ...args] = text.trim().split(/\s+/);
+        console.log(router.handleCommand({ cmd: (c ?? "").toLowerCase(), args }));
+      } finally {
+        release();
+      }
+      return 0;
+    }
     case "rewards": {
       if (cfg.mode === "live") {
         const b = liveBlockers({ stamp: readStamp(join(cfg.state_dir, "verify-stamp.json")), configHash: rt.hash, nowMs: Date.now(), maxAgeDays: cfg.verify_max_age_days, modeIsLive: true, env: process.env });

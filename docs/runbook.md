@@ -194,6 +194,9 @@ LIVE_CONFIRM=yes npm run live -- run --config config/live.yaml
 | `/resume` | 恢復，並重置回撤熔斷的觀察窗 |
 | `/exit <oppId>` | 下一輪出場該部位，失敗會重試到成功 |
 | `/exitall` | 全部出場並暫停 |
+| `/transfer <id> arrived\|failed\|refunded [usd]` | 人工結案一筆卡住的跨鏈轉帳（同時重置熔斷觀察窗） |
+
+沒有 Telegram 時，同樣的指令可以用 `npm run live -- cmd "/status"` 下。
 
 ### 告警等級
 
