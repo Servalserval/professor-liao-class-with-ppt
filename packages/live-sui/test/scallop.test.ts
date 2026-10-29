@@ -5,13 +5,14 @@ import { normalizeStructTag } from "@mysten/sui/utils";
 import { SuiGrpcClient } from "@mysten/sui/grpc";
 import { POOL_ADDRESSES, ScallopBuilder, TEST_ADDRESSES, WHITELIST, type PoolAddress } from "@scallop-io/sui-scallop-sdk";
 import { BroadcastUnconfirmedError, type AssetRef, type LiveContext, type RewardRateQuery } from "@incentive-router/live-common";
-import { DEFAULT_CONFIG, loopPairOpportunity } from "@incentive-router/core";
+import { DEFAULT_CONFIG, loopPairOpportunity, supplyOpportunity } from "@incentive-router/core";
 import { Mutex, type PtbSwapper, type SuiEnv } from "../src/common.js";
 import {
   borrowIncentiveRates,
   buildScallopLoopPair,
   buildScallopSupplyMarket,
   holdingUnits,
+  planSpoolStake,
   planWithdraw,
   spoolIsLive,
   spoolPendingReward,
@@ -881,14 +882,15 @@ describe("ScallopAdapter x real SDK tx builder (offline)", () => {
     assert.ok(kinds.includes("MergeCoins") && kinds.includes("TransferObjects"));
   });
 
-  it("supply deposit (new spool account) and full withdraw (unstake + burn sCoin + redeem) with the real Move calls", async () => {
+  it("supply deposit (new spool account, restaking held sCoin) and full withdraw (unstake + burn sCoin + redeem) with the real Move calls", async () => {
     const w = fakeWorld({ sCoin: 2_000_000n, stakeAccounts: [] });
     const f = await realPtbFactory();
     const sdk = { ...w.sdk, createPtb: f.createPtb } as ScallopSdkLike;
     const a = new ScallopAdapter({ env: w.env, sdk, pairs: [], supply: [{ asset: USDC }], now: () => NOW });
     const d = await a.deposit("USDC", 1_000_000n, w.ctx);
     assert.ok(d.ok, d.detail);
-    assert.deepEqual(moveFns(f.txs[0]!).filter((x) => x.includes("::")), ["mint::mint", "user::new_spool_account", "user::stake"]);
+    assert.deepEqual(moveFns(f.txs[0]!).filter((x) => x.includes("::")), ["mint::mint", "s_coin_converter::burn_s_coin", "user::new_spool_account", "user::stake"]);
+    assert.ok(moveFns(f.txs[0]!).includes("MergeCoins"));
     w.st.stakeAccounts = [{ id: "0x" + "ac".repeat(32), staked: 1_000_000, index: 0, points: 0 }];
     const r = await a.withdraw("USDC", 1, w.ctx);
     assert.ok(r.ok, r.detail);
@@ -945,6 +947,22 @@ describe("scallop supply math", () => {
     assert.equal(planWithdraw(h, 1).units, 1_100n);
     assert.throws(() => planWithdraw(h, 0));
   });
+  it("spool stake plan: never beyond 99% of room; restake held sCoin only when room is left; split when it does not fit", () => {
+    assert.deepEqual(planSpoolStake({ newUnitsLb: 100n, existingUnits: 50n, roomUnits: 1_000n }), { stakeUnits: 150n, includeExisting: true, stakeAll: true });
+    assert.deepEqual(planSpoolStake({ newUnitsLb: 100n, existingUnits: 0n, roomUnits: 1_000n }), { stakeUnits: 100n, includeExisting: false, stakeAll: true });
+    assert.deepEqual(planSpoolStake({ newUnitsLb: 100n, existingUnits: 950n, roomUnits: 1_000n }), { stakeUnits: 990n, includeExisting: true, stakeAll: false });
+    assert.deepEqual(planSpoolStake({ newUnitsLb: 2_000n, existingUnits: 50n, roomUnits: 1_000n }), { stakeUnits: 990n, includeExisting: false, stakeAll: false });
+    assert.deepEqual(planSpoolStake({ newUnitsLb: 100n, existingUnits: 50n, roomUnits: 0n }), { stakeUnits: 0n, includeExisting: false, stakeAll: false });
+  });
+
+  it("SupplyMarket: spool reward carries perUserCapUsd = my staked + remaining spool room", () => {
+    const m = buildScallopSupplyMarket({ marketId: "USDC", asset: USDC, pool: pool(), spool: spoolFix(), spoolRewardToken: "SUI", spoolCapUsd: 5_000, spoolBasisUsd: 1_000_000, extra: [], paused: false, nowMs: NOW });
+    assert.equal(m.rewards[0]!.perUserCapUsd, 5_000);
+    assert.equal(m.rewards[0]!.basisUsd, 1_000_000);
+    const empty = buildScallopSupplyMarket({ marketId: "USDC", asset: USDC, pool: pool(), spool: spoolFix(), spoolBasisUsd: 0, extra: [], paused: false, nowMs: NOW });
+    assert.equal(empty.rewards[0]!.basisUsd, undefined); // nothing staked yet: fall back to the core default
+  });
+
   it("SupplyMarket: pool APR, spool reward only when staking, withdrawable = cash, caps, IRM", () => {
     const m = buildScallopSupplyMarket({
       marketId: "USDC",
@@ -1013,6 +1031,48 @@ describe("ScallopAdapter as SupplyAdapter", () => {
     assert.deepEqual(order(w3.calls), ["supply", "mintSCoin"]);
     assert.match(r3.detail!, /held as susdc/);
     assert.equal(r3.txs[0]!.simulated, true);
+  });
+
+  it("spool reward only for what is or can be staked: tiny spool room -> none; cap = staked + room; unstaked sCoin noted", async () => {
+    // room = (1e14 - 1e12) units * 1.0 / 1e6 * $1 = $99M; my staked 1e9 units = $1000
+    const w = fakeWorld({ stakeAccounts: [{ id: "0xacc", staked: 1e9, index: 2e9, points: 0 }], sCoin: 3_000_000_000n });
+    const [m] = await mk(w).supplyMarkets();
+    const r = m!.rewards.find((x) => x.token === "SUI")!;
+    assert.ok(Math.abs(r.perUserCapUsd! - (1_000 + 99_000_000)) < 1e-6, `${r.perUserCapUsd}`);
+    // dilution basis = everything staked in the spool (stakedAmount 1e12 units * 1.0 / 1e6 * $1), not the pool's $5M supply
+    assert.ok(Math.abs(r.basisUsd! - 1_000_000) < 1e-6, `${r.basisUsd}`);
+    assert.equal(m!.totalSupplyUsd, 5_000_000);
+    // the core dilutes the spool reward over the $1M staked, not the $5M pool: +$1M of mine halves it
+    const o = supplyOpportunity({ ...m!, myDepositUsd: 0 }, { cfg: DEFAULT_CONFIG, nowMs: NOW, myEquityByOpp: {} }, "test");
+    assert.ok(o, "core rejected the Scallop supply market");
+    const spoolStream = o.streams.find((x) => x.label === "supply_reward:SUI")!;
+    assert.ok(Math.abs(spoolStream.aprAt(1) - 0.04) < 1e-6, `${spoolStream.aprAt(1)}`);
+    assert.ok(Math.abs(spoolStream.aprAt(1_000_000) - 0.02) < 1e-9, `${spoolStream.aprAt(1_000_000)}`);
+    assert.match(m!.note!, /\$3000\.00 held as unstaked sCoin earns no spool reward/);
+    // spool almost full: $500 of room (< $1000 default) -> no spool reward and deposits hold sCoin
+    const full = fakeWorld({ spoolOver: { maxStake: 1e12 + 500e6 } });
+    assert.deepEqual((await mk(full).supplyMarkets())[0]!.rewards, []);
+    await mk(full).deposit("USDC", 1_000_000n, full.ctx);
+    assert.deepEqual(order(full.calls), ["supply", "mintSCoin"]);
+    // ... unless the operator accepts a smaller room
+    const small = fakeWorld({ spoolOver: { maxStake: 1e12 + 500e6 } });
+    assert.equal((await mk(small, {}, { minSpoolRoomUsd: 100 }).supplyMarkets())[0]!.rewards.length, 1);
+  });
+
+  it("deposit(): restakes held sCoin when the spool has room; splits at the room and holds the rest", async () => {
+    const w = fakeWorld({ sCoin: 5_000_000n, stakeAccounts: [{ id: "0xacc", staked: 1, index: 0, points: 0 }] });
+    const r = await mk(w).deposit("USDC", 1_000_000n, w.ctx);
+    assert.ok(r.ok, r.detail);
+    assert.deepEqual(order(w.calls), ["supply", "burnSCoin", "stake"]);
+    assert.match(r.detail!, /restaking held sCoin/);
+    // room for ~2.5 units of USDC (2.5e6 market units): new 1e6 fits, held 5e6 only partially -> split + hold rest
+    const t = fakeWorld({ sCoin: 5_000_000n, stakeAccounts: [{ id: "0xacc", staked: 1, index: 0, points: 0 }], spoolOver: { maxStake: 1e12 + 2.5e6 } });
+    const rt = await mk(t, {}, { minSpoolRoomUsd: 1 }).deposit("USDC", 1_000_000n, t.ctx);
+    assert.ok(rt.ok, rt.detail);
+    assert.deepEqual(order(t.calls), ["supply", "burnSCoin", "stake", "mintSCoin"]);
+    const kinds = t.lastTx.tx!.getData().commands.map((c) => c.$kind);
+    assert.ok(kinds.includes("SplitCoins") && kinds.includes("MergeCoins"));
+    assert.match(rt.detail!, /staked 2475000 units \(spool room\), rest held/);
   });
 
   it("deposit(): refuses on short wallet, paused pool (no supply limit), supply cap", async () => {
@@ -1098,8 +1158,12 @@ describe("ScallopAdapter as SupplyAdapter", () => {
     assert.ok(rep.checks.some((c) => c.name === "supply:USDC:lending_pool" && c.ok));
   });
 
-  it("constructor: needs pairs or supply; unique supply ids", () => {
+  it("constructor: needs pairs or supply (not both); unique supply ids", () => {
     const w = fakeWorld();
+    assert.throws(
+      () => new ScallopAdapter({ env: w.env, sdk: w.sdk, pairs: [{ pairId: "SUI/USDC", collateral: SUI, debt: USDC }], supply: [SUP] }),
+      /separate adapter instances/
+    );
     assert.throws(() => new ScallopAdapter({ env: w.env, sdk: w.sdk, pairs: [] }), /no pairs or supply/);
     assert.throws(() => new ScallopAdapter({ env: w.env, sdk: w.sdk, pairs: [], supply: [SUP, SUP] }), /duplicate supply/);
   });

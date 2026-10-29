@@ -19,8 +19,7 @@
    - 錢從 Arbitrum 用 CCTP 搬過去，成本約 $5.4，不到一天收益（約 $19）。
    - 其餘 $180k 留在原鏈不動。
 4. **其他候選被擋下的原因各不相同：**
-   - 利率不夠（NAVI USDC 5.72% < 6.5%）。
-   - 利用率太高（Plasma USDT0 93.7%、Sentora RLUSD 98%、Monad USDC 92%）。
+   - 利率不夠（NAVI USDC 5.72% < 6.5%、Plasma USDT0 4.38%、Monad USDC 4.18%）。
    - 每週獎勵今天到期，幾乎不算錢（Aave V4 USDC／USDG、Horizon RLUSD）。
    - 換幣成本超過一天收益（NAVI USDsui、Plasma GHO）。
 5. 「每週活動會續」的假設預設關閉，打開後選倉結果也一樣（見 §6）。
@@ -96,6 +95,9 @@ net = raw − haircut − depeg − costs − move        （全部是年化，�
 - **為什麼放貸門檻比較低：** 放貸沒有清算、沒有換匯來回、曝險只有 1 倍，脫鉤損失也已經另外扣掉了。所以溢價大約只要循環的三分之一。
 - 這是政策選擇，可以改：`thresholds.kind_premium_adjust.deposit`，可以填單一數字或依等級分開填。
 - 進場和出場之間留有差距（遲滯），避免利率在門檻附近來回時反覆進出。設定檢查會拒絕「出場門檻 ≥ 進場門檻」的設定。
+- **利用率：** 單純放貸有自己的水位（`sources.supply.utilization_warn` 95% 禁止新進場、`utilization_exit` 99% 出場）。
+  存款會「降低」利用率，真正的風險是領不出來，這由 1/10 進場、1/5 出場的可提領量規則負責。
+  vault（Fluid、MetaMorpho、Euler、一般 ERC-4626）沒有借貸意義上的利用率，只看可提領量。
 - **其他上限：**
   - 每協議：tier 1 40%、tier 2 15%、tier 3 5%。
   - 單一部位：40%，canary 期間另外有硬上限。
@@ -135,7 +137,11 @@ net = raw − haircut − depeg − costs − move        （全部是年化，�
   - 不用協議預言機，因為預言機常被釘在 1。2026/7 AZND 事件時，市價約 0.18，預言機還顯示 1。
   - 警告級：禁止新進場。
   - 出場級：全部出場，不做去抖動，因為擠兌時先走的人先拿到錢。
+  - 單純放貸直接用表上的水位。循環有 L 倍槓桿，所以取「表上水位」和 `sources.lending_loop.depeg_*`（0.3%／1%）裡比較嚴的那個。
 - **單一資產上限：** `stables.<幣>.max_frac` 可以限制某一種幣在所有部位裡的合計占比。
+  - 循環按 L 倍抵押品計算。
+  - 大小寫不同的同一種幣（USDT／USDt）合併計算。
+  - 設定裡只差大小寫的兩個 key 會被拒絕。
 
 ### 4.3 研究建議了、但還沒自動化的規則（目前要人工盯）
 
@@ -191,9 +197,9 @@ net = raw − haircut − depeg − costs − move        （全部是年化，�
 | 不進 | NAVI USDC（Sui） | $24k | 5.72% | 6.5% | 低於 tier 2 門檻 |
 | 不進 | Fluid fUSDT0（Arbitrum） | $6k | 4.75% | 5.5% | 低於門檻；Fluid 已滿 40% |
 | 不進 | Aave V3 Plasma GHO | $24k | 4.61% | 5.5% | WXPL 獎勵折價重；GHO 預期損失 0.3% |
-| 不進 | Aave V3 Plasma USDT0 | — | 4.38% | 5.5% | 利用率 93.7% 達警告級 |
-| 不進 | Morpho Sentora RLUSD | — | 4.32% | 6.5% | 利用率 98%，達出場級（可提領量未驗證） |
-| 不進 | Aave V3 Monad USDC | — | 4.18% | 5.5% | 利用率 92%；WMON 每週活動今天到期 |
+| 不進 | Aave V3 Plasma USDT0 | $24k | 4.38% | 5.5% | 原生 4.68%，扣 USDT0 預期損失 0.3% 後不夠 |
+| 不進 | Morpho Sentora RLUSD（vault） | $24k | 4.23% | 6.5% | RLUSD 獎勵 11/5 到期，時間加權後偏低（可提領量未驗證） |
+| 不進 | Aave V3 Monad USDC | $24k | 4.18% | 5.5% | WMON 每週活動今天到期 |
 | 不進 | Fluid fGHO（Ethereum） | $6k | 4.10% | 5.5% | 低於門檻；Fluid 已滿 40% |
 | 不進 | Aave V4 Core USDC | $24k | 3.26% | 6.5% | 2.65% USDC 補貼 14 小時後到期，幾乎不算 |
 | 不進 | Aave Horizon RLUSD | $24k | 2.51% | 6.5% | 補貼到 11/5，時間加權後偏低 |
@@ -246,6 +252,14 @@ npx tsx packages/core/src/cli.ts sim examples/scenarios/selection-2026-10-29-wha
 ---
 
 ## 8. 已知限制
+
+- **一個市場只能有一種角色：** 循環或單純放貸二選一，而且只能列一次。
+  - 原因是同一個錢包在一個借貸市場只有一個帳戶（Aave pool、NAVI 錢包帳戶、Suilend obligation），單純存款放進去會變成循環借款的抵押品。
+  - runner 會拒絕違反的設定。
+  - adapter 遇到帳戶裡已經有借款時也會拒絕存入、提領和估值。這種情況通常是之前跑循環留下的部位，要人工處理。
+- **結果不確定的交易：**
+  - 存款廣播了但沒確認，或讀不到結果時，先記成 $0、不扣閒置資金，由下一輪鏈上讀數和錢包快照校正。
+  - 校正之前不會再進同一個市場，避免重複存入。
 
 - **市價抓不到時會退回協議價：** `SupplyRegistry` 會改用協議自己的價格，同時記一筆警告。如果協議預言機被釘在 1，這段期間就看不到脫鉤。
 - **Fluid 與一般 vault 的 APR** 是從份額價格成長推算的，需要能查歷史狀態的 archive RPC。

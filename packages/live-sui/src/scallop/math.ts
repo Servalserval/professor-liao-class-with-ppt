@@ -687,9 +687,22 @@ export interface BuildSupplyInput {
   /** Spool data when we stake (live spool); undefined = not staking. */
   spool?: SpoolLike;
   spoolRewardToken?: string;
+  /**
+   * Spool rewards accrue only on what is staked, and a spool has a global
+   * stake cap: my rewarded basis is at most (my staked + remaining spool
+   * room). Passed through as the reward's perUserCapUsd.
+   */
+  spoolCapUsd?: number;
+  /**
+   * USD currently staked in the spool: spool rewards are shared among spool
+   * stakers, not the whole lending pool, so the core dilutes them over this
+   * (RewardRate.basisUsd) instead of totalSupplyUsd.
+   */
+  spoolBasisUsd?: number;
   extra: RewardRate[];
   paused: boolean;
   myDepositUsd?: number;
+  note?: string;
   nowMs: number;
 }
 
@@ -705,7 +718,12 @@ export function buildScallopSupplyMarket(a: BuildSupplyInput): SupplyMarket {
   const rewards: RewardRate[] = [];
   if (a.spool) {
     const apr = finiteOr0(a.spool.rewardApr);
-    if (apr > 0) rewards.push({ token: a.spoolRewardToken ?? a.spool.rewardCoinType, apr, endsAtMs: a.spool.endDate.getTime() });
+    if (apr > 0) {
+      const r: RewardRate = { token: a.spoolRewardToken ?? a.spool.rewardCoinType, apr, endsAtMs: a.spool.endDate.getTime() };
+      if (a.spoolCapUsd !== undefined && Number.isFinite(a.spoolCapUsd)) r.perUserCapUsd = Math.max(0, a.spoolCapUsd);
+      if (a.spoolBasisUsd !== undefined && Number.isFinite(a.spoolBasisUsd) && a.spoolBasisUsd > 0) r.basisUsd = a.spoolBasisUsd;
+      rewards.push(r);
+    }
   }
   rewards.push(...a.extra);
   const m: SupplyMarket = {
@@ -721,10 +739,39 @@ export function buildScallopSupplyMarket(a: BuildSupplyInput): SupplyMarket {
     supplyCapRemainingUsd: Math.max(0, p.maxSupplyCoin - p.supplyCoin) * price,
     paused: a.paused,
     dataAsOfMs: a.nowMs,
-    note: a.spool ? "Scallop lending (MarketCoin staked in spool)" : "Scallop lending (sCoin held in wallet)",
+    note: a.note ?? (a.spool ? "Scallop lending (MarketCoin staked in spool)" : "Scallop lending (sCoin held in wallet)"),
   };
   const irm = irmFromPool(p);
   if (irm) m.irm = irm;
   if (a.myDepositUsd !== undefined) m.myDepositUsd = a.myDepositUsd;
   return m;
+}
+
+export interface SpoolStakePlan {
+  /** Market-coin units to stake (0 = do not stake). */
+  stakeUnits: bigint;
+  /** Burn + restake the sCoin / MarketCoin already held (only when room is left after the new deposit). */
+  includeExisting: boolean;
+  /** Everything (new + included existing) fits: stake the merged coin whole, no split. */
+  stakeAll: boolean;
+}
+
+/**
+ * How much of a deposit (and of what is already held unstaked) goes into the
+ * spool, never beyond 99% of its remaining capacity (the spool aborts above
+ * max stake; the 1% absorbs the conversion-rate move until execution).
+ * `newUnitsLb` = a LOWER bound of the market-coin units the mint will return.
+ */
+export function planSpoolStake(i: { newUnitsLb: bigint; existingUnits: bigint; roomUnits: bigint }): SpoolStakePlan {
+  const room = mulFracFloor(i.roomUnits > 0n ? i.roomUnits : 0n, 0.99);
+  if (room <= 0n || i.newUnitsLb <= 0n) return { stakeUnits: 0n, includeExisting: false, stakeAll: false };
+  const includeExisting = i.existingUnits > 0n && room > i.newUnitsLb;
+  const total = i.newUnitsLb + (includeExisting ? i.existingUnits : 0n);
+  return total <= room ? { stakeUnits: total, includeExisting, stakeAll: true } : { stakeUnits: room, includeExisting, stakeAll: false };
+}
+
+/** Lower bound of market-coin units minted for `amount` underlying (0.1% under the read conversion rate). */
+export function mintedUnitsLowerBound(amount: bigint, conversionRate: number): bigint {
+  if (!(conversionRate > 0) || !Number.isFinite(conversionRate)) throw new Error(`scallop: invalid conversion rate ${conversionRate}`);
+  return BigInt(Math.floor((Number(amount) / conversionRate) * 0.999));
 }

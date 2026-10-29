@@ -47,6 +47,8 @@ import {
   buildScallopSupplyMarket,
   claimableRewards,
   holdingUnits,
+  mintedUnitsLowerBound,
+  planSpoolStake,
   planWithdraw,
   spoolIsLive,
   spoolPendingReward,
@@ -131,6 +133,11 @@ export interface ScallopAdapterOptions {
   /** Refuse open/deleverage when Scallop's price and ctx.priceUsd differ by more than this. Default 0.02. */
   maxPriceDeviation?: number;
   /**
+   * Minimum remaining spool capacity (USD) for staking to be worth it; below
+   * it no spool reward is reported and deposits hold sCoin. Default 1000.
+   */
+  minSpoolRoomUsd?: number;
+  /**
    * Also claim spool rewards of stake accounts NOT belonging to a configured
    * supply market (configured supply markets' spools are always claimed).
    * Default false. Deprecated spools are never claimed.
@@ -165,8 +172,16 @@ interface SupplyState {
   pool: PoolLike & { conversionRate: number };
   spool?: SpoolLike;
   spoolDeprecated: boolean;
-  /** Spool live AND staking enabled for this market. */
+  /** Spool live AND staking enabled AND at least minSpoolRoomUsd of spool capacity left. */
   staking: boolean;
+  /** Remaining spool capacity, market-coin units / USD (0 when no spool). */
+  roomUnits: bigint;
+  roomUsd: number;
+  myStakedUsd: number;
+  /** USD staked in the spool by everyone (spool reward dilution basis). */
+  spoolStakedUsd: number;
+  /** Underlying-USD of my sCoin / MarketCoin held in the wallet (not staked). */
+  myUnstakedUsd: number;
   holdings: SupplyHoldings;
   accounts: StakeAccountLike[];
   paused: boolean;
@@ -222,6 +237,9 @@ export class ScallopAdapter implements LendingAdapter, SupplyAdapter {
   constructor(private readonly opts: ScallopAdapterOptions) {
     this.env = opts.env;
     if (!opts.pairs.length && !opts.supply?.length) throw new Error("scallop: no pairs or supply markets configured");
+    if (opts.pairs.length && opts.supply?.length) {
+      throw new Error("scallop: configure loop pairs and supply markets in separate adapter instances (one role per venue entry)");
+    }
     for (const m of opts.supply ?? []) {
       const id = m.marketId ?? m.asset.symbol;
       if (this.supplyCfg.has(id)) throw new Error(`scallop: duplicate supply marketId ${id}`);
@@ -974,16 +992,22 @@ export class ScallopAdapter implements LendingAdapter, SupplyAdapter {
     const spoolDeprecated = wl.deprecated.has(m.spoolName) || wl.deprecated.has(m.coinName);
     const live = spoolIsLive(spool, this.now(), { whitelisted: spoolListed, deprecated: spoolDeprecated });
     const accounts = (accountsAll[m.spoolName] ?? []).map((a) => ({ id: a.id, staked: a.staked, index: a.index, points: a.points }));
+    const dec = m.cfg.asset.decimals;
+    const usdOfUnits = (marketUnits: bigint) => unitsUsd(underlyingOf(marketUnits, pool.conversionRate), pool.coinPrice, dec);
+    const roomUnits = spool ? unitsFromNumber(Math.max(0, spool.maxStake - spool.stakedAmount)) : 0n;
+    const roomUsd = usdOfUnits(roomUnits);
+    const staked = accounts.filter((a) => a.staked > 0).map((a) => ({ accountId: a.id, units: unitsFromNumber(a.staked) }));
     return {
       pool,
       spool: spool ?? undefined,
       spoolDeprecated,
-      staking: live && (m.cfg.stakeInSpool ?? true),
-      holdings: {
-        sCoin: sBal,
-        marketCoin: mBal,
-        staked: accounts.filter((a) => a.staked > 0).map((a) => ({ accountId: a.id, units: unitsFromNumber(a.staked) })),
-      },
+      staking: live && (m.cfg.stakeInSpool ?? true) && roomUsd >= (this.opts.minSpoolRoomUsd ?? 1_000),
+      roomUnits,
+      roomUsd,
+      myStakedUsd: usdOfUnits(staked.reduce((a, x) => a + x.units, 0n)),
+      spoolStakedUsd: spool ? usdOfUnits(unitsFromNumber(Math.max(0, spool.stakedAmount))) : 0,
+      myUnstakedUsd: usdOfUnits(sBal + mBal),
+      holdings: { sCoin: sBal, marketCoin: mBal, staked },
       accounts,
       // The SDK does not expose the pool's active flag (VERIFY_LIVE); a
       // deprecated pool or a zero supply limit means deposits are off.
@@ -1017,8 +1041,16 @@ export class ScallopAdapter implements LendingAdapter, SupplyAdapter {
           nowMs,
         };
         if (st.staking && st.spool) {
+          // Reward only the part that is or can be staked: my staked + the
+          // spool's remaining room. Unstaked sCoin I hold earns no spool
+          // reward until the next deposit restakes it (deposit() does).
           input.spool = st.spool;
           input.spoolRewardToken = this.symbolOf(sdk, st.spool.rewardCoinType);
+          input.spoolCapUsd = st.myStakedUsd + st.roomUsd;
+          input.spoolBasisUsd = st.spoolStakedUsd;
+          if (st.myUnstakedUsd > 0.01) {
+            input.note = `Scallop lending; $${st.myUnstakedUsd.toFixed(2)} held as unstaked sCoin earns no spool reward until the next deposit restakes it`;
+          }
         }
         return buildScallopSupplyMarket(input);
       })
@@ -1072,34 +1104,51 @@ export class ScallopAdapter implements LendingAdapter, SupplyAdapter {
     const dec = m.cfg.asset.decimals;
     const room = unitsFromNumber(Math.max(0, (st.pool.maxSupplyCoin - st.pool.supplyCoin) * 10 ** dec));
     if (amount > room) return { kind: "refuse", detail: `supply-limit headroom ${room} < ${amount}` };
-    let staking = st.staking;
-    if (staking && st.spool) {
-      const marketUnits = Number(amount) / st.pool.conversionRate;
-      if (st.spool.maxStake - st.spool.stakedAmount < marketUnits) staking = false; // spool full: hold sCoin instead
-    }
+    // Stake up to the spool's remaining room (the reported reward is capped the
+    // same way), restaking sCoin / MarketCoin already held when room is left.
+    const plan = st.staking
+      ? planSpoolStake({
+          newUnitsLb: mintedUnitsLowerBound(amount, st.pool.conversionRate),
+          existingUnits: st.holdings.sCoin + st.holdings.marketCoin,
+          roomUnits: st.roomUnits,
+        })
+      : { stakeUnits: 0n, includeExisting: false, stakeAll: false };
 
     const sdk = await this.sdk();
     const { tx, stx } = sdk.createPtb();
     tx.setSender(this.env.address);
     const coin = tx.add(coinWithBalance({ type: m.coinType, balance: amount }));
     const marketCoin = stx.supply(coin, m.coinName); // mint::mint -> MarketCoin<T>
+    const keep = (c: TransactionObjectArgument) => {
+      // anything not staked is held as sCoin (or as MarketCoin when the pool has no sCoin)
+      tx.transferObjects([m.sCoinName ? stx.mintSCoin(m.spoolName, c) : c], this.env.address);
+    };
     let how: string;
-    if (staking) {
+    if (plan.stakeUnits > 0n) {
+      if (plan.includeExisting) {
+        const parts: TransactionObjectArgument[] = [];
+        if (st.holdings.sCoin > 0n && m.sCoinName && m.sCoinType) {
+          parts.push(stx.burnSCoin(m.sCoinName, tx.add(coinWithBalance({ type: m.sCoinType, balance: st.holdings.sCoin }))));
+        }
+        if (st.holdings.marketCoin > 0n) parts.push(tx.add(coinWithBalance({ type: m.marketCoinType, balance: st.holdings.marketCoin })));
+        if (parts.length) tx.mergeCoins(marketCoin, parts);
+      }
+      const toStake = plan.stakeAll ? marketCoin : tx.splitCoins(marketCoin, [tx.pure.u64(plan.stakeUnits)])[0]!;
       const existing = st.accounts[0]?.id;
-      if (existing) stx.stake(existing, marketCoin, m.spoolName);
+      if (existing) stx.stake(existing, toStake, m.spoolName);
       else {
         const account = stx.createStakeAccount(m.spoolName);
-        stx.stake(account, marketCoin, m.spoolName);
+        stx.stake(account, toStake, m.spoolName);
         tx.transferObjects([account], this.env.address);
       }
-      how = `staked in spool ${m.spoolName}${existing ? "" : " (new stake account)"}`;
-    } else if (m.sCoinName) {
-      const sCoin = stx.mintSCoin(m.spoolName, marketCoin);
-      tx.transferObjects([sCoin], this.env.address);
-      how = `held as ${m.sCoinName}`;
+      if (!plan.stakeAll) keep(marketCoin);
+      how =
+        `${plan.stakeAll ? "staked" : `staked ${plan.stakeUnits} units (spool room), rest held`} in spool ${m.spoolName}` +
+        (plan.includeExisting ? " incl. restaking held sCoin" : "") +
+        (existing ? "" : " (new stake account)");
     } else {
-      tx.transferObjects([marketCoin], this.env.address);
-      how = "held as MarketCoin";
+      keep(marketCoin);
+      how = m.sCoinName ? `held as ${m.sCoinName}` : "held as MarketCoin";
     }
     return {
       kind: "tx",
