@@ -17,7 +17,7 @@
  *    flagging `paused` (which the core treats as an EXIT signal); `paused`
  *    is only set when withdraw/repay themselves are blocked.
  */
-import type { LoopLeg, LoopPair, RewardRate } from "@incentive-router/core";
+import type { LoopLeg, LoopPair, RewardRate, SupplyMarket } from "@incentive-router/core";
 import { borrowAprWithRiskPremium, bpsToFrac, capRemaining, hubSupplyApr, irmFromRateData, rayToNumber, toHuman } from "./math.js";
 
 export interface InterestRateData {
@@ -247,4 +247,72 @@ export function mapLoopPair(x: MapPairInput): { pair: LoopPair; status: PairStat
       drawnApr: drawnAprDebt,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Supply-only markets (plain deposits, no borrow, collateral not enabled)
+// ---------------------------------------------------------------------------
+
+export interface MapSupplyInput {
+  protocol: string;
+  chain: string;
+  marketId: string;
+  r: ReserveMarketData & { hub: string };
+  rewards: RewardRate[];
+  /** My deposit (base units). */
+  myUnits: bigint;
+  dataAsOfMs: number;
+}
+
+/** Why deposits are impossible right now (empty = deposits allowed). */
+export function depositBlockers(r: ReserveMarketData): string[] {
+  const out: string[] = [];
+  if (r.paused) out.push(`${r.symbol} reserve paused`);
+  if (r.frozen) out.push(`${r.symbol} reserve frozen (no new supply)`);
+  if (!r.spokeActive) out.push(`${r.symbol}: spoke inactive on the hub`);
+  if (r.spokeHalted) out.push(`${r.symbol}: spoke halted on the hub`);
+  const room = capRemaining(r.addCap, r.decimals, r.spokeAdded);
+  if (room !== null && room === 0n) out.push(`${r.symbol} supply cap (addCap ${r.addCap}) reached`);
+  return out;
+}
+
+/**
+ * On-chain reserve snapshot -> core SupplyMarket.
+ *  - Totals are HUB level and consistent with the hub IRM:
+ *    S = liquidity + drawn + swept, B = drawn (utilization = the IRM's own
+ *    drawn / (liquidity + drawn + swept); swept is not counted as borrowed so
+ *    the projected supply rate is not inflated).
+ *  - supplyAprBase = drawnRate * (drawn + premium) * (1 - liquidityFee) / added
+ *    (on-chain APR; no APY conversion needed). IRM unscaled (no risk premium:
+ *    a supplier pays none), reserveFactor = liquidityFee.
+ *  - withdrawableUsd = min(hub liquidity, assets added through this spoke);
+ *    0 when the reserve is paused or the spoke is inactive / halted.
+ *  - paused = deposits disabled (paused / frozen / spoke inactive or halted).
+ */
+export function mapSupplyMarket(x: MapSupplyInput): SupplyMarket {
+  const r = x.r;
+  const blockers = depositBlockers(r);
+  const withdrawBlocked = r.paused || !r.spokeActive || r.spokeHalted;
+  const withdrawable = withdrawBlocked ? 0n : min(r.hubLiquidity, r.spokeAdded);
+  const room = capRemaining(r.addCap, r.decimals, r.spokeAdded);
+  const m: SupplyMarket = {
+    protocol: x.protocol,
+    chain: x.chain,
+    marketId: x.marketId,
+    asset: { symbol: r.symbol, assetId: r.address.toLowerCase(), priceUsd: r.priceUsd },
+    totalSupplyUsd: usd(r.hubLiquidity + r.hubDrawn + r.hubSwept, r),
+    totalBorrowUsd: usd(r.hubDrawn, r),
+    supplyAprBase: hubSupplyApr({ drawnRateRay: r.drawnRateRay, drawn: r.hubDrawn, premium: r.hubPremium, addedAssets: r.hubAdded, liquidityFeeBps: r.liquidityFeeBps }),
+    rewards: x.rewards,
+    withdrawableUsd: usd(withdrawable, r),
+    paused: r.paused || r.frozen || !r.spokeActive || r.spokeHalted,
+    myDepositUsd: usd(x.myUnits, r),
+    dataAsOfMs: x.dataAsOfMs,
+    underlying: [`${x.protocol}:${x.chain}:hub:${r.hub}`],
+    note: `Aave V4 spoke reserve ${r.reserveId} (collateral not enabled)${blockers.length ? `; ${blockers.join("; ")}` : ""}`,
+  };
+  const irm = r.irm ? irmFromRateData(r.irm, r.liquidityFeeBps, 1) : undefined;
+  if (irm) m.irm = irm;
+  if (room !== null) m.supplyCapRemainingUsd = usd(room, r);
+  return m;
 }

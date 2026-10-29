@@ -3,8 +3,8 @@
  * Spoke calls are self-encoded from the verified aave-v4 v0.5.11 ABI and
  * guard-checked; AaveKit (@aave/client) is used for reads / cross-checks only.
  */
-export { AaveV4Adapter, type PairSnapshot, type ReserveSnapshot, type UserSnapshot } from "./adapter.js";
-export { AAVE_V4_PROTOCOL, aaveV4AdapterId, type AaveV4AdapterOptions, type AaveV4PairConfig, type AaveV4SpokeConfig } from "./config.js";
+export { AaveV4Adapter, type PairSnapshot, type ReserveSnapshot, type SupplySnapshot, type UserSnapshot } from "./adapter.js";
+export { AAVE_V4_PROTOCOL, aaveV4AdapterId, aaveV4SupplyMarketId, type AaveV4AdapterOptions, type AaveV4PairConfig, type AaveV4SpokeConfig, type AaveV4SupplyConfig } from "./config.js";
 export { aaveKitApi, parseHealthFactorCriterion, pctValue, rewardsFromApiReserve, type AaveV4Api, type ApiRewardMapping } from "./api.js";
 export {
   assertTx,
@@ -16,7 +16,7 @@ export {
   type TxGuardPolicy,
   type TxLike,
 } from "./guard.js";
-export { entryBlockers, exitBlockers, mapLoopPair, type InterestRateData, type MapPairInput, type PairStatus, type ReserveMarketData } from "./market.js";
+export { depositBlockers, entryBlockers, exitBlockers, mapLoopPair, mapSupplyMarket, type InterestRateData, type MapPairInput, type MapSupplyInput, type PairStatus, type ReserveMarketData } from "./market.js";
 export {
   apyToApr,
   borrowAprWithRiskPremium,

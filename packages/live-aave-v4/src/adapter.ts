@@ -19,13 +19,28 @@
  *   multicall(supply out_i, borrow b_{i+1}) — each borrow sized from fresh
  *   on-chain state so LTV never exceeds the target.
  */
-import { formatUnits, getAddress, isAddress, toFunctionSelector, type Abi, type AbiFunction, type Address, type Hex } from "viem";
+import {
+  BaseError,
+  ContractFunctionRevertedError,
+  ExecutionRevertedError,
+  formatUnits,
+  getAddress,
+  isAddress,
+  RawContractError,
+  toFunctionSelector,
+  type Abi,
+  type AbiFunction,
+  type Address,
+  type Hex,
+} from "viem";
 import { bigDecimal, chainId as akChainId, evmAddress, ReservesRequestFilter, type ExecutionPlan, type Reserve } from "@aave/client";
-import type { LoopPair, RewardRate } from "@incentive-router/core";
+import type { LoopPair, RewardRate, SupplyMarket } from "@incentive-router/core";
 import {
   BroadcastUnconfirmedError,
   type AssetRef,
   type LendingAdapter,
+  type SupplyAdapter,
+  type SupplyPositionView,
   type LiveContext,
   type LiveResult,
   type Logger,
@@ -36,11 +51,12 @@ import {
 import { assertChainId, call, erc20Abi, erc20Balance, sendTx, verifyAsset, type EvmEnv, type TxRequest } from "@incentive-router/live-evm-base";
 import { EIP1967_IMPLEMENTATION_SLOT, HUB_ABI, IRM_ABI, ORACLE_ABI, SPOKE_ABI, SPOKE_WRITE_FUNCTIONS } from "./abi.js";
 import { aaveKitApi, pctValue, rewardsFromApiReserve, type AaveV4Api } from "./api.js";
-import { AAVE_V4_PROTOCOL, aaveV4AdapterId, type AaveV4AdapterOptions, type AaveV4PairConfig } from "./config.js";
+import { AAVE_V4_PROTOCOL, aaveV4AdapterId, aaveV4SupplyMarketId, type AaveV4AdapterOptions, type AaveV4PairConfig, type AaveV4SupplyConfig } from "./config.js";
 import { assertTx, checkTx, normalizeAddresses, TxGuardError, type SpokeCallSpec, type TxGuardPolicy } from "./guard.js";
-import { exitBlockers, mapLoopPair, type PairStatus, type ReserveMarketData } from "./market.js";
+import { depositBlockers, exitBlockers, mapLoopPair, mapSupplyMarket, type PairStatus, type ReserveMarketData } from "./market.js";
 import {
   MAX_UINT256,
+  capRemaining,
   ORACLE_DECIMALS,
   RAY,
   fromHumanFloor,
@@ -161,6 +177,26 @@ export interface PairSnapshot {
 }
 
 type ReadCall = { address: Address; abi: Abi; functionName: string; args?: readonly unknown[] };
+/** What the tx builders need to label / cross-check a spoke call. */
+type CallScope = { label: string; assetOf: (reserveId: bigint) => AssetRef };
+
+interface SupplyEntry {
+  cfg: AaveV4SupplyConfig;
+  marketId: string;
+  token: Address;
+}
+interface ResolvedSupply extends SupplyEntry {
+  reserveId: bigint;
+}
+
+export interface SupplySnapshot {
+  blockNumber: bigint;
+  timestampMs: number;
+  reserve: ReserveSnapshot;
+  /** My deposit (assets). */
+  units: bigint;
+  usingAsCollateral: boolean;
+}
 
 const lc = (a: string) => a.toLowerCase();
 const sameAddr = (a: string, b: string) => lc(a) === lc(b);
@@ -170,10 +206,13 @@ const noopLog: Logger = () => {};
 /** A tx of ours was signed + submitted but not confirmed: it may still land. */
 const isUnconfirmed = (e: unknown): e is BroadcastUnconfirmedError =>
   e instanceof BroadcastUnconfirmedError || (e instanceof Error && e.name === "BroadcastUnconfirmedError");
+/** An eth_call that reverted (as opposed to an RPC / transport failure). */
+const isRevertError = (e: unknown): boolean =>
+  e instanceof BaseError && e.walk((x) => x instanceof ExecutionRevertedError || x instanceof ContractFunctionRevertedError || x instanceof RawContractError) !== null;
 /** Accrual margin on a repay meant to clear the debt (1 bp + 1 wei); leftover allowance is reset afterwards. */
 const repayMargin = (debt: bigint) => debt / 10_000n + 1n;
 
-export class AaveV4Adapter implements LendingAdapter {
+export class AaveV4Adapter implements LendingAdapter, SupplyAdapter {
   readonly id: string;
   readonly chain: string;
   readonly protocol = AAVE_V4_PROTOCOL;
@@ -188,6 +227,8 @@ export class AaveV4Adapter implements LendingAdapter {
   private readonly policy: TxGuardPolicy;
   private readonly now: () => number;
   private readonly resolved = new Map<string, ResolvedPair>();
+  private readonly supplies: SupplyEntry[];
+  private readonly resolvedSupply = new Map<string, ResolvedSupply>();
   private readonly statuses = new Map<string, PairStatus>();
   private readonly warned = new Set<string>();
   private claimCache?: { atMs: number; items: LoopPositionView["rewardsUnclaimed"] };
@@ -217,6 +258,23 @@ export class AaveV4Adapter implements LendingAdapter {
         tokens.push(getAddress(a.address));
       }
     }
+    const loopTokens = new Set(tokens.map(lc));
+    const mids = new Set<string>();
+    this.supplies = (o.supply ?? []).map((sc) => {
+      const a = sc.asset;
+      if (a.chain !== s.chain) throw new Error(`AaveV4Adapter supply ${a.symbol}: asset is on ${a.chain}, adapter on ${s.chain}`);
+      if (!isAddress(a.address)) throw new Error(`AaveV4Adapter supply ${a.symbol}: invalid address`);
+      if (loopTokens.has(lc(a.address)))
+        throw new Error(
+          `AaveV4Adapter supply ${a.symbol}: the asset is also used by a loop pair on spoke ${this.spoke} (shared spoke account => one reserve position, collateral flag and HF); use a separate wallet / adapter for plain deposits`
+        );
+      const marketId = aaveV4SupplyMarketId(this.spoke, sc);
+      if (mids.has(marketId)) throw new Error(`AaveV4Adapter: duplicate supply marketId ${marketId}`);
+      mids.add(marketId);
+      return { cfg: sc, marketId, token: getAddress(a.address) };
+    });
+    for (const x of this.supplies) if (this.supplies.filter((y) => sameAddr(y.token, x.token)).length > 1) throw new Error(`AaveV4Adapter: duplicate supply asset ${x.cfg.asset.symbol}`);
+    tokens.push(...this.supplies.map((x) => x.token));
     if (o.swapper && o.swapper.chain !== s.chain) throw new Error(`AaveV4Adapter: swapper is on ${o.swapper.chain}, adapter on ${s.chain}`);
     this.policy = {
       chainId: o.env.viemChain.id,
@@ -384,8 +442,8 @@ export class AaveV4Adapter implements LendingAdapter {
   }
 
   /** One consistent on-chain snapshot of a pair (both reserves + our account), pinned to the latest block. */
-  async snapshot(pairOrId: string | ResolvedPair): Promise<PairSnapshot> {
-    const rp = typeof pairOrId === "string" ? await this.resolvePair(this.pairCfg(pairOrId)) : pairOrId;
+  /** Latest block (all reads of one snapshot are pinned to it) + the spoke's oracle at that block. */
+  private async pinnedBlock(): Promise<{ bn: bigint; timestampMs: number; oracle: Address }> {
     const block = await this.env.publicClient.getBlock({ blockTag: "latest" });
     const bn = block.number as bigint;
     const timestampMs = Number(block.timestamp) * 1000;
@@ -393,6 +451,12 @@ export class AaveV4Adapter implements LendingAdapter {
     if (this.now() - timestampMs > maxStale)
       this.log("warn", `${this.id}: RPC latest block ${bn} is ${Math.round((this.now() - timestampMs) / 1000)}s old`);
     const oracle = getAddress(await this.read<Address>(this.spoke, SPOKE_ABI as Abi, "ORACLE", [], bn));
+    return { bn, timestampMs, oracle };
+  }
+
+  async snapshot(pairOrId: string | ResolvedPair): Promise<PairSnapshot> {
+    const rp = typeof pairOrId === "string" ? await this.resolvePair(this.pairCfg(pairOrId)) : pairOrId;
+    const { bn, timestampMs, oracle } = await this.pinnedBlock();
     const coll = await this.readReserve(rp.cfg.collateral, rp.collId, oracle, bn);
     const debt = rp.same ? coll : await this.readReserve(rp.cfg.debt, rp.debtId, oracle, bn);
     const me = this.env.account;
@@ -468,12 +532,17 @@ export class AaveV4Adapter implements LendingAdapter {
   private async rewardsFor(rp: ResolvedPair, side: "supply" | "borrow", api: Map<string, Reserve> | null): Promise<RewardRate[]> {
     const asset = side === "supply" ? rp.cfg.collateral : rp.cfg.debt;
     const reserveId = side === "supply" ? rp.collId : rp.debtId;
+    return this.rewardsOf(asset, reserveId, side, `${this.spoke}:${reserveId}`, api, rp.cfg.pairId);
+  }
+
+  /** extraRewards (Merkl provider) + AaveKit reserve rewards (per `apiMerklRewards`; never both by default). */
+  private async rewardsOf(asset: AssetRef, reserveId: bigint, side: "supply" | "borrow", marketId: string, api: Map<string, Reserve> | null, label: string): Promise<RewardRate[]> {
     const out: RewardRate[] = [];
     if (this.o.extraRewards) {
       try {
-        out.push(...(await this.o.extraRewards({ protocol: AAVE_V4_PROTOCOL, chain: this.chain, asset, side, marketId: `${this.spoke}:${reserveId}` })));
+        out.push(...(await this.o.extraRewards({ protocol: AAVE_V4_PROTOCOL, chain: this.chain, asset, side, marketId })));
       } catch (e) {
-        this.log("warn", `${this.id} ${rp.cfg.pairId}: extraRewards(${side}) failed: ${errMsg(e)}`);
+        this.log("warn", `${this.id} ${label}: extraRewards(${side}) failed: ${errMsg(e)}`);
       }
     }
     const mode = this.o.apiMerklRewards ?? "auto";
@@ -482,7 +551,7 @@ export class AaveV4Adapter implements LendingAdapter {
     if (useApi && res) {
       const m = rewardsFromApiReserve(res, side, this.now());
       out.push(...m.rewards);
-      for (const s of m.skipped) this.warnOnce(`rw:${s.id}`, `${rp.cfg.pairId}: AaveKit reward ${s.id} not counted: ${s.reason}`);
+      for (const s of m.skipped) this.warnOnce(`rw:${s.id}`, `${label}: AaveKit reward ${s.id} not counted: ${s.reason}`);
     }
     return out;
   }
@@ -652,21 +721,27 @@ export class AaveV4Adapter implements LendingAdapter {
       : call(SPOKE_ABI as Abi, c.fn, [c.reserveId, c.amount, me]);
   }
 
-  private describe(c: SpokeCallSpec, rp: ResolvedPair): string {
-    const a = c.reserveId === rp.collId ? rp.cfg.collateral : rp.cfg.debt;
+  private scope(x: ResolvedPair | CallScope): CallScope {
+    if (!("cfg" in x)) return x;
+    return { label: x.cfg.pairId, assetOf: (id) => (id === x.collId ? x.cfg.collateral : x.cfg.debt) };
+  }
+
+  private describe(c: SpokeCallSpec, sc: CallScope): string {
+    const a = sc.assetOf(c.reserveId);
     if (c.fn === "setUsingAsCollateral") return `setUsingAsCollateral(${a.symbol}, ${c.enabled})`;
     const amt = c.amount === MAX_UINT256 ? "max" : formatUnits(c.amount, a.decimals);
     return `${c.fn} ${amt} ${a.symbol}`;
   }
 
   /** Spoke call(s) for one step: one multicall (atomic) unless disabled. Every request is guard-checked. */
-  private async spokeReqs(calls: SpokeCallSpec[], rp: ResolvedPair): Promise<TxRequest[]> {
-    for (const c of calls) await this.crossCheck(c, rp);
+  private async spokeReqs(calls: SpokeCallSpec[], target: ResolvedPair | CallScope): Promise<TxRequest[]> {
+    const sc = this.scope(target);
+    for (const c of calls) await this.crossCheck(c, sc);
     const batch = (this.o.useSpokeMulticall ?? true) && calls.length > 1;
     const groups = batch ? [calls] : calls.map((c) => [c]);
     return groups.map((g) => {
       const data = g.length === 1 ? this.encodeSpokeCall(g[0]!) : call(SPOKE_ABI as Abi, "multicall", [g.map((c) => this.encodeSpokeCall(c))]);
-      const req: TxRequest = { to: this.spoke, data, description: `${this.id} ${rp.cfg.pairId}: ${g.map((c) => this.describe(c, rp)).join(" + ")}` };
+      const req: TxRequest = { to: this.spoke, data, description: `${this.id} ${sc.label}: ${g.map((c) => this.describe(c, sc)).join(" + ")}` };
       assertTx(req, { kind: "spoke", spoke: this.spoke, calls: g }, this.policy);
       return req;
     });
@@ -688,7 +763,7 @@ export class AaveV4Adapter implements LendingAdapter {
    * AaveKit cross-check (opt-in): AaveKit's plan for the same action must
    * decode to exactly this spoke call. The plan is NEVER sent.
    */
-  private async crossCheck(c: SpokeCallSpec, rp: ResolvedPair): Promise<void> {
+  private async crossCheck(c: SpokeCallSpec, sc: CallScope): Promise<void> {
     if (!this.o.apiCrossCheck) return;
     if (c.fn === "setUsingAsCollateral") return; // AaveKit builds it from a list of changes; not compared (see VERIFY_LIVE)
     if (c.fn === "withdraw" && c.amount === MAX_UINT256) return; // AaveKit "max" encoding is not specified
@@ -696,7 +771,7 @@ export class AaveV4Adapter implements LendingAdapter {
     const map = await this.apiReserves();
     const res = map?.get(String(c.reserveId));
     if (!res) throw new Error(`${this.id}: apiCrossCheck: AaveKit has no reserve ${c.reserveId}`);
-    const asset = c.reserveId === rp.collId ? rp.cfg.collateral : rp.cfg.debt;
+    const asset = sc.assetOf(c.reserveId);
     const value = bigDecimal(formatUnits(c.amount, asset.decimals));
     const sender = evmAddress(this.env.account);
     let plan: ExecutionPlan;
@@ -920,8 +995,7 @@ export class AaveV4Adapter implements LendingAdapter {
   private async recover(ctx: LiveContext, rp: ResolvedPair, anchor: { coll: bigint; debt: bigint }, cause: unknown, txs: TxRecord[]): Promise<string> {
     const cfg = rp.cfg;
     const notes: string[] = [];
-    const mark = (u: BroadcastUnconfirmedError) =>
-      txs.push({ chain: this.chain, id: u.id, description: u.description, simulated: false, unconfirmed: true, ...(u.nonce !== undefined ? { nonce: u.nonce } : {}) });
+    const mark = (u: BroadcastUnconfirmedError) => this.markUnconfirmed(txs, u);
     const observe = async () => {
       const s = await this.snapshot(rp);
       const c = await erc20Balance(this.env, rp.collToken);
@@ -987,9 +1061,13 @@ export class AaveV4Adapter implements LendingAdapter {
 
   /** Reset any non-zero allowance of the pair tokens to the spoke (live only). */
   private async resetAllowances(ctx: LiveContext, rp: ResolvedPair, txs: TxRecord[]): Promise<void> {
-    if (ctx.dryRun) return;
     const tokens: [Address, string][] = [[rp.collToken, rp.cfg.collateral.symbol]];
     if (!rp.same) tokens.push([rp.debtToken, rp.cfg.debt.symbol]);
+    await this.resetTokenAllowances(ctx, tokens, txs);
+  }
+
+  private async resetTokenAllowances(ctx: LiveContext, tokens: [Address, string][], txs: TxRecord[]): Promise<void> {
+    if (ctx.dryRun) return;
     for (const [token, symbol] of tokens) {
       const cur = await this.read<bigint>(token, erc20Abi as Abi, "allowance", [this.env.account, this.spoke]);
       if (cur === 0n) continue;
@@ -1149,6 +1227,210 @@ export class AaveV4Adapter implements LendingAdapter {
   }
 
   // =========================================================================
+  // supply-only (SupplyAdapter): plain deposits, no borrow, collateral NOT enabled
+  // =========================================================================
+
+  private markUnconfirmed(txs: TxRecord[], u: BroadcastUnconfirmedError): void {
+    txs.push({ chain: this.chain, id: u.id, description: u.description, simulated: false, unconfirmed: true, ...(u.nonce !== undefined ? { nonce: u.nonce } : {}) });
+  }
+
+  private async verifyReserve(label: string, asset: AssetRef, id: bigint, add: (m: string) => void): Promise<void> {
+    const S = SPOKE_ABI as Abi;
+    const res = await this.read<SpokeReserveStruct>(this.spoke, S, "getReserve", [id]);
+    if (!sameAddr(res.underlying, asset.address)) add(`${label}: reserve ${id} underlying ${res.underlying} != ${asset.symbol} ${asset.address}`);
+    if (Number(res.decimals) !== asset.decimals) add(`${label}: reserve ${id} decimals ${res.decimals} != ${asset.decimals}`);
+    if (!this.hubs.some((h) => sameAddr(h, res.hub))) add(`${label}: reserve ${id} is on hub ${res.hub}, not a configured hub`);
+    const [u, d] = await this.read<readonly [Address, number]>(getAddress(res.hub), HUB_ABI as Abi, "getAssetUnderlyingAndDecimals", [BigInt(res.assetId)]);
+    if (!sameAddr(u, asset.address) || Number(d) !== asset.decimals) add(`${label}: hub asset ${res.assetId} is ${u}/${d}, expected ${asset.address}/${asset.decimals}`);
+    const back = await this.read<bigint>(this.spoke, S, "getReserveId", [getAddress(res.hub), BigInt(res.assetId)]);
+    if (back !== id) add(`${label}: spoke.getReserveId(hub, ${res.assetId}) = ${back} != configured reserve ${id}`);
+  }
+
+  /** Configured supply market ids (stable, computable from config: see AaveV4SupplyConfig.marketId). */
+  supplyMarketIds(): string[] {
+    return this.supplies.map((x) => x.marketId);
+  }
+
+  private async resolveSupply(marketId: string): Promise<ResolvedSupply> {
+    const hit = this.resolvedSupply.get(marketId);
+    if (hit) return hit;
+    const e = this.supplies.find((x) => x.marketId === marketId);
+    if (!e) throw new Error(`${this.id}: unknown supply market ${marketId}`);
+    const reserveId = e.cfg.reserveId !== undefined ? BigInt(e.cfg.reserveId) : await this.discoverReserveId(e.cfg.asset);
+    const r: ResolvedSupply = { ...e, reserveId };
+    this.resolvedSupply.set(marketId, r);
+    return r;
+  }
+
+  private supplyScope(rs: ResolvedSupply): CallScope {
+    return { label: rs.marketId, assetOf: () => rs.cfg.asset };
+  }
+
+  /** Block-pinned on-chain snapshot of one supply market + my deposit. */
+  async supplySnapshot(marketId: string): Promise<SupplySnapshot> {
+    const rs = await this.resolveSupply(marketId);
+    const { bn, timestampMs, oracle } = await this.pinnedBlock();
+    const reserve = await this.readReserve(rs.cfg.asset, rs.reserveId, oracle, bn);
+    const S = SPOKE_ABI as Abi;
+    const [units, status] = (await this.readAll(
+      [
+        { address: this.spoke, abi: S, functionName: "getUserSuppliedAssets", args: [rs.reserveId, this.env.account] },
+        { address: this.spoke, abi: S, functionName: "getUserReserveStatus", args: [rs.reserveId, this.env.account] },
+      ],
+      bn
+    )) as [bigint, readonly [boolean, boolean]];
+    return { blockNumber: bn, timestampMs, reserve, units, usingAsCollateral: status[0] };
+  }
+
+  async supplyMarkets(): Promise<SupplyMarket[]> {
+    if (!this.supplies.length) return [];
+    const api = await this.apiReserves();
+    const out: SupplyMarket[] = [];
+    for (const e of this.supplies) {
+      try {
+        const rs = await this.resolveSupply(e.marketId);
+        const s = await this.supplySnapshot(e.marketId);
+        const rewards = await this.rewardsOf(e.cfg.asset, rs.reserveId, "supply", e.marketId, api, e.marketId);
+        if (s.usingAsCollateral) this.warnOnce(`supcoll:${e.marketId}`, `${e.marketId}: our supply is enabled as collateral; the next deposit() disables it`);
+        out.push(mapSupplyMarket({ protocol: AAVE_V4_PROTOCOL, chain: this.chain, marketId: e.marketId, r: s.reserve, rewards, myUnits: s.units, dataAsOfMs: s.timestampMs }));
+      } catch (err) {
+        this.log("warn", `${this.id} ${e.marketId}: supplyMarkets() failed: ${errMsg(err)}`);
+      }
+    }
+    return out;
+  }
+
+  async supplyPosition(marketId: string): Promise<SupplyPositionView | null> {
+    const s = await this.supplySnapshot(marketId);
+    if (s.units === 0n) return null;
+    return {
+      marketId,
+      depositUsd: toHuman(s.units, s.reserve.decimals) * s.reserve.priceUsd,
+      units: s.units,
+      rewardsUnclaimed: await this.nonMerklClaimables(),
+      asOfMs: s.timestampMs,
+    };
+  }
+
+  /**
+   * After a failed LIVE supply-side tx: re-read (never assume it did not
+   * land). Unconfirmed -> nothing more is sent, the observed state is
+   * reported. Otherwise a leftover allowance (approve landed, supply failed)
+   * is reset to 0. Supply / withdraw are single atomic spoke calls, so there
+   * are no stray funds to put back.
+   */
+  private async recoverSupply(ctx: LiveContext, rs: ResolvedSupply, cause: unknown, txs: TxRecord[]): Promise<string> {
+    const a = rs.cfg.asset;
+    const show = async () => {
+      const s = await this.supplySnapshot(rs.marketId);
+      const w = await erc20Balance(this.env, rs.token);
+      return `observed: deposit ${formatUnits(s.units, a.decimals)} ${a.symbol}, wallet ${formatUnits(w, a.decimals)} ${a.symbol}`;
+    };
+    let seen: string;
+    try {
+      seen = await show();
+    } catch (e) {
+      return `state re-read failed (${errMsg(e)}); no recovery attempted`;
+    }
+    if (isUnconfirmed(cause)) {
+      this.markUnconfirmed(txs, cause);
+      return `tx ${cause.id} (nonce ${cause.nonce ?? "?"}) unconfirmed and may still land: no further txs sent; ${seen}`;
+    }
+    try {
+      await this.resetTokenAllowances(ctx, [[rs.token, a.symbol]], txs);
+    } catch (e) {
+      if (isUnconfirmed(e)) this.markUnconfirmed(txs, e);
+      return `allowance reset failed: ${errMsg(e)}; ${seen}`;
+    }
+    return seen;
+  }
+
+  async deposit(marketId: string, amount: bigint, ctx: LiveContext): Promise<LiveResult> {
+    const txs: TxRecord[] = [];
+    try {
+      const rs = await this.resolveSupply(marketId);
+      const a = rs.cfg.asset;
+      if (!(amount > 0n)) return { ok: false, txs, detail: `${this.id} ${marketId}: amount must be > 0` };
+      const s = await this.supplySnapshot(marketId);
+      const blocked = depositBlockers(s.reserve);
+      if (blocked.length) return { ok: false, txs, detail: `${this.id} ${marketId}: deposits blocked: ${blocked.join("; ")}` };
+      const room = capRemaining(s.reserve.addCap, a.decimals, s.reserve.spokeAdded);
+      if (room !== null && amount > room) return { ok: false, txs, detail: `${this.id} ${marketId}: supply cap room ${formatUnits(room, a.decimals)} ${a.symbol} < ${formatUnits(amount, a.decimals)}` };
+      const bal = await erc20Balance(this.env, rs.token);
+      if (bal < amount) return { ok: false, txs, detail: `${this.id} ${marketId}: wallet has ${formatUnits(bal, a.decimals)} ${a.symbol}, need ${formatUnits(amount, a.decimals)}` };
+      const calls: SpokeCallSpec[] = [{ fn: "supply", reserveId: rs.reserveId, amount }];
+      // plain deposit: never collateral (the spoke leaves the flag unchanged on supply)
+      if (s.usingAsCollateral) calls.push({ fn: "setUsingAsCollateral", reserveId: rs.reserveId, enabled: false });
+      const group = [...(await this.approveReqs(rs.token, a.symbol, amount)), ...(await this.spokeReqs(calls, this.supplyScope(rs)))];
+      const amountUsd = toHuman(amount, a.decimals) * s.reserve.priceUsd;
+      if (ctx.dryRun) {
+        txs.push(...(await this.exec(ctx, group)));
+        return { ok: true, txs, amountUsd, detail: `${this.id} ${marketId}: [dry-run] deposit ${formatUnits(amount, a.decimals)} ${a.symbol} simulated` };
+      }
+      try {
+        txs.push(...(await this.exec(ctx, group)));
+      } catch (e) {
+        return { ok: false, txs, detail: `${this.id} ${marketId}: deposit failed: ${errMsg(e)}; ${await this.recoverSupply(ctx, rs, e, txs)}` };
+      }
+      await this.resetTokenAllowances(ctx, [[rs.token, a.symbol]], txs);
+      return { ok: true, txs, amountUsd, detail: `${this.id} ${marketId}: deposited ${formatUnits(amount, a.decimals)} ${a.symbol}` };
+    } catch (e) {
+      return { ok: false, txs, detail: `${this.id} ${marketId}: ${errMsg(e)}` };
+    }
+  }
+
+  /** Withdraw `fraction` of my deposit; 1 = everything via amount = uint256.max (Spoke.withdraw caps at the balance: no dust). */
+  async withdraw(marketId: string, fraction: number, ctx: LiveContext): Promise<LiveResult> {
+    const txs: TxRecord[] = [];
+    try {
+      if (!(fraction > 0 && fraction <= 1)) return { ok: false, txs, detail: `${this.id} ${marketId}: fraction out of range ${fraction}` };
+      const rs = await this.resolveSupply(marketId);
+      const a = rs.cfg.asset;
+      const s = await this.supplySnapshot(marketId);
+      if (s.units === 0n) return { ok: true, txs, detail: `${this.id} ${marketId}: no deposit` };
+      const r = s.reserve;
+      if (r.paused || !r.spokeActive || r.spokeHalted) return { ok: false, txs, detail: `${this.id} ${marketId}: withdraw blocked (paused / spoke inactive or halted)` };
+      const amount = fraction >= 1 ? MAX_UINT256 : (s.units * BigInt(Math.floor(fraction * 1_000_000))) / 1_000_000n;
+      if (amount === 0n) return { ok: false, txs, detail: `${this.id} ${marketId}: fraction ${fraction} rounds to 0` };
+      const reqs = await this.spokeReqs([{ fn: "withdraw", reserveId: rs.reserveId, amount }], this.supplyScope(rs));
+      if (ctx.dryRun) {
+        txs.push(...(await this.exec(ctx, reqs)));
+        return { ok: true, txs, detail: `${this.id} ${marketId}: [dry-run] withdraw ${fraction >= 1 ? "max" : formatUnits(amount, a.decimals)} ${a.symbol} simulated` };
+      }
+      const before = await erc20Balance(this.env, rs.token);
+      try {
+        txs.push(...(await this.exec(ctx, reqs)));
+      } catch (e) {
+        return { ok: false, txs, detail: `${this.id} ${marketId}: withdraw failed: ${errMsg(e)}; ${await this.recoverSupply(ctx, rs, e, txs)}` };
+      }
+      const after = await erc20Balance(this.env, rs.token);
+      const got = after > before ? after - before : 0n;
+      return { ok: true, txs, amountUsd: toHuman(got, a.decimals) * r.priceUsd, detail: `${this.id} ${marketId}: withdrew ${formatUnits(got, a.decimals)} ${a.symbol}` };
+    } catch (e) {
+      return { ok: false, txs, detail: `${this.id} ${marketId}: ${errMsg(e)}` };
+    }
+  }
+
+  /**
+   * eth_call of a full withdraw (uint256.max) from our account. true = it
+   * would succeed (or there is nothing to withdraw); false = it reverts;
+   * RPC / transport errors THROW (unknown is not a failure).
+   */
+  async simulateWithdraw(marketId: string, _ctx: LiveContext): Promise<boolean> {
+    const rs = await this.resolveSupply(marketId);
+    const units = await this.read<bigint>(this.spoke, SPOKE_ABI as Abi, "getUserSuppliedAssets", [rs.reserveId, this.env.account]);
+    if (units === 0n) return true;
+    const [req] = await this.spokeReqs([{ fn: "withdraw", reserveId: rs.reserveId, amount: MAX_UINT256 }], this.supplyScope(rs));
+    try {
+      await this.env.publicClient.call({ account: this.env.account, to: req!.to, data: req!.data });
+      return true;
+    } catch (e) {
+      if (isRevertError(e)) return false;
+      throw e;
+    }
+  }
+
+  // =========================================================================
   // rewards
   // =========================================================================
 
@@ -1296,23 +1578,26 @@ export class AaveV4Adapter implements LendingAdapter {
       }
       try {
         const rp = await this.resolvePair(cfg);
-        for (const [asset, id] of [
-          [cfg.collateral, rp.collId],
-          [cfg.debt, rp.debtId],
-        ] as const) {
-          const res = await this.read<SpokeReserveStruct>(this.spoke, S, "getReserve", [id]);
-          if (!sameAddr(res.underlying, asset.address)) add(`${cfg.pairId}: reserve ${id} underlying ${res.underlying} != ${asset.symbol} ${asset.address}`);
-          if (Number(res.decimals) !== asset.decimals) add(`${cfg.pairId}: reserve ${id} decimals ${res.decimals} != ${asset.decimals}`);
-          if (!this.hubs.some((h) => sameAddr(h, res.hub))) add(`${cfg.pairId}: reserve ${id} is on hub ${res.hub}, not a configured hub`);
-          const [u, d] = await this.read<readonly [Address, number]>(getAddress(res.hub), HUB_ABI as Abi, "getAssetUnderlyingAndDecimals", [BigInt(res.assetId)]);
-          if (!sameAddr(u, asset.address) || Number(d) !== asset.decimals) add(`${cfg.pairId}: hub asset ${res.assetId} is ${u}/${d}, expected ${asset.address}/${asset.decimals}`);
-          const back = await this.read<bigint>(this.spoke, S, "getReserveId", [getAddress(res.hub), BigInt(res.assetId)]);
-          if (back !== id) add(`${cfg.pairId}: spoke.getReserveId(hub, ${res.assetId}) = ${back} != configured reserve ${id}`);
-        }
+        await this.verifyReserve(cfg.pairId, cfg.collateral, rp.collId, add);
+        if (!rp.same) await this.verifyReserve(cfg.pairId, cfg.debt, rp.debtId, add);
         const st = await this.pairStatus(cfg.pairId);
         if (!st.canOpen) add(`market ${cfg.pairId}: cannot open now: ${st.reasons.join("; ")}`);
       } catch (e) {
         add(`${cfg.pairId}: ${errMsg(e)}`);
+      }
+    }
+    // supply-only markets
+    for (const e of this.supplies) {
+      try {
+        for (const m of await verifyAsset(this.env, e.cfg.asset)) add(`${e.marketId}: ${m}`);
+        const rs = await this.resolveSupply(e.marketId);
+        await this.verifyReserve(e.marketId, e.cfg.asset, rs.reserveId, add);
+        const snap = await this.supplySnapshot(e.marketId);
+        const bl = depositBlockers(snap.reserve);
+        if (bl.length) add(`supply market ${e.marketId}: deposits blocked now: ${bl.join("; ")}`);
+        if (snap.usingAsCollateral) add(`supply market ${e.marketId}: our supply is enabled as collateral (deposit() disables it)`);
+      } catch (err) {
+        add(`${e.marketId}: ${errMsg(err)}`);
       }
     }
     // allowlisted targets
@@ -1345,13 +1630,17 @@ export class AaveV4Adapter implements LendingAdapter {
           filter: ReservesRequestFilter.All,
         });
         const byId = new Map(map.map((r) => [String(r.onChainId), r]));
+        const checks: [AssetRef, bigint][] = [];
         for (const cfg of this.pairs) {
           const rp = this.resolved.get(cfg.pairId);
-          if (!rp) continue;
-          for (const [asset, id] of [
-            [cfg.collateral, rp.collId],
-            [cfg.debt, rp.debtId],
-          ] as const) {
+          if (rp) checks.push([cfg.collateral, rp.collId], [cfg.debt, rp.debtId]);
+        }
+        for (const e of this.supplies) {
+          const rs = this.resolvedSupply.get(e.marketId);
+          if (rs) checks.push([e.cfg.asset, rs.reserveId]);
+        }
+        {
+          for (const [asset, id] of checks) {
             const r = byId.get(String(id));
             if (!r) add(`AaveKit: no reserve ${id} (${asset.symbol}) on this spoke`);
             else {

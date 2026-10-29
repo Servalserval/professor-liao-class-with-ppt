@@ -6,7 +6,7 @@
  * withdraw require HF >= 1 (HF = CF * collateral / debt), withdraw/repay cap
  * at the balance / debt, multicall applies inner calls atomically.
  */
-import { decodeFunctionData, erc20Abi, getAddress, keccak256, pad, toFunctionSelector, type Abi, type AbiFunction, type Address, type Chain, type Hex } from "viem";
+import { decodeFunctionData, erc20Abi, ExecutionRevertedError, getAddress, keccak256, pad, toFunctionSelector, type Abi, type AbiFunction, type Address, type Chain, type Hex } from "viem";
 import type { AssetRef, LiveContext, SwapAdapter, SwapQuote } from "@incentive-router/live-common";
 import { Mutex, type EvmEnv, type PublicClient, type WalletClient } from "@incentive-router/live-evm-base";
 import { SPOKE_ABI, SPOKE_WRITE_FUNCTIONS } from "../src/abi.js";
@@ -35,6 +35,9 @@ interface State {
   debt: bigint;
   usingAsCollateral: boolean;
   lastRiskPremium: bigint;
+  /** Plain USDt deposit on reserve 2 (supply-only side) and its collateral flag. */
+  usdtSupplied: bigint;
+  usdtCollateral: boolean;
 }
 
 const lc = (a: string) => a.toLowerCase();
@@ -45,6 +48,11 @@ export class FakeV4 {
   collateralRiskBps = 2500;
   debtBorrowable = true;
   collPaused = false;
+  usdtPaused = false;
+  usdtFrozen = false;
+  usdtAddCap = 50_000_000;
+  /** eth_call fails with a transport error (not a revert). */
+  rpcDown = false;
   drawnRateUsdt = 4n * 10n ** 25n; // 4% RAY
   drawnRateUsde = 1n * 10n ** 25n;
   priceUsde = 100_000_000n; // $1 (8 dec)
@@ -71,7 +79,7 @@ export class FakeV4 {
   /** Highest LTV after any borrow / withdraw; lowest HF after any withdraw while in debt. */
   maxLtvSeen = 0;
   minHfAfterWithdraw = Infinity;
-  state: State = { wallet: { [lc(USDE)]: 10_000n * E18, [lc(USDT)]: 0n }, allowance: { [lc(USDE)]: 0n, [lc(USDT)]: 0n }, supplied: 0n, debt: 0n, usingAsCollateral: false, lastRiskPremium: 0n };
+  state: State = { wallet: { [lc(USDE)]: 10_000n * E18, [lc(USDT)]: 0n }, allowance: { [lc(USDE)]: 0n, [lc(USDT)]: 0n }, supplied: 0n, debt: 0n, usingAsCollateral: false, lastRiskPremium: 0n, usdtSupplied: 0n, usdtCollateral: false };
 
   private collUsd(s: State) {
     return (Number(s.supplied) / 1e18) * (Number(this.priceUsde) / 1e8);
@@ -97,18 +105,21 @@ export class FakeV4 {
         return;
       case "supply": {
         const [id, amt, who] = d.args as [bigint, bigint, Address];
-        if (lc(who) !== lc(ME) || id !== COLL_ID) throw new Error("Unauthorized/unsupported supply");
-        if (this.collPaused) throw new Error("ReservePaused");
+        if (lc(who) !== lc(ME)) throw new Error("Unauthorized");
+        if (id === COLL_ID ? this.collPaused : this.usdtPaused) throw new Error("ReservePaused");
+        if (id === DEBT_ID && this.usdtFrozen) throw new Error("ReserveFrozen");
         const t = tok(id);
         if (s.allowance[t]! < amt) throw new Error("ERC20InsufficientAllowance");
         if (s.wallet[t]! < amt) throw new Error("ERC20InsufficientBalance");
         s.allowance[t]! -= amt;
         s.wallet[t]! -= amt;
-        s.supplied += amt;
+        if (id === COLL_ID) s.supplied += amt;
+        else s.usdtSupplied += amt;
         return;
       }
       case "setUsingAsCollateral":
-        s.usingAsCollateral = d.args[1] as boolean;
+        if ((d.args[0] as bigint) === COLL_ID) s.usingAsCollateral = d.args[1] as boolean;
+        else s.usdtCollateral = d.args[1] as boolean;
         return;
       case "borrow": {
         const [id, amt] = d.args as [bigint, bigint];
@@ -122,7 +133,15 @@ export class FakeV4 {
       }
       case "withdraw": {
         const [id, amt] = d.args as [bigint, bigint];
-        if (id !== COLL_ID) throw new Error("unsupported withdraw");
+        if (id === DEBT_ID) {
+          if (this.usdtPaused) throw new Error("ReservePaused");
+          const w = amt < s.usdtSupplied ? amt : s.usdtSupplied;
+          if (w === 0n) throw new Error("InvalidAmount");
+          if (w > 3_500_000n * E6 - s.debt + s.usdtSupplied) throw new Error("InsufficientLiquidity");
+          s.usdtSupplied -= w;
+          s.wallet[lc(USDT)]! += w;
+          return;
+        }
         const w = amt < s.supplied ? amt : s.supplied;
         s.supplied -= w;
         s.wallet[lc(USDE)]! += w;
@@ -179,19 +198,19 @@ export class FakeV4 {
         case "getReserveConfig":
           return id === COLL_ID
             ? { collateralRisk: this.collateralRiskBps, paused: this.collPaused, frozen: false, borrowable: false, receiveSharesEnabled: true }
-            : { collateralRisk: 0, paused: false, frozen: false, borrowable: this.debtBorrowable, receiveSharesEnabled: true };
+            : { collateralRisk: 0, paused: this.usdtPaused, frozen: this.usdtFrozen, borrowable: this.debtBorrowable, receiveSharesEnabled: true };
         case "getDynamicReserveConfig":
           return id === COLL_ID ? { collateralFactor: this.cfBps, maxLiquidationBonus: 10_300, liquidationFee: 1000 } : { collateralFactor: 0, maxLiquidationBonus: 10_000, liquidationFee: 0 };
         case "getReserveSuppliedAssets":
-          return id === COLL_ID ? 20_000_000n * E18 + s.supplied : 0n;
+          return id === COLL_ID ? 20_000_000n * E18 + s.supplied : 1_000_000n * E6 + s.usdtSupplied;
         case "getReserveDebt":
           return id === COLL_ID ? [0n, 0n] : [2_000_000n * E6 + s.debt, 0n];
         case "getUserSuppliedAssets":
-          return id === COLL_ID ? s.supplied : 0n;
+          return id === COLL_ID ? s.supplied : s.usdtSupplied;
         case "getUserTotalDebt":
           return id === DEBT_ID ? s.debt : 0n;
         case "getUserReserveStatus":
-          return id === COLL_ID ? [s.usingAsCollateral, false] : [false, s.debt > 0n];
+          return id === COLL_ID ? [s.usingAsCollateral, false] : [s.usdtCollateral, s.debt > 0n];
         case "getUserPosition":
           return { drawnShares: 0n, premiumShares: 0n, premiumOffsetRay: 0n, suppliedShares: id === COLL_ID ? s.supplied : 0n, dynamicConfigKey: 1 };
         case "getUserAccountData": {
@@ -236,19 +255,19 @@ export class FakeV4 {
         case "getAsset":
           return usde
             ? { liquidity: 5_000_000n * E18, swept: 0n, liquidityFee: 1000, irStrategy: IRM, underlying: USDE, decimals: 18 }
-            : { liquidity: 3_500_000n * E6 - s.debt, swept: 0n, liquidityFee: 1000, irStrategy: IRM, underlying: USDT, decimals: 6 };
+            : { liquidity: 3_500_000n * E6 - s.debt + s.usdtSupplied, swept: 0n, liquidityFee: 1000, irStrategy: IRM, underlying: USDT, decimals: 6 };
         case "getAssetDrawnRate":
           return usde ? this.drawnRateUsde : this.drawnRateUsdt;
         case "getAssetOwed":
           return usde ? [1_000_000n * E18, 0n] : [10_000_000n * E6 + s.debt, 50_000n * E6];
         case "getAddedAssets":
-          return usde ? 50_000_000n * E18 + s.supplied : 13_550_000n * E6;
+          return usde ? 50_000_000n * E18 + s.supplied : 13_550_000n * E6 + s.usdtSupplied;
         case "getSpoke":
           return usde
             ? { drawnShares: 0n, premiumShares: 0n, premiumOffsetRay: 0n, addedShares: 0n, addCap: Number(MAX_SPOKE_CAP), drawCap: 0, riskPremiumThreshold: 0, active: true, halted: false, deficitRay: 0n }
-            : { drawnShares: 0n, premiumShares: 0n, premiumOffsetRay: 0n, addedShares: 0n, addCap: 0, drawCap: 12_000_000, riskPremiumThreshold: 0, active: true, halted: false, deficitRay: 0n };
+            : { drawnShares: 0n, premiumShares: 0n, premiumOffsetRay: 0n, addedShares: 0n, addCap: this.usdtAddCap, drawCap: 12_000_000, riskPremiumThreshold: 0, active: true, halted: false, deficitRay: 0n };
         case "getSpokeAddedAssets":
-          return usde ? 20_000_000n * E18 + s.supplied : 0n;
+          return usde ? 20_000_000n * E18 + s.supplied : 1_000_000n * E6 + s.usdtSupplied;
         case "getSpokeOwed":
           return usde ? [0n, 0n] : [2_000_000n * E6 + s.debt, 0n];
       }
@@ -278,7 +297,12 @@ export class FakeV4 {
     multicall: async (p: { contracts: { address: Address; functionName: string; args?: readonly unknown[] }[] }) =>
       p.contracts.map((c) => this.read(c.address, c.functionName, c.args)),
     call: async (p: { to: Address; data: Hex }) => {
-      this.apply(clone(this.state), p.to, p.data, false);
+      if (this.rpcDown) throw new Error("fetch failed (ECONNREFUSED)");
+      try {
+        this.apply(clone(this.state), p.to, p.data, false);
+      } catch (e) {
+        throw new ExecutionRevertedError({ message: (e as Error).message });
+      }
       return { data: "0x" };
     },
     estimateGas: async () => 100_000n,

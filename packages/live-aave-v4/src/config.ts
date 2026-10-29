@@ -62,6 +62,24 @@ export interface AaveV4PairConfig {
   minBorrowUsd?: number;
 }
 
+/**
+ * A plain-deposit (supply-only) market on the same spoke: supply, never
+ * borrow, collateral NOT enabled. The asset must not be used by a loop pair of
+ * this adapter (same spoke account => same reserve position); use a separate
+ * wallet if you want both.
+ */
+export interface AaveV4SupplyConfig {
+  asset: AssetRef;
+  /**
+   * Stable market id. Default: `<spoke checksummed>:<reserveId>` when
+   * `reserveId` is configured, else `<spoke checksummed>:<asset.symbol>`
+   * (both computable from config alone, so bindings survive restarts).
+   */
+  marketId?: string;
+  /** On-chain reserve id; default discovered via spoke.getReserveId(hub, hub.getAssetId(asset)). */
+  reserveId?: number | bigint;
+}
+
 export interface AaveV4AdapterOptions {
   env: EvmEnv;
   /** AaveKit client (default AaveClient.create({ cache: false })). Ignored when `api` is given. */
@@ -69,7 +87,10 @@ export interface AaveV4AdapterOptions {
   /** Injectable AaveKit facade (tests / offline). `null` disables AaveKit entirely (on-chain only). */
   api?: AaveV4Api | null;
   spoke: AaveV4SpokeConfig;
+  /** Loop pairs (may be empty for a supply-only adapter). */
   pairs: AaveV4PairConfig[];
+  /** Supply-only markets (SupplyAdapter side). */
+  supply?: AaveV4SupplyConfig[];
   /** Same-chain swapper for debt <-> collateral (required for two-asset pairs). */
   swapper?: SwapAdapter;
   /** External reward streams (Merkl campaigns, incl. Ethena Liquid Leverage with maxHealthFactor). */
@@ -104,4 +125,9 @@ export interface AaveV4AdapterOptions {
 
 export function aaveV4AdapterId(spoke: Pick<AaveV4SpokeConfig, "chain" | "spokeName">): string {
   return `${AAVE_V4_PROTOCOL}:${spoke.chain}:${spoke.spokeName}`;
+}
+
+export function aaveV4SupplyMarketId(spokeChecksummed: string, s: AaveV4SupplyConfig): string {
+  if (s.marketId) return s.marketId;
+  return s.reserveId !== undefined ? `${spokeChecksummed}:${BigInt(s.reserveId)}` : `${spokeChecksummed}:${s.asset.symbol}`;
 }

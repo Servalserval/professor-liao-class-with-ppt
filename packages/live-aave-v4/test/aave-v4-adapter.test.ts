@@ -374,3 +374,191 @@ describe("AaveV4Adapter.verifyConfig / claimRewards", () => {
     assert.match(r2.detail ?? "", /allowUndecoded/);
   });
 });
+
+// ---------------------------------------------------------------------------
+describe("AaveV4Adapter as SupplyAdapter (plain deposits, collateral not enabled)", () => {
+  const E6 = 10n ** 6n;
+  const MID = `${SPOKE}:${DEBT_ID}`;
+  function supplyOnly(f: FakeV4, over: Partial<AaveV4AdapterOptions> = {}): AaveV4Adapter {
+    f.state.wallet[USDT.toLowerCase()] = 5_000n * E6;
+    return make(f, { pairs: [], supply: [{ asset: usdtRef, reserveId: DEBT_ID }], ...over });
+  }
+
+  it("refuses a supply asset that a loop pair on the same spoke also uses", () => {
+    const f = new FakeV4();
+    assert.throws(() => make(f, { supply: [{ asset: usdtRef }] }), /shared spoke account/);
+    assert.throws(() => make(f, { pairs: [], supply: [{ asset: usdtRef }, { asset: usdtRef, marketId: "x" }] }), /duplicate supply asset/);
+  });
+
+  it("marketId: <spoke>:<reserveId> when configured, else <spoke>:<symbol>; reserve discovered on-chain", async () => {
+    const f = new FakeV4();
+    assert.deepEqual(supplyOnly(f).supplyMarketIds(), [MID]);
+    const b = make(f, { pairs: [], supply: [{ asset: usdtRef }] });
+    assert.deepEqual(b.supplyMarketIds(), [`${SPOKE}:USDt`]);
+    const [m] = await b.supplyMarkets();
+    assert.equal(m!.marketId, `${SPOKE}:USDt`);
+    assert.match(m!.note ?? "", /reserve 2/);
+  });
+
+  it("supplyMarkets(): block-pinned on-chain rate, IRM, hub totals, withdrawable, cap room, rewards", async () => {
+    const f = new FakeV4();
+    const queries: RewardRateQuery[] = [];
+    const a = supplyOnly(f, {
+      priceUsd: async () => 0.9995,
+      extraRewards: async (q) => {
+        queries.push(q);
+        return [{ token: "AAVE", apr: 0.02, netOf: ["*"] }];
+      },
+    });
+    const [m] = await a.supplyMarkets();
+    assert.ok(m);
+    assert.equal(m.protocol, "aave-v4");
+    assert.equal(m.marketId, MID);
+    assert.deepEqual(m.asset, { symbol: "USDt", assetId: USDT.toLowerCase(), priceUsd: 0.9995 });
+    // drawnRate 4% * (10M drawn + 50k premium) * (1 - 10% fee) / 13.55M added
+    assert.ok(Math.abs(m.supplyAprBase - (0.04 * 10_050_000 * 0.9) / 13_550_000) < 1e-12, `${m.supplyAprBase}`);
+    assert.ok(Math.abs(m.totalSupplyUsd - 13_500_000 * 0.9995) < 1e-6);
+    assert.ok(Math.abs(m.totalBorrowUsd - 10_000_000 * 0.9995) < 1e-6);
+    assert.ok(Math.abs(m.withdrawableUsd! - 1_000_000 * 0.9995) < 1e-6, "min(hub liquidity, added via this spoke)");
+    assert.ok(Math.abs(m.supplyCapRemainingUsd! - 49_000_000 * 0.9995) < 1e-6);
+    assert.ok(m.irm && Math.abs(m.irm.points[1]![1] - 0.05) < 1e-12, "supplier IRM is unscaled (no risk premium)");
+    assert.equal(m.irm!.reserveFactor, 0.1);
+    assert.deepEqual(m.rewards, [{ token: "AAVE", apr: 0.02, netOf: ["*"] }]);
+    assert.deepEqual(queries, [{ protocol: "aave-v4", chain: "avalanche", asset: usdtRef, side: "supply", marketId: MID }]);
+    assert.equal(m.paused, false);
+    assert.equal(m.myDepositUsd, 0);
+    assert.equal(m.dataAsOfMs, f.blockTs * 1000);
+    f.usdtFrozen = true;
+    assert.equal((await a.supplyMarkets())[0]!.paused, true);
+  });
+
+  it("deposit dry-run: approve + supply proven in one batch, nothing changes", async () => {
+    const f = new FakeV4();
+    const a = supplyOnly(f);
+    let sim: { to: string; data: Hex }[] = [];
+    const orig = f.publicClient.simulateCalls;
+    f.publicClient.simulateCalls = async (p) => {
+      sim = p.calls;
+      return orig(p);
+    };
+    const r = await a.deposit(MID, 1_000n * E6, testCtx(true));
+    assert.equal(r.ok, true, r.detail);
+    assert.equal(f.state.usdtSupplied, 0n);
+    assert.equal(sim.length, 2);
+    assert.deepEqual(decodeFunctionData({ abi: erc20Abi, data: sim[0]!.data }).args, [SPOKE, 1_000n * E6]);
+    const sup = decodeSpoke(sim[1]!.data);
+    assert.equal(sup.functionName, "supply");
+    assert.deepEqual(sup.args, [DEBT_ID, 1_000n * E6, ME]);
+  });
+
+  it("deposit live: exact approval consumed, no collateral, position readable", async () => {
+    const f = new FakeV4();
+    const a = supplyOnly(f);
+    const r = await a.deposit(MID, 1_000n * E6, testCtx(false));
+    assert.equal(r.ok, true, r.detail);
+    assert.equal(f.state.usdtSupplied, 1_000n * E6);
+    assert.equal(f.state.usdtCollateral, false);
+    assert.equal(f.state.allowance[USDT.toLowerCase()], 0n);
+    assert.ok(!f.sent.some((t) => t.to === SPOKE && decodeSpoke(t.data).functionName !== "supply"));
+    const p = await a.supplyPosition(MID);
+    assert.equal(p!.units, 1_000n * E6);
+    assert.equal(p!.depositUsd, 1_000);
+    assert.equal(p!.asOfMs, f.blockTs * 1000);
+    assert.equal((await a.supplyMarkets())[0]!.myDepositUsd, 1_000);
+  });
+
+  it("deposit disables a collateral flag that is already on (plain deposit is never collateral)", async () => {
+    const f = new FakeV4();
+    f.state.usdtCollateral = true;
+    const r = await supplyOnly(f).deposit(MID, 100n * E6, testCtx(false));
+    assert.equal(r.ok, true, r.detail);
+    assert.equal(f.state.usdtCollateral, false);
+    const mc = decodeSpoke(f.sent.find((t) => t.to === SPOKE)!.data);
+    assert.equal(mc.functionName, "multicall");
+    assert.deepEqual((mc.args[0] as Hex[]).map((x) => decodeSpoke(x).functionName), ["supply", "setUsingAsCollateral"]);
+  });
+
+  it("deposit refuses when paused / frozen, over the cap, or beyond the wallet", async () => {
+    const f = new FakeV4();
+    const a = supplyOnly(f);
+    f.usdtFrozen = true;
+    assert.match((await a.deposit(MID, 1n, testCtx(true))).detail ?? "", /frozen/);
+    f.usdtFrozen = false;
+    f.usdtAddCap = 1_000_000; // exactly the 1M already added via this spoke
+    assert.match((await a.deposit(MID, 1n, testCtx(true))).detail ?? "", /supply cap/);
+    f.usdtAddCap = 50_000_000;
+    assert.match((await a.deposit(MID, 6_000n * E6, testCtx(true))).detail ?? "", /wallet has/);
+    assert.equal(f.submitted, 0);
+  });
+
+  it("withdraw(0.5) then withdraw(1) with max semantics (no dust)", async () => {
+    const f = new FakeV4();
+    const a = supplyOnly(f);
+    await a.deposit(MID, 1_000n * E6, testCtx(false));
+    const h = await a.withdraw(MID, 0.5, testCtx(false));
+    assert.equal(h.ok, true, h.detail);
+    assert.equal(f.state.usdtSupplied, 500n * E6);
+    assert.equal(h.amountUsd, 500);
+    const all = await a.withdraw(MID, 1, testCtx(false));
+    assert.equal(all.ok, true, all.detail);
+    assert.equal(f.state.usdtSupplied, 0n);
+    assert.equal(f.state.wallet[USDT.toLowerCase()], 5_000n * E6);
+    const last = decodeSpoke(f.sent[f.sent.length - 1]!.data);
+    assert.deepEqual(last.args, [DEBT_ID, (1n << 256n) - 1n, ME]);
+    assert.equal(await a.supplyPosition(MID), null);
+    assert.match((await a.withdraw(MID, 1, testCtx(false))).detail ?? "", /no deposit/);
+  });
+
+  it("simulateWithdraw: true / false on revert / throws on RPC errors", async () => {
+    const f = new FakeV4();
+    const a = supplyOnly(f);
+    assert.equal(await a.simulateWithdraw(MID, testCtx(true)), true, "nothing to withdraw");
+    await a.deposit(MID, 1_000n * E6, testCtx(false));
+    assert.equal(await a.simulateWithdraw(MID, testCtx(true)), true);
+    f.usdtPaused = true;
+    assert.equal(await a.simulateWithdraw(MID, testCtx(true)), false);
+    f.usdtPaused = false;
+    f.rpcDown = true;
+    await assert.rejects(a.simulateWithdraw(MID, testCtx(true)), /fetch failed/);
+  });
+
+  it("unconfirmed deposit broadcast: re-reads, sends nothing more, reports observed state", async () => {
+    for (const mode of ["landed", "dropped"] as const) {
+      const f = new FakeV4();
+      const a = supplyOnly(f);
+      f.unconfirmed = { at: 1, mode }; // approve OK, supply unconfirmed
+      const r = await a.deposit(MID, 1_000n * E6, testCtx(false));
+      assert.equal(r.ok, false, mode);
+      assert.match(r.detail ?? "", /unconfirmed and may still land: no further txs sent/);
+      assert.match(r.detail ?? "", new RegExp(`observed: deposit ${mode === "landed" ? "1000" : "0"} USDt`));
+      assert.equal(f.submitted, 2, mode);
+      assert.ok(r.txs.some((t) => t.unconfirmed && t.id), mode);
+    }
+  });
+
+  it("a definitively failed deposit resets the allowance it left behind", async () => {
+    const f = new FakeV4();
+    const a = supplyOnly(f);
+    f.unconfirmed = undefined;
+    // supply reverts on-chain after the approve landed: simulate by pausing between the two submissions
+    const send = f.publicClient.sendRawTransaction;
+    let n = 0;
+    f.publicClient.sendRawTransaction = async (p) => {
+      if (n++ === 1) f.usdtPaused = true; // the supply now reverts on-chain
+      const h = await send(p);
+      f.usdtPaused = false;
+      return h;
+    };
+    const r = await a.deposit(MID, 1_000n * E6, testCtx(false));
+    assert.equal(r.ok, false);
+    assert.equal(f.state.usdtSupplied, 0n);
+    assert.equal(f.state.allowance[USDT.toLowerCase()], 0n, r.detail);
+  });
+
+  it("verifyConfig covers supply markets", async () => {
+    const f = new FakeV4();
+    assert.deepEqual(await supplyOnly(f).verifyConfig(), []);
+    f.usdtFrozen = true;
+    assert.ok((await supplyOnly(f).verifyConfig()).some((i) => i.includes("deposits blocked")));
+  });
+});
