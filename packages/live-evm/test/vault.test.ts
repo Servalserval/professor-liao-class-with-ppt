@@ -435,6 +435,7 @@ test("supplyMarkets: ids, protocols, Euler rate-model APR / cash / IRM", async (
   assert.equal(a.id, "vault:base");
   const m = await byId(a);
   assert.deepEqual([...m.keys()], [lc(V_EULER), lc(V_GEN), lc(V_FLUID), lc(V_MM)]);
+  assert.ok([...m.values()].every((x) => x.kind === "vault"));
   const e = m.get(lc(V_EULER))!;
   assert.equal(e.protocol, "euler");
   // borrow 4% at u = 90%, fee 10%: supply = 0.04 x 0.9 x 0.9
@@ -615,34 +616,79 @@ test("simulateWithdraw: no position = true; RPC errors throw (unknown, not a fai
   await assert.rejects(a.simulateWithdraw(lc(V_GEN), ctx()), /503/);
 });
 
-test("BroadcastUnconfirmedError: re-read state — landed counts as done, lost is reported UNCONFIRMED", async () => {
+test("BroadcastUnconfirmedError: re-read state, sign nothing more; landed = done, lost = UNCONFIRMED", async () => {
   const fc = world();
-  // the approve goes through; the deposit submit times out but the tx landed
   const live = ctx({ dryRun: false });
-  let n = 0;
+  fc.vaults.get(lc(V_GEN))!.pullFrac = 0.9; // leaves an allowance a normal deposit would reset
+  /** which next broadcast times out: the vault call (deposit / redeem) or the token call (approve) */
+  let trap: { on: "vault" | "token"; mode: "landed" | "lost" } | undefined;
   const env = fc.env();
   const pc = env.publicClient as unknown as { sendRawTransaction: (x: { serializedTransaction: Hex }) => Promise<Hex> };
   const base = pc.sendRawTransaction;
   pc.sendRawTransaction = async (x) => {
-    if (++n === 2) fc.unconfirmed = "landed";
+    const to = lc(fc.raws.get(x.serializedTransaction)!.to);
+    if (trap && (trap.on === "vault" ? to === lc(V_GEN) : to === lc(USDC))) {
+      fc.unconfirmed = trap.mode;
+      trap = undefined;
+    }
     return base(x);
   };
   const b = new ERC4626VaultAdapter({ env, vaults: CFG, fetchMorphoVault: async () => morphoVault() });
+
+  // deposit landed but unconfirmed: ok, and NO approve(0) afterwards (it would take the pending nonce)
+  trap = { on: "vault", mode: "landed" };
   const r = await b.deposit(lc(V_GEN), 1_000n * E6, live);
   assert.equal(r.ok, true, r.detail);
-  assert.match(r.detail!, /unconfirmed but the share balance shows it landed/);
-  assert.ok(r.txs.some((t) => t.unconfirmed && t.id));
+  assert.match(r.detail!, /unconfirmed but the share balance shows it landed .*allowance 100000000 left .*not reset while a tx is unconfirmed/);
+  assert.deepEqual(fc.sent.map((s) => s.fn), ["approve", "deposit"]);
+  assert.equal(r.txs.at(-1)!.unconfirmed, true, "the unconfirmed record is the last tx");
+  assert.ok(r.txs.at(-1)!.id);
 
-  n = 0;
-  pc.sendRawTransaction = async (x) => {
-    if (++n === 1) fc.unconfirmed = "lost";
-    return base(x);
-  };
+  // deposit lost: UNCONFIRMED failure, nothing signed after it (the leftover allowance is first reset to 0, then approved)
+  fc.sent = [];
+  trap = { on: "vault", mode: "lost" };
+  const lost = await b.deposit(lc(V_GEN), 1_000n * E6, live);
+  assert.equal(lost.ok, false);
+  assert.match(lost.detail!, /UNCONFIRMED: deposit 0x[0-9a-f]{64} \(nonce .*\) may still land/);
+  assert.deepEqual(fc.sent.map((s) => [s.fn, s.args[1]]), [["approve", 0n], ["approve", 1_000n * E6]], "no reset after the lost deposit");
+  assert.equal(lost.txs.filter((t) => t.unconfirmed).length, 1);
+  assert.equal(lost.txs.at(-1)!.unconfirmed, true);
+
+  // an unconfirmed APPROVE stops the call before the deposit
+  fc.sent = [];
+  fc.allowances.set(key(ACCOUNT, V_GEN), 0n);
+  trap = { on: "token", mode: "lost" };
+  const ap = await b.deposit(lc(V_GEN), 1_000n * E6, live);
+  assert.equal(ap.ok, false);
+  assert.match(ap.detail!, /approve .* submitted as 0x[0-9a-f]{64} but not confirmed/);
+  assert.deepEqual(fc.sent, [], "deposit never signed");
+  assert.equal(ap.txs.length, 1);
+  assert.equal(ap.txs[0]!.unconfirmed, true);
+
+  // redeem lost
+  trap = { on: "vault", mode: "lost" };
   const w = await b.withdraw(lc(V_GEN), 1, live);
   assert.equal(w.ok, false);
   assert.match(w.detail!, /UNCONFIRMED: redeem 0x[0-9a-f]{64} .*may still land/);
   assert.ok(w.txs.some((t) => t.unconfirmed));
-  assert.equal(fc.vaults.get(lc(V_GEN))!.shares.get(lc(ACCOUNT)), 1_000n * E6 * E12, "shares untouched by the lost redeem");
+  assert.equal(fc.vaults.get(lc(V_GEN))!.shares.get(lc(ACCOUNT)), 900n * E6 * E12, "shares untouched by the lost redeem");
+});
+
+test("supplyMarkets isolates vaults: one failing read is skipped, all failing throws; every market is kind 'vault'", async () => {
+  const fc = world();
+  const warns: string[] = [];
+  const a = adapter(fc, {
+    log: (lvl, m) => void (lvl === "warn" && warns.push(m)),
+    fetchMorphoVault: async () => {
+      throw new Error("deployless query failed: 503");
+    },
+  });
+  const ms = await a.supplyMarkets();
+  assert.deepEqual(ms.map((m) => m.marketId), [lc(V_EULER), lc(V_GEN), lc(V_FLUID)]);
+  assert.ok(ms.every((m) => m.kind === "vault"));
+  assert.ok(warns.some((w) => /skipping vault .*\(metamorpho\): deployless query failed/.test(w)), warns.join("\n"));
+  fc.rpcDown = true;
+  await assert.rejects(a.supplyMarkets(), /every vault read failed/);
 });
 
 test("claimRewards is a no-op; walletBalance reads the token", async () => {

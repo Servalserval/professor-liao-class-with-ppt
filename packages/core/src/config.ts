@@ -205,8 +205,16 @@ export interface RouterConfig {
       chains: string[];
       assumed_withdrawable_frac: number;
     };
-    /** Supply-only lending (sources/supply.ts). Utilization levels are shared with lending_loop. */
+    /** Supply-only lending (sources/supply.ts). */
     supply: {
+      /**
+       * Utilization levels for plain deposits (a deposit LOWERS utilization;
+       * the risk is being unable to withdraw, which the 1/10 and 1/5
+       * withdrawable-liquidity rules cover). warn blocks entries; exit leaves.
+       * Not used for vaults (SupplyMarket.kind "vault").
+       */
+      utilization_warn: number;
+      utilization_exit: number;
       /** Deposits into a stable whose depeg tier is above this are refused. */
       max_risk_tier: Tier;
       /** Tier assumed for a stablecoin that is not in `stables`. */
@@ -345,7 +353,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
       chains: [],
       assumed_withdrawable_frac: 0.3,
     },
-    supply: { max_risk_tier: 2, unknown_stable_tier: 3, txs_per_entry: 2, txs_per_exit: 1 },
+    supply: { utilization_warn: 0.95, utilization_exit: 0.99, max_risk_tier: 2, unknown_stable_tier: 3, txs_per_entry: 2, txs_per_exit: 1 },
   },
   // Researched 2026-10-29 (docs/selection.md §3): tier, expected yearly depeg loss, |p-1| warn/exit.
   stables: {
@@ -435,6 +443,16 @@ export function validateConfig(c: RouterConfig): string[] {
   if (c.caps.max_total_deployed_usd !== undefined && !(c.caps.max_total_deployed_usd >= 0))
     e.push("caps.max_total_deployed_usd must be >= 0");
   const tierOk = (t: unknown) => t === 1 || t === 2 || t === 3;
+  {
+    const seen = new Map<string, string>();
+    for (const sym of Object.keys(c.stables ?? {})) {
+      const k = sym.toLowerCase();
+      const prev = seen.get(k);
+      if (prev !== undefined)
+        e.push(`stables.${sym} and stables.${prev} differ only by case (keys are case-insensitive; keep one spelling — the defaults use ${prev})`);
+      else seen.set(k, sym);
+    }
+  }
   for (const [sym, sc] of Object.entries(c.stables ?? {})) {
     if (!tierOk(sc.tier)) e.push(`stables.${sym}.tier must be 1, 2 or 3`);
     if (sc.expected_loss_apr !== undefined && !(sc.expected_loss_apr >= 0 && sc.expected_loss_apr < 1)) e.push(`stables.${sym}.expected_loss_apr must be in [0,1)`);
@@ -443,6 +461,11 @@ export function validateConfig(c: RouterConfig): string[] {
       e.push(`stables.${sym}.depeg_exit must be > depeg_warn`);
   }
   for (const t of [1, 2, 3] as Tier[]) if (!(c.tiers_default_loss[t] >= 0)) e.push(`tiers_default_loss.${t} must be >= 0`);
+  {
+    const sp = c.sources.supply;
+    if (!(sp.utilization_warn > 0 && sp.utilization_warn < sp.utilization_exit && sp.utilization_exit <= 1))
+      e.push("sources.supply: need 0 < utilization_warn < utilization_exit <= 1");
+  }
   if (!tierOk(c.sources.supply.max_risk_tier)) e.push("sources.supply.max_risk_tier must be 1, 2 or 3");
   if (!tierOk(c.sources.supply.unknown_stable_tier)) e.push("sources.supply.unknown_stable_tier must be 1, 2 or 3");
   for (const [kind, adj] of Object.entries(c.thresholds.kind_premium_adjust ?? {})) {

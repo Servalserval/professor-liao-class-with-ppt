@@ -1,4 +1,4 @@
-export { NaviAdapter } from "./adapter.js";
+export { NaviAdapter, NaviAccountConflictError } from "./adapter.js";
 export type { NaviAdapterOptions, NaviPairConfig, NaviPairInfo, NaviAccount, NaviSupplyConfig } from "./adapter.js";
 export { defaultNaviSdk, NAVI_MARKET_KEYS, NAVI_DEFAULT_MARKET } from "./sdk.js";
 export type { NaviSdk } from "./sdk.js";

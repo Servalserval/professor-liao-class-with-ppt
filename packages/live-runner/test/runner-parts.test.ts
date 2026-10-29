@@ -266,4 +266,25 @@ describe("runner safety: lock, mode marker, gate, stablecoin scope", async () =>
     assert.ok(validateLiveConfig(base).some((x) => x.includes("not a stablecoin")));
     assert.ok(!validateLiveConfig({ ...(base as object), allow_non_stable: true } as never).some((x) => x.includes("not a stablecoin")));
   });
+  it("one role and one entry per lending market (a plain deposit would back a loop's debt in the shared account)", async () => {
+    const { validateLiveConfig } = await import("../src/liveConfig.js");
+    const mk = (lending: unknown[], vaults: unknown[] = []) =>
+      validateLiveConfig({
+        mode: "shadow",
+        chains: { arbitrum: { rpc: "x" } },
+        assets: { arbitrum: { USDT0: { address: "0x1", decimals: 6 }, USDC: { address: "0x2", decimals: 6 } } },
+        lending,
+        vaults,
+        canary: { max_position_usd: 1, max_total_deployed_usd: 1 },
+        limits: { max_slippage_bps: 10, max_gas_usd: {}, max_loop_iterations: 8 },
+      } as never);
+    const loop = { type: "aave-v3", chain: "arbitrum", market: "AaveV3Arbitrum", pairs: [{ pairId: "u", collateral: "USDC", debt: "USDC" }] };
+    const sup = { type: "aave-v3", chain: "arbitrum", market: "AaveV3Arbitrum", pairs: [], supply: [{ asset: "USDT0" }] };
+    assert.deepEqual(mk([loop]), []);
+    assert.deepEqual(mk([sup]), []);
+    assert.ok(mk([{ ...loop, supply: [{ asset: "USDT0" }] }]).some((x) => /both loop pairs and plain deposits/.test(x)));
+    assert.ok(mk([loop, sup]).some((x) => /listed twice/.test(x)));
+    const v = { chain: "arbitrum", vaults: [{ address: "0x3", asset: "USDC", flavor: "fluid" }] };
+    assert.ok(mk([], [v, v]).some((x) => /vaults@arbitrum: listed twice/.test(x)));
+  });
 });

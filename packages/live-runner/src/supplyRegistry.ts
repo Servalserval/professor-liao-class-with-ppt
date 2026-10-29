@@ -75,10 +75,22 @@ export class SupplyRegistry {
   bind(oppId: string): SupplyBinding | undefined {
     const hit = this.bindings.get(oppId);
     if (hit) return hit;
+    // Before the first successful market read (e.g. right after a restart while
+    // a reward API is down) held deposits must still be markable and exitable.
+    // oppId = `${sourceId}:${protocol}:${marketId}`; protocol ids have no ':'.
     const lid = oppId.toLowerCase();
-    const m = this.wired.filter(({ sourceId, w }) => oppId.startsWith(`${sourceId}:`) && w.marketId !== undefined && lid.endsWith(`:${w.marketId.toLowerCase()}`));
-    if (m.length !== 1) return undefined;
-    const { adapter, w } = m[0]!;
-    return { adapter, marketId: w.marketId!, asset: w.asset };
+    const mine = this.wired.filter(({ sourceId }) => oppId.startsWith(`${sourceId}:`));
+    if (!mine.length) return undefined;
+    const exact = mine.filter(({ w }) => w.marketId !== undefined && lid.endsWith(`:${w.marketId.toLowerCase()}`));
+    if (exact.length === 1) return { adapter: exact[0]!.adapter, marketId: exact[0]!.w.marketId!, asset: exact[0]!.w.asset };
+    const rest = oppId.slice(mine[0]!.sourceId.length + 1);
+    const cut = rest.indexOf(":");
+    const marketId = cut >= 0 ? rest.slice(cut + 1) : "";
+    if (!marketId) return undefined;
+    const unnamed = mine.filter(({ w }) => w.marketId === undefined);
+    // the adapter's default id contains the symbol (Aave: "USDC", Navi: "main:USDC", V4: "<spoke>:USDC")
+    const bySym = unnamed.filter(({ w }) => marketId.toLowerCase().split(":").includes(w.asset.symbol.toLowerCase()));
+    const pick = bySym.length === 1 ? bySym[0] : unnamed.length === 1 && mine.length === 1 ? unnamed[0] : undefined;
+    return pick ? { adapter: pick.adapter, marketId, asset: pick.w.asset } : undefined;
   }
 }

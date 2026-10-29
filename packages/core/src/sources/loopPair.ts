@@ -287,8 +287,11 @@ export function loopPairOpportunity(
   });
   const expRatio = pair.expectedPriceRatio !== undefined && fin(pair.expectedPriceRatio) && pair.expectedPriceRatio > 0 ? pair.expectedPriceRatio : 1;
   const depeg = same ? 0 : Math.abs(D.priceUsd / C.priceUsd / expRatio - 1);
-  // per-stable depeg levels (strictest of the two legs) override the lending_loop defaults
-  const dl = depegLevels(ctx.cfg, [C.symbol, D.symbol]);
+  // Strictest of the per-stable levels of both legs AND the lending_loop levels: a
+  // leveraged position loses L x the depeg at exit, so loops never get looser
+  // levels than sources.lending_loop.depeg_* (the per-stable levels are sized for 1x).
+  const dlS = depegLevels(ctx.cfg, [C.symbol, D.symbol]);
+  const dl = { warn: Math.min(dlS.warn, ll.depeg_warn), exit: Math.min(dlS.exit, ll.depeg_exit) };
   // Expected depeg loss as a running cost: a same-asset loop is exposed 1x
   // (both legs move together); a pair conservatively L x on the collateral.
   const risk = stableRisk(ctx.cfg, C.symbol);
@@ -341,7 +344,7 @@ export function loopPairOpportunity(
     name: `${pair.protocol} ${same ? C.symbol : `${C.symbol}/${D.symbol}`} loop @${(ltv * 100).toFixed(0)}% LTV`,
     primaryVenue: pair.protocol,
     chain: pair.chain,
-    legs: [{ venue: pair.protocol, chain: pair.chain, token: C.symbol, equityFrac: 1 }],
+    legs: [{ venue: pair.protocol, chain: pair.chain, token: C.symbol, equityFrac: 1, grossFrac: L }],
     streams,
     costs: {
       entryFrac: (L - 1) * ((D.borrowFeeFrac ?? 0) + swapCostFrac),

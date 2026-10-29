@@ -337,6 +337,12 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
     (l.pairs ?? []).map((p: PairSpec) => ({ pairId: p.pairId, collateral: asset(l.chain, p.collateral), debt: asset(l.chain, p.debt), expectedPriceRatio: p.expected_price_ratio }));
   const supplyWiringOf = (l: LendingSpec): (SupplyWiring & SupplySpecResolved)[] =>
     (l.supply ?? []).map((sp) => ({ asset: asset(l.chain, sp.asset), marketId: sp.marketId, market: sp.market, reserveId: sp.reserveId, stakeInSpool: sp.stakeInSpool }));
+  const adapterIds = new Set<string>();
+  const claimId = (id: string) => {
+    // two adapters with one id would share sources, executors and reward claims
+    if (adapterIds.has(id)) throw new Error(`two lending/vault adapters share the id ${id}: merge their config entries (or set a distinct protocol/id)`);
+    adapterIds.add(id);
+  };
   const addVerifier = (id: string, target: unknown) => {
     const v = (target as { verifyConfig?: () => Promise<unknown> }).verifyConfig;
     verifiers.push({ id, run: v ? async () => issuesOf(await v.call(target)) : async () => [`${id}: adapter has no verifyConfig()`] });
@@ -356,6 +362,7 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
     const supplyWiring = supplyWiringOf(l);
     const opt = (l.options ?? {}) as Record<string, unknown>;
     const adapter = makeLendingAdapter(l, wiring, opt, factoryDeps, supplyWiring);
+    claimId(adapter.id);
     if (wiring.length) {
       loopSources.push(registry.source(adapter, wiring));
       lendingForKeeper.push({ adapter, pairIds: wiring.map((w) => w.pairId) });
@@ -378,6 +385,7 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
       curator: x.curator,
     }));
     const adapter = new ERC4626VaultAdapter({ env: evmEnv(v.chain), vaults, extraRewards, priceUsd: (a: AssetRef) => prices.priceUsd(a), log, ...(opt as object) });
+    claimId(adapter.id);
     supplySources.push(supplyRegistry.source(adapter, vaults.map((x) => ({ marketId: x.marketId, asset: x.asset }))));
     supplyForKeeper.push({ adapter, marketIds: () => supplyRegistry.marketIds(adapter) });
     addVerifier(`vaults:${v.chain}`, adapter);
@@ -637,7 +645,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
       return new AaveV3Adapter({
         env: d.evmEnv(l.chain),
         market,
-        pairs: l.pairs.map((p, i) => ({
+        pairs: (l.pairs ?? []).map((p, i) => ({
           pairId: p.pairId,
           collateral: wiring[i]!.collateral,
           debt: wiring[i]!.debt,
@@ -661,7 +669,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
       return new AaveV4Adapter({
         env: d.evmEnv(l.chain),
         spoke,
-        pairs: l.pairs.map((p, i) => ({ pairId: p.pairId, collateral: wiring[i]!.collateral, debt: wiring[i]!.debt })),
+        pairs: (l.pairs ?? []).map((p, i) => ({ pairId: p.pairId, collateral: wiring[i]!.collateral, debt: wiring[i]!.debt })),
         swapper: d.swappers[l.chain],
         extraRewards: rewards ? (q) => rewards({ ...q, marketId: a.hub }) : undefined,
         priceUsd: d.priceUsd,
@@ -674,7 +682,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
     case "lista":
       return new MorphoBlueAdapter({
         env: d.evmEnv(l.chain),
-        markets: l.pairs.map((p, i) => {
+        markets: (l.pairs ?? []).map((p, i) => {
           if (!p.marketId) throw new Error(`morpho pair ${p.pairId}: marketId required`);
           return { pairId: p.pairId, marketId: p.marketId as Hex, collateral: wiring[i]!.collateral, debt: wiring[i]!.debt, lltv: (p as { lltv?: number }).lltv };
         }),
@@ -691,7 +699,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
     case "scallop":
       return new ScallopAdapter({
         env: d.suiEnv(),
-        pairs: l.pairs.map((p, i) => ({ pairId: p.pairId, collateral: wiring[i]!.collateral, debt: wiring[i]!.debt, obligationId: (p as { obligationId?: string }).obligationId })),
+        pairs: (l.pairs ?? []).map((p, i) => ({ pairId: p.pairId, collateral: wiring[i]!.collateral, debt: wiring[i]!.debt, obligationId: (p as { obligationId?: string }).obligationId })),
         swapper: d.suiPtbSwapper,
         extraRewards: d.extraRewards,
         sdkOptions: { pythApiKey: process.env.PYTH_API_KEY || undefined },
@@ -701,7 +709,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
     case "navi":
       return new NaviAdapter({
         env: d.suiEnv(),
-        pairs: l.pairs.map((p, i) => ({
+        pairs: (l.pairs ?? []).map((p, i) => ({
           pairId: p.pairId,
           collateral: wiring[i]!.collateral,
           debt: wiring[i]!.debt,
@@ -718,7 +726,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
       return new SuilendAdapter({
         env: d.suiEnv(),
         lendingMarket: l.market ?? "main",
-        pairs: l.pairs.map((p, i) => ({ pairId: p.pairId, collateral: wiring[i]!.collateral, debt: wiring[i]!.debt })),
+        pairs: (l.pairs ?? []).map((p, i) => ({ pairId: p.pairId, collateral: wiring[i]!.collateral, debt: wiring[i]!.debt })),
         swapper: d.suiPtbSwapper,
         extraRewards: d.extraRewards,
         priceUpdateSource: d.pythUpdates,

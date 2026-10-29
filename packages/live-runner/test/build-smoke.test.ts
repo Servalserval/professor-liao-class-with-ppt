@@ -36,7 +36,7 @@ describe("live runner wiring (offline smoke test of config/live.example.yaml)", 
     assert.deepEqual(rt.sources.map((s) => s.id).sort(), ids);
     assert.deepEqual(Object.keys(rt.executors).sort(), ids);
     assert.notEqual(rt.executors["aave-v3:base#supply"], rt.executors["aave-v3:plasma"], "deposits get the supply executor");
-    assert.equal(rt.supplyRegistry.bind("aave-v3:base#supply:aave-v3:USDC")?.marketId, undefined, "no marketId configured: bound on first read");
+    assert.equal(rt.supplyRegistry.bind("aave-v3:base#supply:aave-v3:USDC")?.marketId, "USDC", "no marketId configured: bound by asset before the first read");
     assert.deepEqual(Object.keys(rt.bridges).sort(), ["cctp_v2_standard", "swap", "usdt0_oft"]);
     assert.equal(rt.canSign.evm, false, "no key in env: read-only");
     // every enabled route endpoint is an idle bucket

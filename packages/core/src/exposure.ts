@@ -8,6 +8,8 @@ export interface Exposure {
   byVenue: Record<string, number>;
   byChain: Record<string, number>;
   byToken: Record<string, number>;
+  /** Depeg exposure per stable, case-insensitive key (lowercase), leverage included (Leg.grossFrac). */
+  byStableGross: Record<string, number>;
   byKind: Record<string, number>;
   byOpp: Record<string, number>;
   /** Unclaimed + held - hedged reward tokens. */
@@ -27,6 +29,7 @@ function addLegs(e: Exposure, legs: Leg[], equityUsd: number) {
     add(e.byVenue, l.venue, usd);
     add(e.byChain, l.chain, usd);
     add(e.byToken, l.token, usd);
+    add(e.byStableGross, l.token.toLowerCase(), usd * (l.grossFrac ?? 1));
   }
 }
 
@@ -36,6 +39,7 @@ export function computeExposure(positions: Position[]): Exposure {
     byVenue: {},
     byChain: {},
     byToken: {},
+    byStableGross: {},
     byKind: {},
     byOpp: {},
     byRewardToken: {},
@@ -64,6 +68,7 @@ export function withAddition(e: Exposure, opp: Opportunity, deltaUsd: number): E
     byVenue: { ...e.byVenue },
     byChain: { ...e.byChain },
     byToken: { ...e.byToken },
+    byStableGross: { ...(e.byStableGross ?? {}) },
     byKind: { ...e.byKind },
     byOpp: { ...e.byOpp },
     byRewardToken: { ...e.byRewardToken },
@@ -97,8 +102,10 @@ export function capViolations(cfg: RouterConfig, after: Exposure, opp: Opportuni
     const ft = (after.byToken[leg.token] ?? 0) / totalEquityUsd;
     if (ft > c.per_token_frac + 1e-9) r.push(`token ${leg.token} would be ${pct(ft)} > cap ${pct(c.per_token_frac)}`);
     // per-stable cap (depeg concentration) across every position holding the asset
+    // (case-insensitive: USDT and USDt are one asset; leverage counted via Leg.grossFrac)
     const sm = stableConfig(cfg, leg.token)?.max_frac;
-    if (sm !== undefined && ft > sm + 1e-9) r.push(`stable ${leg.token} would be ${pct(ft)} > stables.${leg.token}.max_frac ${pct(sm)}`);
+    const fs = (after.byStableGross?.[leg.token.toLowerCase()] ?? 0) / totalEquityUsd;
+    if (sm !== undefined && fs > sm + 1e-9) r.push(`stable ${leg.token} would be ${pct(fs)} of equity (leverage included) > stables.${leg.token}.max_frac ${pct(sm)}`);
   }
   const kindCap = c.per_kind_frac[opp.kind as Kind] ?? 1;
   const fk = (after.byKind[opp.kind] ?? 0) / totalEquityUsd;

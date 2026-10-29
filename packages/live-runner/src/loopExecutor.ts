@@ -178,8 +178,14 @@ export class LoopExecutor implements Executor {
       const cost = opp ? gross * opp.costs.exitFrac + opp.costs.fixedExitUsd : 0;
       return { ok: true, amountUsd: Math.max(0, gross - cost), detail: `shadow: simulated OK | ${summarize(r)}` };
     }
-    const balAfter = await b.adapter.walletBalance(b.collateral);
-    return { ok: true, amountUsd: unitsToUsd(balAfter - balBefore, price, b.collateral.decimals), detail: summarize(r) };
+    try {
+      const balAfter = await b.adapter.walletBalance(b.collateral);
+      return { ok: true, amountUsd: unitsToUsd(balAfter - balBefore, price, b.collateral.decimals), detail: summarize(r) };
+    } catch (e) {
+      // the close succeeded: never fail after money moved (the wallet snapshot corrects idle)
+      const est = r.amountUsd ?? pos.equityUsd * Math.min(1, fraction);
+      return { ok: true, amountUsd: est, detail: `${summarize(r)}; wallet read failed (${(e as Error).message}) — booked $${est.toFixed(2)}` };
+    }
   }
 
   async rebalance(pos: Position, opp: Opportunity): Promise<ExecResult> {

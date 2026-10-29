@@ -129,16 +129,20 @@ sources:
     chains: []
     assumed_withdrawable_frac: 0.3
   supply:                         # supply-only lending (deposit, no borrow): sources/supply.ts
+    utilization_warn: 0.95        # blocks new deposits (a deposit lowers utilization; the 1/10 + 1/5 liquidity rules guard exits)
+    utilization_exit: 0.99        # leave: the pool is close to locked (not used for vaults)
     max_risk_tier: 2              # refuse deposits into stables whose depeg tier is above this
     unknown_stable_tier: 3        # a stable missing from `stables` is treated as tier 3
     txs_per_entry: 2              # approve + deposit
     txs_per_exit: 1
 
-# Stablecoin depeg risk (deposits AND loops). PROVISIONAL tiers — replace with
-# researched values. The expected loss is charged as a running cost:
+# Stablecoin depeg risk (deposits AND loops), researched 2026-10-29 (docs/selection.md §4).
+# Keys are case-insensitive (USDT also covers USDt); two keys differing only by case are an error.
+# The expected loss is charged as a running cost:
 #   deposit / same-asset loop: 1 x loss(asset); two-asset loop: L x loss(collateral).
 # Per stable: tier (1|2|3), expected_loss_apr (default tiers_default_loss[tier]),
-# depeg_warn / depeg_exit (|price-1| levels, override sources.lending_loop), and
+# depeg_warn / depeg_exit (|price-1| levels; deposits use them as is, loops use the stricter of
+# these and sources.lending_loop.depeg_*), and
 # max_frac (cap on that asset across ALL positions, share of total equity).
 stables:   # researched 2026-10-29 (docs/selection.md §3)
   USDC:    {tier: 1, expected_loss_apr: 0.0005, depeg_warn: 0.003, depeg_exit: 0.01}

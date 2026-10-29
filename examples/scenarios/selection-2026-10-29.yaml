@@ -54,6 +54,7 @@ opportunities:
       protocol: fluid
       chain: ethereum
       marketId: ethereum:fUSDC
+      kind: vault
       asset: {symbol: USDC, priceUsd: 1.0}
       totalSupplyUsd: 140300000
       totalBorrowUsd: 125450000
@@ -82,6 +83,7 @@ opportunities:
       protocol: morpho-vault
       chain: ethereum
       marketId: ethereum:sentora-rlusd
+      kind: vault
       asset: {symbol: RLUSD, priceUsd: 1.0}
       totalSupplyUsd: 437000000
       totalBorrowUsd: 428540000
@@ -101,6 +103,7 @@ opportunities:
       protocol: fluid
       chain: ethereum
       marketId: ethereum:fGHO
+      kind: vault
       asset: {symbol: GHO, priceUsd: 0.9995}
       totalSupplyUsd: 22500000
       totalBorrowUsd: 15260000
@@ -147,6 +150,7 @@ opportunities:
       protocol: fluid
       chain: arbitrum
       marketId: arbitrum:fUSDT0
+      kind: vault
       asset: {symbol: USDT0, priceUsd: 1.0}
       totalSupplyUsd: 40000000
       totalBorrowUsd: 34530000

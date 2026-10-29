@@ -43,6 +43,12 @@ export interface RewardRate {
   ineligibleIfBorrowing?: string[];
   /** Campaign APR cap (target-APR campaigns); the stream never exceeds it. */
   aprCap?: number;
+  /**
+   * USD the reward is spread over when that is not the whole pool side (a
+   * Scallop spool, a gauge): `apr` is relative to this basis and my deposit
+   * dilutes it. Default: the pool side's total. (Read by sources/supply.ts.)
+   */
+  basisUsd?: number;
 }
 
 /** Protocol-agnostic view of ONE same-asset lending market. */

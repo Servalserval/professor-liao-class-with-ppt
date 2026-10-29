@@ -74,12 +74,29 @@ export function decimalStringToUnits(s: string, decimals: number): bigint {
   return shift >= 0 ? digits * 10n ** BigInt(shift) : digits / 10n ** BigInt(-shift);
 }
 
-/** Navi internal 9-decimal amount (string from getLendingState / bigint) -> token base units (floor). */
-export function naviNormalToBase(amount: string | bigint, decimals: number): bigint {
+/**
+ * Navi internal 9-decimal amount (string from getLendingState / bigint) -> token base units.
+ * Floor by default (balances we can withdraw); "ceil" for debts, so a dust debt never reads as 0.
+ */
+export function naviNormalToBase(amount: string | bigint, decimals: number, rounding: "floor" | "ceil" = "floor"): bigint {
   const a = typeof amount === "bigint" ? amount : decimalStringToUnits(amount, 0);
   if (decimals === NAVI_INTERNAL_DECIMALS) return a;
-  if (decimals < NAVI_INTERNAL_DECIMALS) return a / 10n ** BigInt(NAVI_INTERNAL_DECIMALS - decimals);
+  if (decimals < NAVI_INTERNAL_DECIMALS) {
+    const d = 10n ** BigInt(NAVI_INTERNAL_DECIMALS - decimals);
+    return rounding === "ceil" ? (a + d - 1n) / d : a / d;
+  }
   return a * 10n ** BigInt(decimals - NAVI_INTERNAL_DECIMALS);
+}
+
+/** Raw (9-decimal) amount > 0? Independent of prices, so a missing oracle price never hides a debt. */
+export function rawPositive(amount: string | bigint | undefined | null): boolean {
+  if (amount === undefined || amount === null) return false;
+  try {
+    return (typeof amount === "bigint" ? amount : decimalStringToUnits(String(amount), 0)) > 0n;
+  } catch {
+    // unparseable -> assume a balance exists (conservative)
+    return true;
+  }
 }
 
 export function unitsToNumber(units: bigint, decimals: number): number {

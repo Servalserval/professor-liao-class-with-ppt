@@ -9,6 +9,7 @@
  */
 import type { Executor, ExecResult, Opportunity, Position } from "@incentive-router/core";
 import {
+  BroadcastUnconfirmedError,
   type AssetRef,
   type LiveContext,
   type LiveResult,
@@ -39,9 +40,16 @@ function summarize(r: LiveResult): string {
   return [r.detail, txs].filter(Boolean).join(" | ");
 }
 
+/** How long an entry whose outcome is unknown blocks a new entry into the same market. */
+const UNRESOLVED_ENTRY_MS = 15 * 60_000;
+
 export class SupplyExecutor implements Executor {
   readonly markToMarket?: (pos: Position, opp?: Opportunity) => Promise<number>;
   private readonly nullMarks = new Map<string, number>();
+  /** A full exit was attempted (broadcast): the next "no deposit" read is believed at once. */
+  private readonly exitAttempted = new Set<string>();
+  /** Entries booked at $0 because their outcome was unknown: no new entry until this time. */
+  private readonly unresolvedUntil = new Map<string, number>();
 
   constructor(private readonly d: SupplyExecutorDeps) {
     if (d.mode === "live") {
@@ -50,14 +58,20 @@ export class SupplyExecutor implements Executor {
         const v = await b.adapter.supplyPosition(b.marketId);
         if (v) {
           this.nullMarks.delete(pos.oppId);
+          this.unresolvedUntil.delete(pos.oppId);
           return v.depositUsd;
         }
+        if (this.exitAttempted.has(pos.oppId) || pos.equityUsd <= 0) return 0;
         const n = (this.nullMarks.get(pos.oppId) ?? 0) + 1;
         this.nullMarks.set(pos.oppId, n);
         if (n < (this.d.nullMarksBeforeZero ?? 3)) throw new Error(`${pos.oppId}: adapter reports no deposit (${n}x); keeping book value`);
         return 0;
       };
     }
+  }
+
+  private now(): number {
+    return Date.now();
   }
 
   private binding(oppId: string): SupplyBinding {
@@ -79,8 +93,24 @@ export class SupplyExecutor implements Executor {
     }
   }
 
+  /**
+   * Entry outcome unknown (money may or may not have moved): track the
+   * position at $0 and debit nothing. The next wallet snapshot and
+   * markToMarket settle it either way without a fake drawdown; a new entry
+   * into this market waits until then.
+   */
+  private unresolved(oppId: string, why: string): ExecResult {
+    this.unresolvedUntil.set(oppId, this.now() + UNRESOLVED_ENTRY_MS);
+    return { ok: true, amountUsd: 0, spentUsd: 0, detail: `${why} — outcome unknown: tracked at $0 until the next mark / wallet read settles it` };
+  }
+
   async enter(opp: Opportunity, deltaUsd: number): Promise<ExecResult> {
     const b = this.binding(opp.id);
+    const until = this.unresolvedUntil.get(opp.id);
+    if (this.d.mode === "live" && until !== undefined && this.now() < until)
+      return { ok: false, detail: `previous entry into ${opp.id} is unresolved; waiting for an on-chain read` };
+    this.nullMarks.delete(opp.id);
+    this.exitAttempted.delete(opp.id);
     const price = await this.d.ctx.priceUsd(b.asset);
     let units = usdToUnits(deltaUsd, price, b.asset.decimals);
     const have = await b.adapter.walletBalance(b.asset);
@@ -88,27 +118,37 @@ export class SupplyExecutor implements Executor {
     if (have < units)
       return { ok: false, detail: `wallet has ${unitsToUsd(have, price, b.asset.decimals).toFixed(2)} USD of ${b.asset.symbol} on ${b.asset.chain}, need ${deltaUsd.toFixed(2)}` };
     const spentUsd = unitsToUsd(units, price, b.asset.decimals);
-    const before = this.d.mode === "live" ? await this.depositUsd(b) : { ok: true as const, usd: 0 };
-    const book = async (why: string): Promise<ExecResult | null> => {
+    let before = 0;
+    if (this.d.mode === "live") {
+      const r0 = await this.depositUsd(b);
+      // without a baseline the result cannot be measured: send nothing
+      if (!r0.ok) return { ok: false, detail: `deposit read failed before entry (${r0.err}); nothing sent` };
+      before = r0.usd;
+    }
+    /** Measured growth of my deposit (capped at what was sent), null when nothing grew, undefined when unreadable. */
+    const measure = async (): Promise<number | null | undefined> => {
       const a = await this.depositUsd(b);
-      if (!a.ok || !before.ok) {
-        const est = spentUsd * (1 - opp.costs.entryFrac) - opp.costs.fixedEntryUsd;
-        return { ok: true, amountUsd: Math.max(0, est), spentUsd, detail: `${why}; deposit read failed — booked estimate $${est.toFixed(2)}, verify on-chain` };
-      }
-      const grew = a.usd - before.usd;
-      return grew > Math.max(1, spentUsd * 0.01) ? { ok: true, amountUsd: grew, spentUsd, detail: `${why}; deposit grew $${grew.toFixed(2)}` } : null;
+      if (!a.ok) return undefined;
+      const grew = Math.min(a.usd - before, spentUsd);
+      return grew > Math.max(1, spentUsd * 0.01) ? grew : null;
     };
     let r: LiveResult;
     try {
       r = await b.adapter.deposit(b.marketId, units, this.wctx());
     } catch (e) {
       if (this.d.mode === "shadow") return { ok: false, detail: `shadow: ${(e as Error).message}` };
-      return (await book(`PARTIAL after error (${(e as Error).message})`)) ?? { ok: false, detail: `deposit failed: ${(e as Error).message}` };
+      const msg = (e as Error).message;
+      const g = await measure();
+      if (typeof g === "number") return { ok: true, amountUsd: g, spentUsd: g, detail: `PARTIAL after error (${msg}); deposit grew $${g.toFixed(2)}` };
+      if (g === undefined || e instanceof BroadcastUnconfirmedError) return this.unresolved(opp.id, `deposit error (${msg})`);
+      return { ok: false, detail: `deposit failed: ${msg}` };
     }
     if (!r.ok) {
-      if (this.d.mode === "live" && r.txs.some((t) => !t.simulated && t.id)) {
-        const booked = await book(`PARTIAL: ${summarize(r)}`);
-        if (booked) return booked;
+      const broadcast = r.txs.some((t) => !t.simulated && t.id);
+      if (this.d.mode === "live" && broadcast) {
+        const g = await measure();
+        if (typeof g === "number") return { ok: true, amountUsd: g, spentUsd: g, detail: `PARTIAL: ${summarize(r)}; deposit grew $${g.toFixed(2)}` };
+        if (g === undefined || r.txs.some((t) => t.unconfirmed)) return this.unresolved(opp.id, `PARTIAL: ${summarize(r)}`);
       }
       return { ok: false, detail: summarize(r) };
     }
@@ -116,11 +156,20 @@ export class SupplyExecutor implements Executor {
       const cost = spentUsd * opp.costs.entryFrac + opp.costs.fixedEntryUsd;
       return { ok: true, amountUsd: spentUsd - cost, spentUsd, detail: `shadow: simulated OK | ${summarize(r)}` };
     }
-    return (await book(summarize(r))) ?? { ok: true, amountUsd: 0, spentUsd, detail: `${summarize(r)} | WARNING: no deposit increase measured` };
+    const g = await measure();
+    if (typeof g === "number") return { ok: true, amountUsd: g, spentUsd, detail: `${summarize(r)}; deposit grew $${g.toFixed(2)}` };
+    if (g === undefined) {
+      // the adapter confirmed the deposit; only our read failed: book the estimate
+      const est = Math.max(0, spentUsd * (1 - opp.costs.entryFrac) - opp.costs.fixedEntryUsd);
+      return { ok: true, amountUsd: est, spentUsd, detail: `${summarize(r)}; deposit read failed — booked estimate $${est.toFixed(2)}, the next mark corrects it` };
+    }
+    return this.unresolved(opp.id, `${summarize(r)} | no deposit increase measured yet`);
   }
 
   async exit(pos: Position, fraction: number, opp?: Opportunity): Promise<ExecResult> {
     const b = this.binding(pos.oppId);
+    const full = fraction >= 1;
+    this.nullMarks.delete(pos.oppId);
     const price = await this.d.ctx.priceUsd(b.asset);
     const balBefore = await b.adapter.walletBalance(b.asset);
     let r: LiveResult;
@@ -128,18 +177,34 @@ export class SupplyExecutor implements Executor {
       r = await b.adapter.withdraw(b.marketId, Math.min(1, fraction), this.wctx());
     } catch (e) {
       if (this.d.mode === "shadow") return { ok: false, detail: `shadow: ${(e as Error).message}` };
+      if (full) this.exitAttempted.add(pos.oppId);
       const balAfter = await b.adapter.walletBalance(b.asset).catch(() => balBefore);
       const back = unitsToUsd(balAfter - balBefore, price, b.asset.decimals);
       return { ok: false, amountUsd: back > 0 ? back : undefined, detail: `withdraw failed: ${(e as Error).message}${back > 0 ? ` (after $${back.toFixed(2)} returned)` : ""}` };
     }
+    if (this.d.mode === "live" && full && r.txs.some((t) => !t.simulated && t.id)) this.exitAttempted.add(pos.oppId);
     if (!r.ok) return { ok: false, detail: summarize(r) };
     if (this.d.mode === "shadow") {
       const gross = pos.equityUsd * Math.min(1, fraction);
       const cost = opp ? gross * opp.costs.exitFrac + opp.costs.fixedExitUsd : 0;
       return { ok: true, amountUsd: Math.max(0, gross - cost), detail: `shadow: simulated OK | ${summarize(r)}` };
     }
-    const balAfter = await b.adapter.walletBalance(b.asset);
-    return { ok: true, amountUsd: unitsToUsd(balAfter - balBefore, price, b.asset.decimals), detail: summarize(r) };
+    if (!r.txs.some((t) => !t.simulated && t.id)) {
+      // nothing was sent: the adapter saw no deposit. One lagging read must not drop a real one.
+      const again = await this.depositUsd(b);
+      if (!again.ok) return { ok: false, detail: `${summarize(r)}; confirming read failed (${again.err}) — retrying` };
+      if (again.usd > 1) return { ok: false, detail: `${summarize(r)}; but a re-read shows $${again.usd.toFixed(2)} deposited — retrying` };
+      this.exitAttempted.add(pos.oppId);
+      return { ok: true, amountUsd: 0, detail: `${summarize(r)} (no deposit, confirmed by a second read)` };
+    }
+    try {
+      const balAfter = await b.adapter.walletBalance(b.asset);
+      return { ok: true, amountUsd: unitsToUsd(balAfter - balBefore, price, b.asset.decimals), detail: summarize(r) };
+    } catch (e) {
+      // the withdraw succeeded: never fail after money moved
+      const est = r.amountUsd ?? pos.equityUsd * Math.min(1, fraction);
+      return { ok: true, amountUsd: est, detail: `${summarize(r)}; wallet read failed (${(e as Error).message}) — booked $${est.toFixed(2)}, the wallet snapshot corrects idle` };
+    }
   }
 
   async rebalance(): Promise<ExecResult> {

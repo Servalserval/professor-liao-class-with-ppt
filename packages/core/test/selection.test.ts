@@ -230,8 +230,10 @@ describe("scenario: examples/scenarios/selection-2026-10-29*.yaml", () => {
     const v4 = by("static:aave-v4:ethereum:core:USDC");
     assert.equal(v4.verdict, "rejected");
     assert.ok(v4.haircutApr > 0.02, JSON.stringify(v4));
-    assert.match(by("static:aave-v3:plasma:USDT0").reasons.join(), /utilization/);
-    assert.match(by("static:morpho-vault:ethereum:sentora-rlusd").reasons.join(), /utilization=0\.98/);
+    // 93.7% utilization is below the deposit warn level (95%): it is the rate that fails
+    assert.match(by("static:aave-v3:plasma:USDT0").reasons.join(), /net APR 4\.\d\d% < entry 5\.50%/);
+    // a vault has no utilization signal: the withdrawable-liquidity rules apply instead
+    assert.doesNotMatch(by("static:morpho-vault:ethereum:sentora-rlusd").reasons.join(), /utilization/);
     // USDe is a tier-3 stable: loops pay 3.33 x 1.5% expected depeg loss
     for (const id of ["static:aave-v3:plasma:USDe/GHO", "static:aave-v3:monad:USDe/USDT0"]) {
       const l = by(id);
@@ -271,5 +273,44 @@ describe("per-tier kind premium adjustments", () => {
     assert.equal(entryThreshold(c, 2, "lending_loop"), b + c.thresholds.entry_premium_by_tier[2], "other kinds untouched");
     c.thresholds.kind_premium_adjust = { deposit: { entry: { 1: -0.03 }, exit: { 1: 0 } } };
     assert.match(validateConfig(c).join(), /hysteresis/);
+  });
+});
+
+describe("review fixes (round 2)", () => {
+  it("loops never get looser depeg levels than sources.lending_loop (per-stable levels are sized for 1x)", () => {
+    const cfg = cfgWith(); // USDe tier 3: 0.7% / 2.0%; lending_loop 0.3% / 1.0%
+    const o = loopPairOpportunity(pair(), sctx(cfg), "s")!;
+    const d = o.signals.find((s) => s.name === "depeg")!;
+    assert.equal(d.warnAt, cfg.sources.lending_loop.depeg_warn);
+    assert.equal(d.exitAt, cfg.sources.lending_loop.depeg_exit);
+    // a deposit uses the per-stable levels as is
+    const dep = supplyOpportunity(market({ asset: { symbol: "USDT0", priceUsd: 1 } }), sctx(cfg), "s")!;
+    assert.equal(dep.signals.find((s) => s.name === "depeg")!.exitAt, 0.015);
+  });
+
+  it("stables keys differing only by case are a config error (no silent shadowing)", () => {
+    assert.match(validateConfig(cfgWith({ stables: { usdt0: { tier: 3, max_frac: 0.2 } } })).join(), /differ only by case/);
+  });
+
+  it("per-stable cap counts leverage and is case-insensitive", () => {
+    const cfg = cfgWith({ stables: { USDe: { tier: 3, max_frac: 0.5 } }, caps: { per_venue_frac_by_tier: { 1: 1, 2: 1, 3: 1 }, per_opportunity_frac: 1, per_token_frac: 1, per_chain_frac: { default: 1 }, max_position_usd: 1e9 } });
+    const o = loopPairOpportunity(pair(), sctx(cfg), "s")!;
+    const L = (o.meta as { leverage: number }).leverage;
+    const ctx = dctx({ cfg, equity: 100_000 });
+    // $20k equity in a 3.33x loop = $66.7k of USDe exposure > 50% of $100k
+    const v = capViolations(cfg, withAddition(ctx.exposure, o, 20_000), o, 100_000);
+    assert.ok(L > 3);
+    assert.ok(v.some((x) => /stable USDe .*leverage included/.test(x)), v.join("; "));
+    assert.deepEqual(capViolations(cfg, withAddition(ctx.exposure, o, 10_000), o, 100_000).filter((x) => /stable/.test(x)), []);
+  });
+
+  it("deposits: own utilization levels (lower utilization is not a reason to block); vaults have no utilization signal", () => {
+    const cfg = cfgWith();
+    const hi = supplyOpportunity(market({ totalBorrowUsd: 93e6 }), sctx(cfg), "s")!;
+    const u = hi.signals.find((s) => s.name === "utilization")!;
+    assert.equal(u.warnAt, cfg.sources.supply.utilization_warn);
+    assert.deepEqual(entryBlockers(hi, dctx({ cfg })).filter((x) => /utilization/.test(x)), []);
+    const vault = supplyOpportunity(market({ kind: "vault", totalBorrowUsd: 98e6, withdrawableUsd: 2e6 }), sctx(cfg), "s")!;
+    assert.equal(vault.signals.find((s) => s.name === "utilization"), undefined);
   });
 });

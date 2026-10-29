@@ -56,6 +56,12 @@ export interface Leg {
   /** Asset actually held at this venue (net), for per-token caps. */
   token: string;
   equityFrac: number;
+  /**
+   * Depeg exposure to `token` as a multiple of this leg's equity (default 1).
+   * A loop holds L x equity of its collateral: grossFrac = L. Used by the
+   * per-stable cap (stables.<SYM>.max_frac).
+   */
+  grossFrac?: number;
 }
 
 /**

@@ -10,6 +10,7 @@ import { BroadcastUnconfirmedError, type AssetRef, type LiveContext } from "@inc
 import { Mutex, Transaction, normalizeStructTag, normalizeSuiAddress, type PtbSwapper, type SuiEnv } from "../src/common.js";
 import {
   NaviAdapter,
+  NaviAccountConflictError,
   apyToApr,
   buildIrmModel,
   capsRemaining,
@@ -538,7 +539,10 @@ describe("NaviAdapter", () => {
     // same-asset view: put the debt on USDC too
     const sdk = {
       ...h.sdk,
-      getLendingState: (async () => [{ assetId: 10, supplyBalance: String(1000e9), borrowBalance: String(800e9), market: "main", pool: { ...POOLS[0], emodes: [EMODE_STABLE] } }]) as unknown as NaviSdk["getLendingState"],
+      getLendingState: (async (addr: string) =>
+        normalizeSuiAddress(addr) === CAP_ID
+          ? [{ assetId: 10, supplyBalance: String(1000e9), borrowBalance: String(800e9), market: "main", pool: { ...POOLS[0], emodes: [EMODE_STABLE] } }]
+          : []) as unknown as NaviSdk["getLendingState"],
     };
     const a = new NaviAdapter({ env: h.env, pairs: [{ pairId: "USDC/USDC", collateral: USDC, debt: USDC }], sdk });
     const v = await a.position("USDC/USDC");
@@ -691,29 +695,29 @@ describe("NaviAdapter", () => {
 // SupplyAdapter (plain deposits) + broadcast honesty
 // ---------------------------------------------------------------------------
 
-const NO_EMODE_POOLS = POOLS.map((p) => ({ ...p, emodes: [] as unknown[] })) as typeof POOLS;
 const SUPPLY_USDC = { asset: USDC };
 
 describe("NaviAdapter as SupplyAdapter", () => {
-  test("config: pairs optional; supply shares no account with an emode-'off' loop; ids unique", () => {
+  test("config: pairs optional; loop pairs and supply markets never share a Navi market; ids unique", () => {
     const h = mkHarness();
     assert.doesNotThrow(() => new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk }));
-    assert.throws(
-      () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDC, debt: USDC, emode: "off" }], supply: [SUPPLY_USDC], sdk: h.sdk }),
-      /share the wallet's Navi account in market main: both hold USDC \(positions conflated\) and the deposit would collateralize the loop/
-    );
-    // even without a shared asset the account would be shared
-    assert.throws(
-      () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDT, debt: USDT, emode: "off" }], supply: [SUPPLY_USDC], sdk: h.sdk }),
-      /would collateralize the loop/
-    );
-    // other market, or an e-mode-capable pair: fine
+    for (const emode of ["off", "auto", 2] as const) {
+      assert.throws(
+        () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDC, debt: USDC, emode }], supply: [SUPPLY_USDC], sdk: h.sdk }),
+        /both configured in Navi market main; loops and plain deposits must not share a market in one adapter .*both hold USDC/
+      );
+    }
+    // no shared asset: still refused (same wallet account could collateralize the loop)
+    assert.throws(() => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDT, debt: USDT }], supply: [SUPPLY_USDC], sdk: h.sdk }), /must not share a market/);
+    // different markets: fine
     assert.doesNotThrow(
-      () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDC, debt: USDC, emode: "off", market: "sui-usdc" }], supply: [SUPPLY_USDC], sdk: h.sdk })
+      () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDC, debt: USDC, market: "sui-usdc" }], supply: [SUPPLY_USDC], sdk: h.sdk })
     );
-    assert.doesNotThrow(() => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDC, debt: USDC }], supply: [SUPPLY_USDC], sdk: h.sdk }));
     assert.throws(() => new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC, { asset: USDC, marketId: "x" }], sdk: h.sdk }), /configured twice/);
-    assert.throws(() => new NaviAdapter({ env: h.env, pairs: [{ pairId: "main:USDC", collateral: USDC, debt: USDC }], supply: [SUPPLY_USDC], sdk: h.sdk }), /not unique/);
+    assert.throws(
+      () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "main:USDC", collateral: USDC, debt: USDC, market: "sui-usdc" }], supply: [SUPPLY_USDC], sdk: h.sdk }),
+      /not unique/
+    );
   });
 
   test("supplyMarkets(): base APR, incentives, IRM, totals, cash, caps, my deposit", async () => {
@@ -847,24 +851,77 @@ describe("NaviAdapter as SupplyAdapter", () => {
     assert.deepEqual(hl.control.waited, ["DIGEST2"]);
   });
 
-  test("loop/supply separation at runtime and claimRewards by supply marketId", async () => {
-    // "auto" pair with no covering e-mode would land in the wallet account holding supply deposits
-    const h = mkHarness({ pools: NO_EMODE_POOLS });
-    const a = new NaviAdapter({ env: h.env, pairs: [{ pairId: "USDC/USDC", collateral: USDC, debt: USDC }], supply: [SUPPLY_USDC], sdk: h.sdk });
-    const r = await a.open("USDC/USDC", 1_000_000_000n, 0.7, h.ctx);
-    assert.equal(r.ok, false);
-    assert.match(r.detail!, /holds plain supply deposits/);
-    const issues = await a.verifyConfig();
-    assert.ok(issues.some((i) => /main:USDC: loop pair USDC\/USDC has no covering e-mode/.test(i)), issues.join("\n"));
-    // the supply deposit in the wallet account is not reported as a loop position
-    const h2 = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
-    const b = new NaviAdapter({ env: h2.env, pairs: [{ pairId: "USDC/USDC", collateral: USDC, debt: USDC }], supply: [SUPPLY_USDC], sdk: h2.sdk });
-    assert.equal(await b.position("USDC/USDC"), null);
+  test("supply side refuses a wallet account that borrows (loop leftovers), checked on RAW balances", async () => {
+    // earlier run left a wallet-account loop: 1000 USDC collateral, 600 USDT debt; USDT oracle price missing (0)
+    const zeroPx = POOLS.map((p) => (p.id === 19 ? { ...p, oracle: { ...p.oracle, price: "0" } } : p)) as typeof POOLS;
+    const h = mkHarness({ state: { [ADDR]: { coll: 1000, debt: 600 } }, pools: zeroPx });
+    const a = new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk });
+    await assert.rejects(a.supplyPosition("main:USDC"), (e: Error) => e instanceof NaviAccountConflictError && /has debt \(USDT\)/.test(e.message));
+    await assert.rejects(a.withdraw("main:USDC", 0.25, h.ctx), NaviAccountConflictError);
+    await assert.rejects(a.withdraw("main:USDC", 1, h.ctx), NaviAccountConflictError);
+    await assert.rejects(a.simulateWithdraw("main:USDC", h.ctx), NaviAccountConflictError);
+    assert.equal(h.calls.filter((c) => c.fn === "withdraw").length, 0, "no loop collateral was touched");
+    const d = await a.deposit("main:USDC", 1_000_000n, h.ctx);
+    assert.equal(d.ok, false);
+    assert.match(d.detail!, /has debt \(USDT\)/);
+    const [m] = await a.supplyMarkets();
+    assert.ok(m);
+    assert.equal(m.myDepositUsd, undefined, "loop collateral is not reported as a plain deposit");
+    assert.ok((await a.verifyConfig()).some((i) => /main:USDC: the wallet's Navi account in main has debt \(USDT\)/.test(i)));
+    assert.equal(h.sims(), 0);
+  });
+
+  test("loop side never hides a wallet-account position (earlier run / config), even with e-mode resolved", async () => {
+    const h = mkHarness({ state: { [ADDR]: { coll: 1000, debt: 600 } } });
+    const a = new NaviAdapter({ env: h.env, pairs: [{ pairId: "USDC/USDT", collateral: USDC, debt: USDT }], sdk: h.sdk, swapper: h.swapper });
+    const v = await a.position("USDC/USDT");
+    assert.ok(v, "wallet-account loop is reported, not null");
+    close(v.collateralUsd, 1000);
+    close(v.debtUsd, 600);
+    assert.equal(a.pairInfo("USDC/USDT")?.emodeId, 2); // pair itself resolves to an e-mode cap
+    const o = await a.open("USDC/USDT", 1_000_000n, 0.5, h.ctx);
+    assert.equal(o.ok, false);
+    assert.match(o.detail!, /existing USDC\/USDT position is in wallet Navi account/);
+    assert.equal(await a.simulateClose("USDC/USDT", h.ctx), true);
+    h.calls.length = 0;
+    const c = await a.close("USDC/USDT", 1, h.ctx);
+    assert.equal(c.ok, true, c.detail);
+    assert.notEqual(c.detail, "no position");
+    const flash = u64Input(h.calls.find((x) => x.fn === "flash")!.args[1]);
+    assert.ok(flash >= 600_000_000n, "repays the wallet-account debt");
+    assert.equal(h.calls.find((x) => x.fn === "repay")!.args[1], undefined, "on the wallet account (no cap)");
+    // dust debt (raw > 0, < 1 base unit) still counts as debt
+    const hd = mkHarness({ state: { [ADDR]: { coll: 1000, debt: 0.0000001 } } });
+    const ad = new NaviAdapter({ env: hd.env, pairs: [{ pairId: "USDC/USDT", collateral: USDC, debt: USDT }], sdk: hd.sdk, swapper: hd.swapper });
+    assert.ok((await ad.position("USDC/USDT"))!.debtUsd > 0);
+  });
+
+  test("loop side: pair debt in two accounts -> refuse to guess (no 'no position', no close)", async () => {
+    const h = mkHarness({
+      caps: [{ marketId: 0, emodeId: 2, accountCap: CAP_ID }],
+      state: { [ADDR]: { coll: 1000, debt: 600 }, [CAP_ID]: { coll: 1000, debt: 800 } },
+    });
+    const a = new NaviAdapter({ env: h.env, pairs: [{ pairId: "USDC/USDT", collateral: USDC, debt: USDT }], sdk: h.sdk, swapper: h.swapper });
+    await assert.rejects(a.position("USDC/USDT"), /debt in 2 Navi accounts/);
+    const c = await a.close("USDC/USDT", 1, h.ctx);
+    assert.equal(c.ok, false);
+    assert.match(c.detail!, /debt in 2 Navi accounts/);
+    assert.equal(await a.simulateClose("USDC/USDT", h.ctx), false);
+    assert.equal(h.sims(), 0);
+    // collateral-only leftover in another account: the account with the debt wins
+    const h2 = mkHarness({ caps: [{ marketId: 0, emodeId: 2, accountCap: CAP_ID }], state: { [ADDR]: { coll: 50, debt: 0 }, [CAP_ID]: { coll: 1000, debt: 800 } } });
+    const b = new NaviAdapter({ env: h2.env, pairs: [{ pairId: "USDC/USDT", collateral: USDC, debt: USDT }], sdk: h2.sdk, swapper: h2.swapper });
+    close((await b.position("USDC/USDT"))!.debtUsd, 800);
+  });
+
+  test("claimRewards by supply marketId (supply-only adapter)", async () => {
+    const h = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
+    const b = new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk });
     assert.equal((await b.supplyPosition("main:USDC"))!.units, 500_000_000n);
     assert.deepEqual(await b.verifyConfig(), []);
-    const c = await b.claimRewards(h2.ctx, "main:USDC");
+    const c = await b.claimRewards(h.ctx, "main:USDC");
     assert.equal(c.ok, true, c.detail);
-    assert.equal(h2.calls.find((x) => x.fn === "claim")!.args[0], 1, "only the wallet-account USDC entry");
+    assert.equal(h.calls.find((x) => x.fn === "claim")!.args[0], 1, "only the wallet-account USDC entry");
     assert.deepEqual(c.claimed, [{ token: "NAVX", amount: 1_000_000_000n, decimals: 9, coinType: NAVX_T }]);
   });
 });

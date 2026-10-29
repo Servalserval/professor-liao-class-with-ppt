@@ -83,8 +83,9 @@ lending:
     pairs:
       - {pairId: USDe-USDT0, collateral: USDe, debt: USDT0}
   # Plain deposits (supply-only, no borrow): the router compares them with the loops on one
-  # risk-adjusted scale (docs/selection.md). An asset used by a loop pair of the same Aave
-  # market cannot also be a plain deposit there (one account per wallet per market).
+  # risk-adjusted scale (docs/selection.md). ONE ROLE PER MARKET: a wallet has one account
+  # per lending market, and a plain deposit there would back the loop's debt, so a market is
+  # either a loop entry or a deposit entry, and is listed once (the runner refuses otherwise).
   - type: aave-v3
     chain: base
     market: AaveV3Base
@@ -118,8 +119,8 @@ lending:
   #   chain: sui
   #   pairs: [{pairId: USDC-USDsui, collateral: USDC, debt: USDsui}]
   #
-  # Sui plain deposits (each adapter keeps them apart from its loops: Navi wallet account,
-  # Suilend a dedicated borrow-free obligation, Scallop sCoin / spool):
+  # Sui plain deposits — instead of (not in addition to) the Sui loop entries above for the
+  # same market (one role per market):
   # - type: navi
   #   chain: sui
   #   pairs: []

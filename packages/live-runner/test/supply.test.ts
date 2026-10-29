@@ -23,6 +23,13 @@ class FakeSupply implements SupplyAdapter {
   dep = 0n;
   depositThrowsAfter = false;
   withdrawRevert = false;
+  /** Next N supplyPosition reads throw (RPC down). */
+  failPositionReads = 0;
+  /** Next N supplyPosition reads return null although a deposit exists (lagging node). */
+  lagReads = 0;
+  /** deposit outcome override: approve broadcast then fail / broadcast with unknown confirmation (lands or not). */
+  depositMode: "normal" | "approveOnly" | "unconfirmedLands" | "unconfirmedLost" = "normal";
+  failWalletReads = 0;
   calls: string[] = [];
   market(): SupplyMarket {
     return {
@@ -41,12 +48,30 @@ class FakeSupply implements SupplyAdapter {
   }
   async supplyPosition(marketId: string): Promise<SupplyPositionView | null> {
     if (marketId.toLowerCase() !== "0xvault") throw new Error(`unknown market ${marketId}`);
+    if (this.failPositionReads > 0) {
+      this.failPositionReads--;
+      throw new Error("rpc 503");
+    }
+    if (this.lagReads > 0) {
+      this.lagReads--;
+      return null;
+    }
     if (this.dep === 0n) return null;
     return { marketId, depositUsd: Number(this.dep) / 1e6, units: this.dep, rewardsUnclaimed: [], asOfMs: Date.now() };
   }
   async deposit(_m: string, amount: bigint, c: LiveContext): Promise<LiveResult> {
     this.calls.push(`deposit ${amount} dry=${c.dryRun}`);
     if (c.dryRun) return { ok: true, txs: [{ chain: "base", description: "supply", simulated: true }] };
+    if (this.depositMode === "approveOnly")
+      return { ok: false, txs: [{ chain: "base", id: "0xapprove", description: "approve", simulated: false }], detail: "supply reverted" };
+    if (this.depositMode === "unconfirmedLost")
+      return { ok: false, txs: [{ chain: "base", id: "0xsup", description: "supply", simulated: false, unconfirmed: true }], detail: "UNCONFIRMED" };
+    if (this.depositMode === "unconfirmedLands") {
+      this.wallet -= amount;
+      this.dep += amount;
+      this.lagReads = 1; // not visible yet
+      return { ok: false, txs: [{ chain: "base", id: "0xsup", description: "supply", simulated: false, unconfirmed: true }], detail: "UNCONFIRMED" };
+    }
     this.wallet -= amount;
     this.dep += amount;
     if (this.depositThrowsAfter) throw new Error("rpc dropped after broadcast");
@@ -67,6 +92,10 @@ class FakeSupply implements SupplyAdapter {
     return { ok: true, txs: [], claimed: [] };
   }
   async walletBalance() {
+    if (this.failWalletReads > 0) {
+      this.failWalletReads--;
+      throw new Error("rpc 429");
+    }
     return this.wallet;
   }
 }
@@ -180,6 +209,82 @@ describe("SupplyExecutor", () => {
     await assert.rejects(ex.markToMarket!(pos), /no deposit \(1x\)/);
     await assert.rejects(ex.markToMarket!(pos), /no deposit \(2x\)/);
     assert.equal(await ex.markToMarket!(pos), 0, "third consecutive null = really gone");
+  });
+
+  it("live: a failed baseline read sends nothing", async () => {
+    const a = new FakeSupply();
+    a.failPositionReads = 1;
+    const r = await mk("live", a).enter(opp("x"), 1_000);
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /nothing sent/);
+    assert.equal(a.calls.length, 0);
+  });
+
+  it("live: approve broadcast + failed supply with a clean re-read is a failure, not a phantom deposit", async () => {
+    const a = new FakeSupply();
+    a.depositMode = "approveOnly";
+    const r = await mk("live", a).enter(opp("x"), 2_000);
+    assert.equal(r.ok, false);
+    assert.equal(a.dep, 0n);
+  });
+
+  it("live: an unconfirmed deposit is tracked at $0 without debiting idle, blocks re-entry, and the next mark picks it up", async () => {
+    const a = new FakeSupply();
+    a.depositMode = "unconfirmedLands";
+    const ex = mk("live", a);
+    const r = await ex.enter(opp("x"), 2_000);
+    assert.equal(r.ok, true);
+    assert.equal(r.amountUsd, 0);
+    assert.equal(r.spentUsd, 0, "idle is settled by the wallet snapshot, not debited on a guess");
+    assert.match(r.detail!, /outcome unknown/);
+    a.depositMode = "normal";
+    const again = await ex.enter(opp("x"), 2_000);
+    assert.equal(again.ok, false);
+    assert.match(again.detail!, /unresolved/);
+    assert.equal(await ex.markToMarket!({ oppId: "x", equityUsd: 0 } as Position), 2_000);
+    const lost = new FakeSupply();
+    lost.depositMode = "unconfirmedLost";
+    const ex2 = mk("live", lost);
+    const r2 = await ex2.enter(opp("x"), 2_000);
+    assert.equal(r2.ok, true);
+    assert.equal(r2.amountUsd, 0);
+    assert.equal(await ex2.markToMarket!({ oppId: "x", equityUsd: 0 } as Position), 0, "a $0 placeholder with no deposit marks to 0 at once");
+  });
+
+  it("live: a top-up with a lagging baseline read books at most what was sent", async () => {
+    const a = new FakeSupply();
+    const ex = mk("live", a);
+    await ex.enter(opp("x"), 5_000);
+    a.lagReads = 1; // the baseline read misses the existing $5k
+    const r = await ex.enter(opp("x"), 1_000);
+    assert.equal(r.ok, true);
+    assert.equal(r.amountUsd, 1_000);
+  });
+
+  it("live: exit never fails after a successful withdraw; a full exit attempt makes the next empty read final", async () => {
+    const a = new FakeSupply();
+    const ex = mk("live", a);
+    await ex.enter(opp("x"), 3_000);
+    const pos = { oppId: "x", equityUsd: 3_000 } as Position;
+    // wallet read after the withdraw fails
+    let calls = 0;
+    const orig = a.walletBalance.bind(a);
+    a.walletBalance = async () => (++calls === 2 ? Promise.reject(new Error("rpc 429")) : orig());
+    const e = await ex.exit(pos, 1);
+    assert.equal(e.ok, true);
+    assert.equal(e.amountUsd, 3_000, "falls back to the book value");
+    assert.equal(await ex.markToMarket!(pos), 0, "no 3-strike wait after a full exit attempt");
+  });
+
+  it("live: an exit that sees no deposit is confirmed by a second read before the position is dropped", async () => {
+    const a = new FakeSupply();
+    const ex = mk("live", a);
+    await ex.enter(opp("x"), 3_000);
+    // the adapter's own read lags -> it reports "no deposit" without sending anything
+    a.withdraw = async () => ({ ok: true, txs: [], detail: "no deposit" });
+    const e = await ex.exit({ oppId: "x", equityUsd: 3_000 } as Position, 1);
+    assert.equal(e.ok, false);
+    assert.match(e.detail!, /re-read shows \$3000\.00/);
   });
 
   it("rebalance is a no-op for a plain deposit", async () => {

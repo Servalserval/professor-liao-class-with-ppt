@@ -64,6 +64,13 @@ export interface SupplyMarket {
   underlying?: string[];
   /** Free-form note shown in reports (curator, strategy). */
   note?: string;
+  /**
+   * "reserve" (default): a lending reserve; utilization = borrowed / supplied.
+   * "vault": an ERC-4626-style vault; totalBorrowUsd is just "not withdrawable
+   * now", so no utilization signal is derived and only the withdrawable-
+   * liquidity rules (1/10 entry, 1/5 exit) apply.
+   */
+  kind?: "reserve" | "vault";
 }
 
 const fin = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
@@ -169,9 +176,9 @@ export function supplyOpportunity(m: SupplyMarket, ctx: SourceContext, sourceId:
       label,
       kind: "reward",
       aprNow: r.aprCap !== undefined ? Math.min(r.apr, r.aprCap) : r.apr,
-      poolUsd: S,
+      poolUsd: r.basisUsd !== undefined && fin(r.basisUsd) && r.basisUsd > 0 ? r.basisUsd : S,
       grossPerEquity: 1,
-      myEquityNowUsd: myInPool,
+      myEquityNowUsd: r.basisUsd !== undefined && fin(r.basisUsd) && r.basisUsd > 0 ? Math.min(myInPool, r.basisUsd) : myInPool,
       aprMultiplier: 1,
       rewardToken: r.token,
       endsAtMs: r.endsAtMs ?? null,
@@ -203,12 +210,13 @@ export function supplyOpportunity(m: SupplyMarket, ctx: SourceContext, sourceId:
 
   // --- risk ------------------------------------------------------------------------------
   const risk = stableRisk(cfg, m.asset.symbol);
-  const ll = cfg.sources.lending_loop;
+  const sp = cfg.sources.supply;
+  const isVault = m.kind === "vault";
   const peg = usdPeg(m.asset.symbol);
   const depeg = peg === null ? 0 : Math.abs(m.asset.priceUsd / peg - 1);
   const sig = (name: string, value: number, warnAt: number, exitAt: number): StressSignal => ({ name, value, warnAt, exitAt, direction: "above" });
   const signalsAt = (u: number): StressSignal[] => [
-    sig("utilization", u, ll.utilization_warn, ll.utilization_exit),
+    ...(isVault ? [] : [sig("utilization", u, sp.utilization_warn, sp.utilization_exit)]),
     ...(peg === null ? [] : [sig("depeg", depeg, risk.depegWarn, risk.depegExit)]),
   ];
 

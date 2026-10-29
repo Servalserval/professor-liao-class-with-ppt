@@ -223,3 +223,15 @@ describe("supplyOpportunity: liquidity, signals, flags", () => {
     assert.ok(!acts.some((a) => a.type === "alert" && /health/.test(a.message)));
   });
 });
+
+describe("supply rewards with a smaller basis (spool / gauge)", () => {
+  it("basisUsd: the reward is diluted over the basis, not the whole pool", () => {
+    const cfg = cfgWith();
+    const pool = (basisUsd?: number) =>
+      supplyOpportunity(market({ rewards: [{ token: "USDC", apr: 0.05, ...(basisUsd !== undefined ? { basisUsd } : {}) }] }), sctx(cfg), "s")!;
+    const r = (o: Opportunity, E: number) => o.streams.find((s) => s.label === "supply_reward:USDC")!.aprAt(E);
+    // $1M into a $10M pool barely dilutes; into a $1M spool it halves the rate
+    assert.ok(r(pool(), 1e6) > 0.045);
+    assert.ok(close(r(pool(1e6), 1e6), 0.025, 1e-6), String(r(pool(1e6), 1e6)));
+  });
+});

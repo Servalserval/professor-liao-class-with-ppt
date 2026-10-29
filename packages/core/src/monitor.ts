@@ -971,7 +971,11 @@ export class Router {
       const opp = opps.get(p.oppId);
       if (!opp) continue;
       const v = valueAt(opp, p.equityUsd, vctx, { holding: true, noTimeWeight: true });
-      let baseApr = -opp.costs.ongoingApr;
+      // The expected depeg loss is a valuation charge, not cash that leaves the
+      // position: paper books accrue only real running costs (a depeg shows up
+      // through prices instead).
+      const depegLoss = typeof opp.meta?.["depegLossApr"] === "number" ? (opp.meta["depegLossApr"] as number) : 0;
+      let baseApr = -(opp.costs.ongoingApr - depegLoss);
       for (const s of v.streams) {
         if (s.kind === "points") continue;
         if (s.kind === "reward") {

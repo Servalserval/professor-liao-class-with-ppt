@@ -332,9 +332,27 @@ export class ERC4626VaultAdapter implements SupplyAdapter {
   // SupplyAdapter: reads
   // -------------------------------------------------------------------------
 
+  /**
+   * Per-vault isolation: a vault whose read fails (e.g. the MetaMorpho SDK
+   * fetch) is skipped with a warning instead of hiding every other vault.
+   * Throws only when every configured vault failed.
+   */
   async supplyMarkets(): Promise<SupplyMarket[]> {
     const now = await this.latestBlock();
-    return Promise.all([...this.vaults.values()].map((v) => this.market(v, now)));
+    const vaults = [...this.vaults.values()];
+    const settled = await Promise.allSettled(vaults.map((v) => this.market(v, now)));
+    const out: SupplyMarket[] = [];
+    const errors: string[] = [];
+    settled.forEach((r, i) => {
+      if (r.status === "fulfilled") out.push(r.value);
+      else {
+        const e = `${vaults[i]!.marketId} (${vaults[i]!.flavor}): ${msg(r.reason)}`;
+        errors.push(e);
+        this.log("warn", `${this.id}: skipping vault ${e}`);
+      }
+    });
+    if (vaults.length && !out.length) throw new Error(`${this.id}: every vault read failed: ${errors.join("; ")}`);
+    return out;
   }
 
   private async market(v: Vault, now: Block): Promise<SupplyMarket> {
@@ -353,6 +371,8 @@ export class ERC4626VaultAdapter implements SupplyAdapter {
       protocol: v.protocol,
       chain: this.chain,
       marketId: v.marketId,
+      // utilization = 1 - withdrawable/totalAssets is not a lending utilization: the core uses the liquidity rules instead
+      kind: "vault",
       asset: { symbol: v.asset.symbol, assetId: lc(v.asset.address), priceUsd: price },
       totalSupplyUsd: usd(totalAssets),
       totalBorrowUsd: fd.withdrawable === undefined ? 0 : usd(totalAssets > fd.withdrawable ? totalAssets - fd.withdrawable : 0n),
@@ -413,8 +433,13 @@ export class ERC4626VaultAdapter implements SupplyAdapter {
     return out;
   }
 
-  /** Leave no allowance behind (a vault that pulled less than approved). Best effort: never fails the caller. */
+  /**
+   * Leave no allowance behind (a vault that pulled less than approved). Best
+   * effort: never fails the caller. Sends NOTHING once any tx of this call is
+   * unconfirmed: a new tx could take the pending nonce and replace it.
+   */
   private async resetAllowance(token: Address, spender: Address, ctx: LiveContext, txs: TxRecord[]): Promise<void> {
+    if (txs.some((t) => t.unconfirmed)) return;
     try {
       const cur = await this.pc.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [this.env.account, spender] });
       if (cur === 0n) return;
@@ -455,14 +480,19 @@ export class ERC4626VaultAdapter implements SupplyAdapter {
           await this.resetAllowance(token, v.address, ctx, txs);
           throw e;
         }
+        // Unconfirmed: re-read only. Nothing more is signed in this call (no allowance reset):
+        // a follow-up tx could reuse the pending nonce and cancel the deposit we report.
         txs.push(unconfirmedRecord(this.chain, e));
-        const now = await this.sharesOf(v);
-        await this.resetAllowance(token, v.address, ctx, txs);
+        const [now, left] = await Promise.all([
+          this.sharesOf(v),
+          this.pc.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [this.env.account, v.address] }),
+        ]);
+        const allowanceNote = left > 0n ? `; allowance ${left} left to ${v.address} (not reset while a tx is unconfirmed)` : "";
         if (now > before) {
           const got = await this.convertToAssets(v, now - before);
-          return { ok: true, txs, amountUsd: unitsToUsd(got, price, v.asset.decimals), detail: `deposit ${e.id} unconfirmed but the share balance shows it landed (${before} -> ${now})` };
+          return { ok: true, txs, amountUsd: unitsToUsd(got, price, v.asset.decimals), detail: `deposit ${e.id} unconfirmed but the share balance shows it landed (${before} -> ${now})${allowanceNote}` };
         }
-        return fail(`UNCONFIRMED: deposit ${e.id} (nonce ${e.nonce ?? "?"}) may still land; shares ${before} -> ${now} at re-read. Resolve it before retrying.`);
+        return fail(`UNCONFIRMED: deposit ${e.id} (nonce ${e.nonce ?? "?"}) may still land; shares ${before} -> ${now} at re-read. Resolve it before retrying${allowanceNote}`);
       }
       await this.resetAllowance(token, v.address, ctx, txs);
       const after = await this.sharesOf(v);

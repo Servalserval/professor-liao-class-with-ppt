@@ -154,6 +154,26 @@ export function validateLiveConfig(c: LiveConfig): string[] {
       if (!["euler", "metamorpho", "fluid", "generic"].includes(x.flavor)) e.push(`vault ${x.address}@${v.chain}: flavor must be euler|metamorpho|fluid|generic`);
     }
   }
+  // One wallet holds one account per lending market: a plain deposit next to a
+  // loop in that account becomes collateral for the loop's debt (Aave enables
+  // collateral on first supply; Navi / Suilend share the account / obligation).
+  // So each market gets ONE role (loops OR plain deposits) and ONE entry.
+  const venueKeys = new Map<string, number>();
+  for (const [i, l] of (c.lending ?? []).entries()) {
+    const key = [l.type, l.chain, l.market ?? "", l.addresses ? JSON.stringify(Object.entries(l.addresses).sort()) : "", l.protocol ?? ""].join("|").toLowerCase();
+    const prev = venueKeys.get(key);
+    if (prev !== undefined) e.push(`lending ${l.type}@${l.chain}${l.market ? ` ${l.market}` : ""}: listed twice (entries ${prev + 1} and ${i + 1}); merge them into one entry`);
+    else venueKeys.set(key, i);
+    if ((l.pairs ?? []).length && (l.supply ?? []).length)
+      e.push(
+        `lending ${l.type}@${l.chain}${l.market ? ` ${l.market}` : ""}: has both loop pairs and plain deposits — one wallet has one account per market, so a deposit would back the loop's debt; use one role per market (or a separate wallet)`
+      );
+  }
+  const vaultChains = new Set<string>();
+  for (const v of c.vaults ?? []) {
+    if (vaultChains.has(v.chain)) e.push(`vaults@${v.chain}: listed twice; put all vaults of a chain in one entry`);
+    vaultChains.add(v.chain);
+  }
   for (const l of c.lending ?? []) {
     if (!c.chains?.[l.chain]) e.push(`lending ${l.type}: chain ${l.chain} has no entry in chains`);
     if (!(l.pairs ?? []).length && !(l.supply ?? []).length) e.push(`lending ${l.type}@${l.chain}: needs pairs or supply`);
@@ -180,6 +200,7 @@ export function loadLiveConfig(path: string, env: NodeJS.ProcessEnv = process.en
   const missing = new Set<string>();
   const expanded = expandEnv(raw, env, missing) as Partial<LiveConfig>;
   const cfg = { ...LIVE_DEFAULTS, ...expanded } as LiveConfig;
+  for (const l of cfg.lending ?? []) l.pairs ??= []; // a supply-only entry may omit pairs
   cfg.limits = { ...(LIVE_DEFAULTS.limits as LiveConfig["limits"]), ...(expanded.limits ?? {}) };
   cfg.canary = { ...(LIVE_DEFAULTS.canary as LiveConfig["canary"]), ...(expanded.canary ?? {}) };
   const errors = validateLiveConfig(cfg);

@@ -147,7 +147,7 @@ describe("loopPair: same-asset equivalence with loopOpportunity", () => {
         assert.equal(o.maxEquityUsd, caps.length ? Math.min(...caps) : undefined);
         assert.equal((o.meta as { leverage: number }).leverage, ref.L);
         assert.equal((o.meta as { ltv: number }).ltv, ref.ltv);
-        assert.deepEqual(o.legs, [{ venue: c.m.protocol, chain: c.m.chain, token: c.m.symbol, equityFrac: 1 }]);
+        assert.deepEqual(o.legs, [{ venue: c.m.protocol, chain: c.m.chain, token: c.m.symbol, equityFrac: 1, grossFrac: ref.L }]);
         assert.deepEqual(validateOpportunity(o, cfg, NOW), []);
       }
       // the delegated output is the pair output, key for key (functions aside)
@@ -191,7 +191,7 @@ describe("loopPair: two-asset math", () => {
     assert.equal(o.metrics.utilization_c, 0.5);
     assert.equal(o.metrics.utilization_d, 0.8);
     assert.equal(o.metrics.tvl_usd, 60e6);
-    assert.deepEqual(o.legs, [{ venue: "navi", chain: "sui", token: "USDC", equityFrac: 1 }]);
+    assert.deepEqual(o.legs, [{ venue: "navi", chain: "sui", token: "USDC", equityFrac: 1, grossFrac: (o.meta as { leverage: number }).leverage }]);
     assert.deepEqual(o.funding, { chain: "sui", asset: "USDC" });
     const risk = stableRisk(cfgWith(), "USDC");
     assert.deepEqual(o.meta, {

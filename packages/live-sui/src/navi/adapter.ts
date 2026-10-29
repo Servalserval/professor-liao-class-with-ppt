@@ -215,6 +215,13 @@ class NaviUnsettledError extends Error {
     };
   }
 }
+/** The supply account is also borrowing (loop leftovers): supply reads / withdrawals throw this. */
+export class NaviAccountConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NaviAccountConflictError";
+  }
+}
 function isBroadcastUnconfirmed(e: unknown): e is BroadcastUnconfirmedError {
   return e instanceof BroadcastUnconfirmedError || (e as { name?: unknown })?.name === "BroadcastUnconfirmedError";
 }
@@ -334,17 +341,19 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
       if (this.supply.has(marketId) || this.pairs.has(marketId)) throw new Error(`navi: supply marketId ${marketId} is not unique (vs supply markets and loop pairIds)`);
       if (supplyKeys.has(`${market}|${type}`)) throw new Error(`navi: supply asset ${s.asset.symbol} configured twice in market ${market}`);
       supplyKeys.add(`${market}|${type}`);
-      // Supply deposits sit in the wallet's Navi account of `market`. A loop pair with emode "off"
-      // would use that same account: positions of a shared asset would be conflated, and even
-      // without a shared asset the deposit would become collateral of the loop (a loop liquidation
-      // could seize it; its withdrawals would be health-checked against the loop's debt).
+      // Separation is enforced by configuration: supply deposits sit in the wallet's Navi
+      // account of `market`, and a loop in the same market could end up in that account
+      // (emode "off", or "auto" without a covering e-mode). Then positions of a shared asset
+      // are conflated and the deposit collateralizes the loop (seizable on liquidation,
+      // withdrawals health-checked against its debt). On-chain leftovers from earlier runs
+      // are handled at runtime (supply reads/withdraws throw when the account has debt).
       for (const p of this.pairs.values()) {
-        if (p.market === market && p.emode === "off")
+        if (p.market === market)
           throw new Error(
-            `navi: supply market ${marketId} and loop pair ${p.pairId} (emode "off") would share the wallet's Navi account in market ${market}: ` +
-              `${[p.collateral, p.debt].some((a) => normType(a.address) === type) ? `both hold ${s.asset.symbol} (positions conflated) and ` : ""}` +
-              `the deposit would collateralize the loop (seizable on liquidation, withdrawals health-checked against its debt). ` +
-              `Use emode "auto"/an e-mode id for the pair (separate e-mode account) or put them in different markets.`
+            `navi: supply market ${marketId} and loop pair ${p.pairId} are both configured in Navi market ${market}; ` +
+              `loops and plain deposits must not share a market in one adapter (the loop could use the wallet account holding the deposit` +
+              `${[p.collateral, p.debt].some((a) => normType(a.address) === type) ? `, both hold ${s.asset.symbol}` : ""}). ` +
+              `Configure them in different markets / adapters.`
           );
       }
       this.supply.set(marketId, { marketId, asset: s.asset, market, type });
@@ -504,25 +513,23 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
   // -------------------------------------------------------------------------
 
   /**
-   * Loop accounts: write target + read candidates. When the market holds supply
-   * deposits, the wallet address account belongs to those deposits and is never a
-   * loop candidate (open() refuses a loop that would need it).
+   * Loop accounts: write target + read candidates. Candidates are EVERY Navi account
+   * of the wallet in this market (all e-mode caps + the wallet address account),
+   * whatever the pair's e-mode setting: a position left by an earlier run / config is
+   * never hidden from position() / close().
    */
   private async accounts(ps: PairState): Promise<{ target: WriteAccount; candidates: NaviAccount[] }> {
     const addr: NaviAccount = { kind: "address", id: normalizeSuiAddress(this.env.address) };
-    const addrOk = !this.supplyMarketKeys().has(ps.market.key);
-    const withAddr = (xs: NaviAccount[]) => (addrOk ? [...xs, addr] : xs);
-    if (ps.cfg.emode === "off") return { target: addr, candidates: withAddr([]) };
     const caps = (await this.sdk.getUserEModeCaps(this.env.address, { client: this.client, disableCache: true }))
       .filter((c) => c.marketId === ps.market.id)
       .map((c): NaviAccount => ({ kind: "cap", id: normalizeSuiAddress(c.accountCap), emodeId: c.emodeId }));
-    if (ps.emode) {
+    if (ps.emode && ps.cfg.emode !== "off") {
       const id = ps.emode.emodeId;
       const mine = caps.filter((c) => c.kind === "cap" && c.emodeId === id);
       const others = caps.filter((c) => !(c.kind === "cap" && c.emodeId === id));
-      return { target: mine[0] ?? { kind: "newCap", emodeId: id }, candidates: withAddr([...mine, ...others]) };
+      return { target: mine[0] ?? { kind: "newCap", emodeId: id }, candidates: [...mine, ...others, addr] };
     }
-    return { target: addr, candidates: withAddr(caps) };
+    return { target: addr, candidates: [addr, ...caps] };
   }
 
   private async readAccount(ps: PairState, account: NaviAccount): Promise<AccountState> {
@@ -533,18 +540,36 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
     return {
       account,
       collateral: c ? M.naviNormalToBase(c.supplyBalance, ps.cfg.collateral.decimals) : 0n,
-      debt: d ? M.naviNormalToBase(d.borrowBalance, ps.cfg.debt.decimals) : 0n,
+      // ceil: a dust debt (raw > 0, < 1 base unit) must not read as "no debt"
+      debt: d && M.rawPositive(d.borrowBalance) ? M.naviNormalToBase(d.borrowBalance, ps.cfg.debt.decimals, "ceil") : 0n,
       entries,
     };
   }
 
-  /** First candidate account holding collateral or debt of this pair. */
+  /**
+   * The account holding this pair's position. Reads every candidate; the account
+   * holding the pair's DEBT wins (others with only collateral are logged, untouched).
+   * Debt of the pair in more than one account -> throws (never guess, never "no position").
+   */
   private async positionState(ps: PairState, candidates: NaviAccount[]): Promise<AccountState | null> {
+    const found: AccountState[] = [];
     for (const a of candidates) {
       const st = await this.readAccount(ps, a);
-      if (st.collateral > 0n || st.debt > 0n) return st;
+      if (st.collateral > 0n || st.debt > 0n) found.push(st);
     }
-    return null;
+    if (!found.length) return null;
+    const withDebt = found.filter((s) => s.debt > 0n);
+    if (withDebt.length > 1)
+      throw new Error(
+        `navi: ${ps.cfg.pairId} has ${ps.cfg.debt.symbol} debt in ${withDebt.length} Navi accounts (${withDebt.map((s) => describeAccount(s.account)).join(", ")}); ` +
+          `refusing to pick one — resolve manually`
+      );
+    const pick = withDebt[0] ?? found[0]!;
+    if (found.length > 1)
+      this.log("warn", `navi: ${ps.cfg.pairId}: pair assets found in ${found.length} Navi accounts; using ${describeAccount(pick.account)}`, {
+        others: found.filter((s) => s !== pick).map((s) => describeAccount(s.account)),
+      });
+    return pick;
   }
 
   private accountHealth(st: AccountState): number | undefined {
@@ -901,11 +926,6 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
       if (existing && !sameAccount(existing.account, acc.target))
         return fail(`existing ${pairId} position is in ${describeAccount(existing.account)}, pair now resolves to ${describeAccount(acc.target)}; close it first`);
       const target: WriteAccount = existing?.account ?? acc.target;
-      if (target.kind === "address" && this.supplyMarketKeys().has(ps.market.key))
-        return fail(
-          `${pairId}: no covering e-mode, so this loop would use the wallet's Navi account in market ${ps.market.key}, ` +
-            `which holds plain supply deposits (they must stay in a separate, debt-free account); refusing`
-        );
       const bf = await this.borrowFeeFrac(ps, target.kind === "newCap" ? this.env.address : target.id);
       const fi = await this.flashInfo(ps, ps.coll);
       const ex = { existingCollateral: existing?.collateral ?? 0n, existingDebt: existing?.debt ?? 0n };
@@ -1413,12 +1433,30 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
   }
 
   /** The wallet address account in this market: my deposit of the asset + whether the account has any debt. */
-  private async readSupplyAccount(ss: SupplyState): Promise<{ units: bigint; debtUsd: number; entries: NaviUserLendingInfo[] }> {
+  /**
+   * The wallet address account in this market: my deposit of the asset and the assets it
+   * owes. Debt is detected on the RAW borrow balance (a missing oracle price would make a
+   * USD check read 0).
+   */
+  private async readSupplyAccount(ss: SupplyState): Promise<{ units: bigint; debtAssets: string[]; entries: NaviUserLendingInfo[] }> {
     const all = await this.sdk.getLendingState(this.env.address, { client: this.client, markets: [ss.market.key], disableCache: true });
     const entries = all.filter((e) => e.market === ss.market.key);
     const mine = entries.find((e) => e.assetId === ss.pool.id);
-    const debtUsd = entries.reduce((s, e) => s + (Number(e.borrowBalance) / 1e9) * Number(e.pool?.oracle?.price ?? 0), 0);
-    return { units: mine ? M.naviNormalToBase(mine.supplyBalance, ss.cfg.asset.decimals) : 0n, debtUsd, entries };
+    const debtAssets = entries.filter((e) => M.rawPositive(e.borrowBalance)).map((e) => e.pool?.token?.symbol ?? `asset#${e.assetId}`);
+    return { units: mine ? M.naviNormalToBase(mine.supplyBalance, ss.cfg.asset.decimals) : 0n, debtAssets, entries };
+  }
+
+  /**
+   * Supply reads / withdrawals on a wallet account that borrows would report (and move)
+   * loop collateral as if it were a plain deposit: refuse loudly instead.
+   */
+  private assertDebtFree(ss: SupplyState, debtAssets: string[], what: string): void {
+    if (debtAssets.length)
+      throw new NaviAccountConflictError(
+        `navi: ${what} ${ss.cfg.marketId}: the wallet's Navi account in market ${ss.market.key} has debt (${debtAssets.join(", ")}), ` +
+          `so its ${ss.cfg.asset.symbol} balance is (or backs) a loop, not a plain deposit; refusing. ` +
+          `Close that position (e.g. with the loop adapter) before using this supply market`
+      );
   }
 
   private supplyRewardMatches(sc: SupplyCfg, r: NaviLendingReward): boolean {
@@ -1454,8 +1492,10 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
     let myDepositUsd: number | undefined;
     try {
       const acct = await this.readSupplyAccount(ss);
-      myDepositUsd = M.unitsToNumber(acct.units, sc.asset.decimals) * price;
-      if (acct.debtUsd > 0) this.log("warn", `navi: wallet Navi account in ${ss.market.key} has $${acct.debtUsd.toFixed(2)} debt; supply deposit ${sc.marketId} is encumbered`);
+      if (acct.debtAssets.length)
+        // the balance would be loop collateral, not a plain deposit: report it as unknown
+        this.log("error", `navi: wallet Navi account in ${ss.market.key} has debt (${acct.debtAssets.join(", ")}); myDepositUsd for ${sc.marketId} left unknown`);
+      else myDepositUsd = M.unitsToNumber(acct.units, sc.asset.decimals) * price;
     } catch (e) {
       this.log("warn", `navi: deposit read failed for ${sc.marketId}`, { error: errMsg(e) });
     }
@@ -1485,6 +1525,7 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
     const sc = this.supplyCfg(marketId);
     const ss = await this.loadSupply(sc);
     const acct = await this.readSupplyAccount(ss);
+    this.assertDebtFree(ss, acct.debtAssets, "supplyPosition");
     if (acct.units <= 0n) return null;
     let rewardsUnclaimed: SupplyPositionView["rewardsUnclaimed"] = [];
     try {
@@ -1514,10 +1555,10 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
       const bal = await this.walletBalance(sc.asset);
       if (bal < amount) return fail(`wallet has ${bal} ${sc.asset.symbol} base units < ${amount}`);
       const acct = await this.readSupplyAccount(ss);
-      if (acct.debtUsd > 0)
+      if (acct.debtAssets.length)
         return fail(
-          `wallet's Navi account in ${ss.market.key} has $${acct.debtUsd.toFixed(2)} of debt; plain deposits must sit in a debt-free account ` +
-            `(they would collateralize that debt). Repay it or move the loop to an e-mode account first`
+          `wallet's Navi account in ${ss.market.key} has debt (${acct.debtAssets.join(", ")}); plain deposits must sit in a debt-free account ` +
+            `(they would collateralize that debt). Close that position first`
         );
       // Deposit has no health check on Navi, so no oracle refresh is needed.
       const tx = new Transaction();
@@ -1538,6 +1579,7 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
   /** Withdraw PTB (oracle refresh first: Navi health-checks every withdraw). null = no deposit. */
   private async buildSupplyWithdraw(ss: SupplyState, fraction: number, ctx: LiveContext, strict: boolean): Promise<{ tx: Transaction; request: bigint; units: bigint } | null> {
     const acct = await this.readSupplyAccount(ss);
+    this.assertDebtFree(ss, acct.debtAssets, fraction >= 1 ? "withdraw(all)" : "withdraw");
     if (acct.units <= 0n) return null;
     // fraction 1: request a bit more than the balance; Navi withdraws min(request, balance) and
     // sends a <= 1000 (9-dec) remainder to the treasury, so nothing is left behind.
@@ -1571,6 +1613,10 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
       if (e instanceof NaviUnsettledError) {
         ctx.log("error", `navi: withdraw ${marketId}: ${e.message}`);
         return e.result();
+      }
+      if (e instanceof NaviAccountConflictError) {
+        ctx.log("error", e.message);
+        throw e;
       }
       ctx.log("error", `navi: withdraw ${marketId} failed`, { error: errMsg(e) });
       return fail(errMsg(e));
@@ -1611,8 +1657,6 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
     const poolsByMarket = new Map<string, NaviPool[]>();
     const storageChecked = new Set<string>();
     const usage = new Map<string, string>();
-    /** pairs resolving to the wallet address account, by market */
-    const addressLoops = new Map<string, string[]>();
 
     const marketOf = (id: string, key: string): NaviMarketConfig | null => {
       try {
@@ -1687,7 +1731,6 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
         emodeId = em?.emodeId ?? null;
       }
       const acct = emodeId === null ? "address" : `emode:${emodeId}`;
-      if (emodeId === null) addressLoops.set(market.key, [...(addressLoops.get(market.key) ?? []), pid]);
       for (const t of new Set([collType, debtType])) {
         const key = `${market.key}|${acct}|${t}`;
         const prev = usage.get(key);
@@ -1700,11 +1743,17 @@ export class NaviAdapter implements LendingAdapter, SupplyAdapter {
       const market = marketOf(sc.marketId, sc.market);
       if (!market) continue;
       const pools = await poolsFor(sc.marketId, market);
-      await checkAsset(sc.marketId, "supply", sc.asset, sc.type, market, pools);
-      for (const pid of addressLoops.get(market.key) ?? [])
-        issues.push(
-          `${sc.marketId}: loop pair ${pid} has no covering e-mode in market ${market.key}, so it would use the wallet account that holds this deposit; open(${pid}) will refuse`
-        );
+      const pool = await checkAsset(sc.marketId, "supply", sc.asset, sc.type, market, pools);
+      if (pool) {
+        // on-chain leftovers: the deposit account must be debt-free
+        try {
+          const acct = await this.readSupplyAccount({ cfg: sc, market, pools, pool, priceUsd: 0, paused: false, asOfMs: Date.now() });
+          if (acct.debtAssets.length)
+            issues.push(`${sc.marketId}: the wallet's Navi account in ${market.key} has debt (${acct.debtAssets.join(", ")}); supply reads/withdrawals will refuse until it is repaid`);
+        } catch (e) {
+          issues.push(`${sc.marketId}: wallet account read failed: ${errMsg(e)}`);
+        }
+      }
     }
     return issues;
   }
