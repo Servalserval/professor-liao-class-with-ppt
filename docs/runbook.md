@@ -99,6 +99,11 @@ cp config/live.example.yaml config/live.yaml
 
 - `assets`：每條鏈每個代幣的地址和 decimals。**從官方文件或區塊瀏覽器複製，不要憑記憶打**。`verify` 會到鏈上讀回 symbol／decimals 比對。
 - `lending`：要開的市場和組合。先只放 [lending-landscape.md](lending-landscape.md) 第 5 節的第一批。
+  - 每個 `lending` 項目可以有 `pairs`（循環）和 `supply`（單純放貸）。兩者可以只有其中一個，`pairs: []` 也可以。
+  - 同一個 Aave 市場裡，同一種資產不能同時在循環和單純存款裡，因為一個錢包在一個市場只有一個帳戶。要兩者都做就換錢包或換市場。
+  - Suilend 的單純存款放在獨立、不借款的 obligation。正式跑之前，請在 `options` 填好 `obligationId` 和 `supplyObligationId`。
+- `vaults`：ERC-4626 vault（Euler／MetaMorpho／Fluid／一般 vault）。地址從協議官網複製。Fluid 和一般 vault 需要 archive RPC。
+- 選倉門檻、穩定幣分級、續期假設都在 `config/live-router.yaml`，說明見 [selection.md](selection.md)。
 - `bridges`／`config/default.yaml` 的 `xchain.routes`：要開的跨鏈路由與費用上限。
 - `canary`：上線初期的硬上限。
 - 改任何一個值都會改變 config hash，必須重新 `verify` 才能 live。

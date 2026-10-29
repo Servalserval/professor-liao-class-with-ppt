@@ -21,6 +21,10 @@
 - **估值**：可實現淨 APR ＝ 每條收益流 × 獎勵幣可實現比例 × 時間權重 − 成本。自己進場造成的稀釋與利率變化都算進去。
 - **穩定幣對循環**：支援「存 A 借 B」，兩邊各用自己的利率模型，並納入換匯成本與深度、脫鉤訊號（用市價，不用協議預言機）。
   獎勵規則看得懂淨額型補貼（`netOf`）、每人上限、HF 上限（Ethena Liquid Leverage 的 HF ≤ 2），以及「借了某幣就失格」的規則。
+- **單純放貸（只存不借）**：Aave V3／V4、NAVI、Suilend、Scallop、ERC-4626 vault（Euler、MetaMorpho、Fluid）。
+  - 和循環貸用同一把尺比較：net = raw − 獎勵折價 − 脫鉤預期損失 − 成本 − 搬運。
+  - 穩定幣分三級，各有預期脫鉤損失與警告／出場水位；第 3 級（USDe 等）不單純存。
+  - 選倉邏輯、門檻與 2026-10-29 情境：[docs/selection.md](docs/selection.md)。
 - **進場閘門**：
   - 通用版 1/10 規則。
   - 分 tier 的門檻（無風險利率＋溢價）。
@@ -72,6 +76,10 @@ npx tsx packages/core/src/cli.ts sim examples/scenarios/plasma-reward-collapse.y
 npx tsx packages/core/src/cli.ts sim examples/scenarios/bank-run.yaml
 npx tsx packages/core/src/cli.ts sim examples/scenarios/cross-chain.yaml
 
+# 選倉：循環 vs 單純放貸，live 設定 + 10-29 研究數字（--why 印出每個候選的 net 拆解與原因）
+npx tsx packages/core/src/cli.ts sim examples/scenarios/selection-2026-10-29.yaml --why
+npx tsx packages/core/src/cli.ts sim examples/scenarios/selection-2026-10-29-whatif-renewal.yaml --why
+
 # 用範例機會掃描（--why 顯示沒過的原因）
 npx tsx packages/core/src/cli.ts scan --static examples/static.yaml --tokens examples/tokens.yaml --probe 20000 --why
 ```
@@ -85,12 +93,14 @@ set -a; . /etc/incentive-router/env; set +a       # RPC、金鑰檔路徑、Tele
 npm run live -- verify      # 到鏈上讀回所有地址、資產、市場、橋、swap router；寫 stamp
 npm run live -- markets --why
 npm run live -- balances
-npm run live -- plan --why  # 模擬一輪：會進哪些、要不要跨鏈搬
+npm run live -- plan --why  # 模擬一輪：會進哪些、要不要跨鏈搬（印出選倉表）
 npm run live -- run         # mode: shadow → 只模擬；mode: live + LIVE_CONFIRM=yes → 實盤
 npm run live -- status
 ```
 
 ## 接上新協議
+
+- 單純放貸：實作 `SupplyAdapter`（`supplyMarkets / supplyPosition / deposit / withdraw / simulateWithdraw / claimRewards / walletBalance`）。一個 adapter 可以同時實作兩個介面，runner 會建立 `<id>#supply` 這個 source。
 
 1. 實作 `LendingAdapter`（`packages/live-common`）：`markets()` 回傳 `LoopPair[]`，另外實作 `position / open / close / deleverage / simulateClose / claimRewards / walletBalance`。每一筆寫入都走 `sendTx` 或 `executePtb`，並提供 `verifyConfig()`。
 2. 在 `packages/live-runner/src/build.ts` 的 `makeLendingAdapter` 加一個 `type`。
