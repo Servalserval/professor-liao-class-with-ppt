@@ -6,7 +6,7 @@
  * withdraw require HF >= 1 (HF = CF * collateral / debt), withdraw/repay cap
  * at the balance / debt, multicall applies inner calls atomically.
  */
-import { decodeFunctionData, erc20Abi, getAddress, pad, toFunctionSelector, type Abi, type AbiFunction, type Address, type Chain, type Hex } from "viem";
+import { decodeFunctionData, erc20Abi, getAddress, keccak256, pad, toFunctionSelector, type Abi, type AbiFunction, type Address, type Chain, type Hex } from "viem";
 import type { AssetRef, LiveContext, SwapAdapter, SwapQuote } from "@incentive-router/live-common";
 import { Mutex, type EvmEnv, type PublicClient, type WalletClient } from "@incentive-router/live-evm-base";
 import { SPOKE_ABI, SPOKE_WRITE_FUNCTIONS } from "../src/abi.js";
@@ -54,7 +54,20 @@ export class FakeV4 {
   simulateCallsSupported = true;
   implSelectors: readonly string[] = [...SPOKE_WRITE_FUNCTIONS, "getUserAccountData", "getReserve", "getUserTotalDebt", "getUserSuppliedAssets"];
   blockTs = Math.floor(Date.UTC(2026, 9, 29, 12) / 1000);
+  /** Txs that were applied on-chain, in order. */
   sent: { to: Address; data: Hex }[] = [];
+  /** Every raw tx submitted via sendRawTransaction (applied or not). */
+  submitted = 0;
+  /**
+   * Make the Nth submission (0-based) ambiguous: "landed" = applied but no
+   * receipt (wait times out); "dropped" = submit times out and the node never
+   * saw it. Either way sendTx throws BroadcastUnconfirmedError.
+   */
+  unconfirmed?: { at: number; mode: "landed" | "dropped" };
+  private nonce = 0;
+  private signed = new Map<Hex, { to: Address; data: Hex }>();
+  private mined = new Map<Hex, "success" | "reverted">();
+  private noReceipt = new Set<Hex>();
   /** Highest LTV after any borrow / withdraw; lowest HF after any withdraw while in debt. */
   maxLtvSeen = 0;
   minHfAfterWithdraw = Infinity;
@@ -290,7 +303,37 @@ export class FakeV4 {
       }
       return { results };
     },
-    waitForTransactionReceipt: async () => ({ status: "success", gasUsed: 100_000n, effectiveGasPrice: 25n * 10n ** 9n }),
+    sendRawTransaction: async (p: { serializedTransaction: Hex }) => {
+      const raw = p.serializedTransaction;
+      const tx = this.signed.get(raw);
+      if (!tx) throw new Error("fake: unknown raw tx");
+      const hash = keccak256(raw);
+      const idx = this.submitted++;
+      const amb = this.unconfirmed?.at === idx ? this.unconfirmed.mode : undefined;
+      if (amb === "dropped") throw new Error("request timed out");
+      const s = clone(this.state);
+      try {
+        this.apply(s, tx.to, tx.data, true);
+        this.state = s;
+        this.sent.push(tx);
+        this.mined.set(hash, "success");
+      } catch {
+        this.mined.set(hash, "reverted");
+      }
+      this.nonce++;
+      if (amb === "landed") this.noReceipt.add(hash);
+      return hash;
+    },
+    getTransaction: async (p: { hash: Hex }) => {
+      if (!this.mined.has(p.hash)) throw new Error("transaction not found");
+      return { hash: p.hash };
+    },
+    waitForTransactionReceipt: async (p: { hash: Hex }) => {
+      if (this.noReceipt.has(p.hash)) throw new Error("Timed out while waiting for transaction");
+      const st = this.mined.get(p.hash);
+      if (!st) throw new Error("Timed out while waiting for transaction");
+      return { status: st, gasUsed: 100_000n, effectiveGasPrice: 25n * 10n ** 9n };
+    },
     getCode: async (p: { address: Address }) => {
       if (lc(p.address) === lc(IMPL)) {
         const sels = this.implSelectors.map((n) => {
@@ -306,12 +349,12 @@ export class FakeV4 {
 
   readonly walletClient = {
     account: { address: ME },
-    sendTransaction: async (p: { to: Address; data: Hex }) => {
-      const s = clone(this.state);
-      this.apply(s, p.to, p.data, true);
-      this.state = s;
-      this.sent.push({ to: p.to, data: p.data });
-      return `0x${this.sent.length.toString(16).padStart(64, "0")}` as Hex;
+    prepareTransactionRequest: async (p: { to: Address; data: Hex; value?: bigint; gas?: bigint }) => ({ ...p, nonce: this.nonce }),
+    signTransaction: async (p: { to: Address; data: Hex; nonce: number }) => {
+      // Unique, opaque "raw tx"; the fake keeps the mapping back to (to, data).
+      const raw = `0x02${(this.signed.size + 1).toString(16).padStart(8, "0")}${p.nonce.toString(16).padStart(8, "0")}${p.to.slice(2)}${p.data.slice(2)}` as Hex;
+      this.signed.set(raw, { to: p.to, data: p.data });
+      return raw;
     },
   };
 

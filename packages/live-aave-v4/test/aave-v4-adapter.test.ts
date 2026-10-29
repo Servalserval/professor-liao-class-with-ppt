@@ -182,6 +182,17 @@ describe("AaveV4Adapter.open", () => {
     assert.equal(f.state.supplied, 10_000n * E18);
   });
 
+  it("live: an unconfirmed step-1 broadcast stops the loop without guessing", async () => {
+    const f = new FakeV4();
+    f.unconfirmed = { at: 1, mode: "landed" }; // approve OK, multicall(supply, collateral, borrow) lands without receipt
+    const r = await make(f).open(PAIR, 10_000n * E18, 0.75, testCtx(false));
+    assert.equal(r.ok, false);
+    assert.match(r.detail ?? "", /unconfirmed/);
+    assert.equal(f.submitted, 2);
+    assert.ok(f.state.debt > 0n && f.ltv() <= 0.75, "it landed; reported, not undone");
+    assert.match(r.detail ?? "", /observed: supplied 10000 USDe/);
+  });
+
   it("apiCrossCheck: refuses when AaveKit's plan for the same action decodes differently", async () => {
     const f = new FakeV4();
     const evil = getAddress("0x6666666666666666666666666666666666666666");
@@ -226,6 +237,8 @@ describe("AaveV4Adapter close / deleverage", () => {
 
   it("close(1): repays everything, withdraws all, HF never below the unwind floor", async () => {
     const { f, a } = await opened();
+    const d0 = f.state.debt;
+    const n0 = f.sent.length;
     const r = await a.close(PAIR, 1, testCtx(false));
     assert.equal(r.ok, true, r.detail);
     assert.equal(f.state.debt, 0n);
@@ -235,8 +248,29 @@ describe("AaveV4Adapter close / deleverage", () => {
     assert.ok(usde > 9_950 && usde < 10_000, `returned ${usde}`);
     assert.ok(r.amountUsd! > 9_950);
     assert.equal(await a.position(PAIR), null);
+    // the 1bp accrual margin left on the final repay is reset: no allowance survives the unwind
+    assert.equal(f.state.allowance[USDT.toLowerCase()], 0n);
+    assert.equal(f.state.allowance[USDE.toLowerCase()], 0n);
+    const lastTx = f.sent[f.sent.length - 1]!;
+    assert.equal(lastTx.to, USDT);
+    assert.deepEqual(decodeFunctionData({ abi: erc20Abi, data: lastTx.data }).args, [SPOKE, 0n]);
+    // every repay approval is capped at the outstanding debt + 1bp margin
+    let debt = d0;
+    for (let i = n0; i < f.sent.length; i++) {
+      const t = f.sent[i]!;
+      if (t.to === USDT) {
+        const amt = decodeFunctionData({ abi: erc20Abi, data: t.data }).args[1] as bigint;
+        assert.ok(amt <= debt + debt / 10_000n + 1n, `approve ${amt} > debt ${debt} + margin`);
+      } else if (t.to === SPOKE) {
+        const d = decodeSpoke(t.data);
+        const calls = d.functionName === "multicall" ? (d.args[0] as Hex[]).map(decodeSpoke) : [d];
+        for (const c of calls) if (c.functionName === "repay") debt -= (c.args[1] as bigint) < debt ? (c.args[1] as bigint) : debt;
+      }
+    }
+    assert.equal(debt, 0n);
     // last spoke tx: multicall(repay, withdraw max)
-    const last = decodeSpoke(f.sent[f.sent.length - 1]!.data);
+    const spokeTxs = f.sent.filter((t) => t.to === SPOKE);
+    const last = decodeSpoke(spokeTxs[spokeTxs.length - 1]!.data);
     assert.equal(last.functionName, "multicall");
     const inner = (last.args[0] as Hex[]).map(decodeSpoke);
     assert.deepEqual(inner.map((x) => x.functionName), ["repay", "withdraw"]);
@@ -274,6 +308,21 @@ describe("AaveV4Adapter close / deleverage", () => {
     assert.match(r.detail ?? "", /re-supplied/);
     assert.equal(f.state.supplied, c0);
     assert.equal(f.state.debt, d0);
+  });
+
+  it("unconfirmed broadcast mid-unwind: re-reads state, sends nothing more, reports the hash", async () => {
+    for (const mode of ["landed", "dropped"] as const) {
+      const { f, a } = await opened();
+      f.unconfirmed = { at: f.submitted + 1, mode }; // 2nd submission of the close (the first repay group)
+      const r = await a.close(PAIR, 1, testCtx(false));
+      assert.equal(r.ok, false, mode);
+      assert.match(r.detail ?? "", /unconfirmed and may still land: no further txs sent/);
+      assert.match(r.detail ?? "", /observed: supplied/);
+      assert.equal(f.submitted, f.unconfirmed.at + 1, `${mode}: nothing submitted after the unconfirmed tx`);
+      const u = r.txs.find((t) => t.unconfirmed);
+      assert.ok(u?.id && u.nonce !== undefined, mode);
+      assert.ok(f.hf() >= 1.0, mode);
+    }
   });
 
   it("exit is refused (not attempted) when the reserve is paused", async () => {

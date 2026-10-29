@@ -23,6 +23,7 @@ import { formatUnits, getAddress, isAddress, toFunctionSelector, type Abi, type 
 import { bigDecimal, chainId as akChainId, evmAddress, ReservesRequestFilter, type ExecutionPlan, type Reserve } from "@aave/client";
 import type { LoopPair, RewardRate } from "@incentive-router/core";
 import {
+  BroadcastUnconfirmedError,
   type AssetRef,
   type LendingAdapter,
   type LiveContext,
@@ -166,6 +167,11 @@ const sameAddr = (a: string, b: string) => lc(a) === lc(b);
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e)).split("\n")[0]!;
 const minB = (a: bigint, b: bigint) => (a < b ? a : b);
 const noopLog: Logger = () => {};
+/** A tx of ours was signed + submitted but not confirmed: it may still land. */
+const isUnconfirmed = (e: unknown): e is BroadcastUnconfirmedError =>
+  e instanceof BroadcastUnconfirmedError || (e instanceof Error && e.name === "BroadcastUnconfirmedError");
+/** Accrual margin on a repay meant to clear the debt (1 bp + 1 wei); leftover allowance is reset afterwards. */
+const repayMargin = (debt: bigint) => debt / 10_000n + 1n;
 
 export class AaveV4Adapter implements LendingAdapter {
   readonly id: string;
@@ -855,40 +861,42 @@ export class AaveV4Adapter implements LendingAdapter {
       if (firstBorrow > 0n) calls.push({ fn: "borrow", reserveId: rp.debtId, amount: firstBorrow });
       if (!calls.length) return { ok: true, txs, detail: `${this.id} ${pairId}: nothing to do (LTV already at/above target)` };
       const g1 = [...(await this.approveReqs(rp.collToken, cfg.collateral.symbol, equity)), ...(await this.spokeReqs(calls, rp))];
-      txs.push(...(await this.exec(ctx, g1)));
       const equityUsd = toHuman(equity, dc) * s.coll.priceUsd;
       const planText = `plan: ${plan.iterations} borrow(s), total ${formatUnits(plan.totalBorrowed, dd)} ${cfg.debt.symbol}, final LTV ${plan.finalLtv.toFixed(4)} (target ${targetLtv}, CF ${maxLtv}), risk premium ${(this.riskPremiumOf(s) * 100).toFixed(2)}%`;
       if (ctx.dryRun) {
+        txs.push(...(await this.exec(ctx, g1)));
         return { ok: true, txs, amountUsd: equityUsd, detail: `${this.id} ${pairId}: [dry-run] step 1 simulated; remaining steps not simulated (each depends on a swap). ${planText}` };
       }
 
-      // ---- remaining iterations, each sized from fresh on-chain state
-      let borrowed = firstBorrow;
-      let iter = firstBorrow > 0n ? 1 : 0;
-      while (borrowed > 0n) {
-        let received: bigint;
-        if (rp.same) received = borrowed;
-        else {
-          try {
-            received = await this.swapMeasured(ctx, cfg.debt, cfg.collateral, borrowed, maxEntry, txs);
-          } catch (e) {
-            const back = await this.repayFromWallet(ctx, rp, borrowed, txs);
-            return { ok: false, txs, amountUsd: equityUsd, detail: `${this.id} ${pairId}: open stopped after ${iter} borrow(s): ${errMsg(e)}; repaid ${formatUnits(back, dd)} ${cfg.debt.symbol} (position stays at LTV <= target)` };
+      // ---- live. Anchors: wallet balances that are NOT stray funds of this operation.
+      const anchor = { coll: await erc20Balance(this.env, rp.collToken), debt: rp.same ? 0n : await erc20Balance(this.env, rp.debtToken) };
+      let iter = 0;
+      try {
+        txs.push(...(await this.exec(ctx, g1)));
+        anchor.coll = await erc20Balance(this.env, rp.collToken); // equity is supplied now
+        let borrowed = firstBorrow;
+        iter = firstBorrow > 0n ? 1 : 0;
+        // remaining iterations, each sized from fresh on-chain state
+        while (borrowed > 0n) {
+          const received = rp.same ? borrowed : await this.swapMeasured(ctx, cfg.debt, cfg.collateral, borrowed, maxEntry, txs);
+          const f = await this.snapshot(rp);
+          let next = 0n;
+          if (iter < maxIter) {
+            const rr = f.coll.oraclePriceUsd / f.debt.oraclePriceUsd;
+            next = fromHumanFloor(nextLoopBorrow(toHuman(f.user.supplied + received, dc), toHuman(f.user.debt, dd), targetLtv, rr) * (1 - 1e-9), dd);
+            if (next < minBorrow) next = 0n;
           }
+          const step: SpokeCallSpec[] = [{ fn: "supply", reserveId: rp.collId, amount: received }];
+          if (next > 0n) step.push({ fn: "borrow", reserveId: rp.debtId, amount: next });
+          txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.collToken, cfg.collateral.symbol, received)), ...(await this.spokeReqs(step, rp))])));
+          borrowed = next;
+          if (next > 0n) iter++;
         }
-        const f = await this.snapshot(rp);
-        let next = 0n;
-        if (iter < maxIter) {
-          const rr = f.coll.oraclePriceUsd / f.debt.oraclePriceUsd;
-          next = fromHumanFloor(nextLoopBorrow(toHuman(f.user.supplied + received, dc), toHuman(f.user.debt, dd), targetLtv, rr) * (1 - 1e-9), dd);
-          if (next < minBorrow) next = 0n;
-        }
-        const step: SpokeCallSpec[] = [{ fn: "supply", reserveId: rp.collId, amount: received }];
-        if (next > 0n) step.push({ fn: "borrow", reserveId: rp.debtId, amount: next });
-        txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.collToken, cfg.collateral.symbol, received)), ...(await this.spokeReqs(step, rp))])));
-        borrowed = next;
-        if (next > 0n) iter++;
+      } catch (e) {
+        const note = await this.recover(ctx, rp, anchor, e, txs);
+        return { ok: false, txs, amountUsd: equityUsd, detail: `${this.id} ${pairId}: open stopped after ${iter} borrow(s): ${errMsg(e)}; ${note}` };
       }
+      await this.resetAllowances(ctx, rp, txs);
       const end = await this.snapshot(rp);
       return {
         ok: true,
@@ -901,18 +909,93 @@ export class AaveV4Adapter implements LendingAdapter {
     }
   }
 
-  /** Repay up to `cap` of the debt asset held in the wallet (used to undo a dangling borrow). */
-  private async repayFromWallet(ctx: LiveContext, rp: ResolvedPair, cap: bigint, txs: TxRecord[]): Promise<bigint> {
+  /**
+   * After a failed LIVE step. Never assumes the failed tx did not land: chain
+   * and wallet are re-read. If any tx of ours is unconfirmed (it may still
+   * land, holding a nonce) nothing more is sent — the observed state is
+   * reported and the next cycle re-reads. Otherwise only funds observed above
+   * the anchors are put back: debt asset -> repay (<= current debt),
+   * collateral -> re-supply; then leftover allowances are reset to 0.
+   */
+  private async recover(ctx: LiveContext, rp: ResolvedPair, anchor: { coll: bigint; debt: bigint }, cause: unknown, txs: TxRecord[]): Promise<string> {
+    const cfg = rp.cfg;
+    const notes: string[] = [];
+    const mark = (u: BroadcastUnconfirmedError) =>
+      txs.push({ chain: this.chain, id: u.id, description: u.description, simulated: false, unconfirmed: true, ...(u.nonce !== undefined ? { nonce: u.nonce } : {}) });
+    const observe = async () => {
+      const s = await this.snapshot(rp);
+      const c = await erc20Balance(this.env, rp.collToken);
+      const d = rp.same ? c : await erc20Balance(this.env, rp.debtToken);
+      return { s, c, d };
+    };
+    const show = (o: { s: PairSnapshot; c: bigint; d: bigint }) =>
+      `observed: supplied ${formatUnits(o.s.user.supplied, cfg.collateral.decimals)} ${cfg.collateral.symbol}, debt ${formatUnits(o.s.user.debt, cfg.debt.decimals)} ${cfg.debt.symbol}, LTV ${AaveV4Adapter.oracleLtv(o.s).toFixed(4)}, wallet ${formatUnits(o.c, cfg.collateral.decimals)} ${cfg.collateral.symbol}${rp.same ? "" : ` / ${formatUnits(o.d, cfg.debt.decimals)} ${cfg.debt.symbol}`}`;
+    let o: Awaited<ReturnType<typeof observe>>;
     try {
-      const bal = await erc20Balance(this.env, rp.debtToken);
-      const debt = await this.read<bigint>(this.spoke, SPOKE_ABI as Abi, "getUserTotalDebt", [rp.debtId, this.env.account]);
-      const amt = minB(minB(bal, cap), debt);
-      if (amt <= 0n) return 0n;
-      txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.debtToken, rp.cfg.debt.symbol, amt)), ...(await this.spokeReqs([{ fn: "repay", reserveId: rp.debtId, amount: amt }], rp))])));
-      return amt;
+      o = await observe();
     } catch (e) {
-      this.log("error", `${this.id} ${rp.cfg.pairId}: could not repay dangling borrow: ${errMsg(e)}`);
-      return 0n;
+      return `state re-read failed (${errMsg(e)}); no recovery attempted`;
+    }
+    if (isUnconfirmed(cause)) {
+      mark(cause);
+      return `tx ${cause.id} (nonce ${cause.nonce ?? "?"}) unconfirmed and may still land: no further txs sent; ${show(o)}`;
+    }
+    let halted = false;
+    try {
+      if (rp.same) {
+        const surplus = o.c > anchor.coll ? o.c - anchor.coll : 0n;
+        const amt = minB(surplus, o.s.user.debt);
+        if (amt > 0n) {
+          txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.debtToken, cfg.debt.symbol, amt)), ...(await this.spokeReqs([{ fn: "repay", reserveId: rp.debtId, amount: amt }], rp))])));
+          notes.push(`repaid ${formatUnits(amt, cfg.debt.decimals)} ${cfg.debt.symbol}`);
+        }
+      } else {
+        const dSur = o.d > anchor.debt ? o.d - anchor.debt : 0n;
+        const rep = minB(dSur, o.s.user.debt);
+        if (rep > 0n) {
+          txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.debtToken, cfg.debt.symbol, rep)), ...(await this.spokeReqs([{ fn: "repay", reserveId: rp.debtId, amount: rep }], rp))])));
+          notes.push(`repaid ${formatUnits(rep, cfg.debt.decimals)} ${cfg.debt.symbol}`);
+        }
+        const cSur = o.c > anchor.coll ? o.c - anchor.coll : 0n;
+        if (cSur > 0n) {
+          txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.collToken, cfg.collateral.symbol, cSur)), ...(await this.spokeReqs([{ fn: "supply", reserveId: rp.collId, amount: cSur }], rp))])));
+          notes.push(`re-supplied ${formatUnits(cSur, cfg.collateral.decimals)} ${cfg.collateral.symbol}`);
+        }
+      }
+    } catch (e) {
+      notes.push(`recovery tx failed: ${errMsg(e)}`);
+      if (isUnconfirmed(e)) {
+        mark(e);
+        halted = true;
+      }
+    }
+    if (!halted) {
+      try {
+        await this.resetAllowances(ctx, rp, txs);
+      } catch (e) {
+        notes.push(`allowance reset failed: ${errMsg(e)}`);
+        if (isUnconfirmed(e)) mark(e);
+      }
+    }
+    try {
+      notes.push(show(await observe()));
+    } catch {
+      /* keep the notes we have */
+    }
+    return notes.join("; ");
+  }
+
+  /** Reset any non-zero allowance of the pair tokens to the spoke (live only). */
+  private async resetAllowances(ctx: LiveContext, rp: ResolvedPair, txs: TxRecord[]): Promise<void> {
+    if (ctx.dryRun) return;
+    const tokens: [Address, string][] = [[rp.collToken, rp.cfg.collateral.symbol]];
+    if (!rp.same) tokens.push([rp.debtToken, rp.cfg.debt.symbol]);
+    for (const [token, symbol] of tokens) {
+      const cur = await this.read<bigint>(token, erc20Abi as Abi, "allowance", [this.env.account, this.spoke]);
+      if (cur === 0n) continue;
+      const req: TxRequest = { to: token, data: call(erc20Abi as Abi, "approve", [this.spoke, 0n]), description: `${this.id}: reset leftover ${symbol} allowance -> spoke` };
+      assertTx(req, { kind: "approve", token, spender: this.spoke, amount: 0n }, this.policy);
+      txs.push(...(await this.exec(ctx, [req])));
     }
   }
 
@@ -964,6 +1047,7 @@ export class AaveV4Adapter implements LendingAdapter {
       const maxExit = cfg.maxExitSwapCostBps ?? 200;
       const dd = cfg.debt.decimals;
       const collBefore = await erc20Balance(this.env, rp.collToken);
+      const anchor = { coll: collBefore, debt: rp.same ? 0n : await erc20Balance(this.env, rp.debtToken) };
 
       // swap cost estimate from a quote at the first step's size
       let swapCost = 0;
@@ -984,6 +1068,7 @@ export class AaveV4Adapter implements LendingAdapter {
         return { ok: false, txs, detail: `${this.id} ${pairId}: [dry-run] ${planText}` };
 
       let finished = false;
+      try {
       for (let i = 0; i < maxIter && !finished; i++) {
         const s = i === 0 ? s0 : await this.snapshot(rp);
         const st = unwindStep(s.user.supplied, s.user.debt, goal, this.unwindParams(rp, s, swapCost));
@@ -1004,11 +1089,12 @@ export class AaveV4Adapter implements LendingAdapter {
         // withdraw -> (swap) -> repay
         if (rp.same) {
           const amt = st.withdraw;
+          const rep = minB(amt, s.user.debt + repayMargin(s.user.debt)); // never approve / repay beyond the debt (+accrual margin)
           const steps: SpokeCallSpec[] = [
             { fn: "withdraw", reserveId: rp.collId, amount: amt },
-            { fn: "repay", reserveId: rp.debtId, amount: amt },
+            { fn: "repay", reserveId: rp.debtId, amount: rep },
           ];
-          txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.debtToken, cfg.debt.symbol, amt)), ...(await this.spokeReqs(steps, rp))])));
+          txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.debtToken, cfg.debt.symbol, rep)), ...(await this.spokeReqs(steps, rp))])));
           if (ctx.dryRun) break;
           continue;
         }
@@ -1019,25 +1105,26 @@ export class AaveV4Adapter implements LendingAdapter {
           if (!(q.costBps <= maxExit)) return { ok: false, txs, detail: `${this.id} ${pairId}: [dry-run] exit swap cost ${q.costBps.toFixed(1)} bps > max ${maxExit} bps` };
           break;
         }
-        let got: bigint;
-        try {
-          got = await this.swapMeasured(ctx, cfg.collateral, cfg.debt, st.withdraw, maxExit, txs);
-        } catch (e) {
-          // put the withdrawn collateral back so the position is not left weaker
-          const back = await erc20Balance(this.env, rp.collToken);
-          const amt = minB(back > collBefore ? back - collBefore : 0n, st.withdraw);
-          if (amt > 0n) txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.collToken, cfg.collateral.symbol, amt)), ...(await this.spokeReqs([{ fn: "supply", reserveId: rp.collId, amount: amt }], rp))])));
-          return { ok: false, txs, detail: `${this.id} ${pairId}: unwind stopped: ${errMsg(e)}; re-supplied ${formatUnits(amt, cfg.collateral.decimals)} ${cfg.collateral.symbol}` };
-        }
+        const got = await this.swapMeasured(ctx, cfg.collateral, cfg.debt, st.withdraw, maxExit, txs);
         const debtNow = await this.read<bigint>(this.spoke, SPOKE_ABI as Abi, "getUserTotalDebt", [rp.debtId, this.env.account]);
-        const steps: SpokeCallSpec[] = [{ fn: "repay", reserveId: rp.debtId, amount: got }];
-        // Final close step: the swap covers the whole debt (+1bp for accrual) -> repay + withdraw max atomically.
-        const coversAll = got >= debtNow + debtNow / 10_000n + 1n;
+        // Approve / repay at most the current debt + a 1bp accrual margin (the spoke pulls only what is owed;
+        // the leftover allowance is reset after the unwind). Excess debt asset stays in the wallet.
+        const cap = debtNow + repayMargin(debtNow);
+        const rep = minB(got, cap);
+        const steps: SpokeCallSpec[] = [{ fn: "repay", reserveId: rp.debtId, amount: rep }];
+        // Final close step: the swap covers the whole debt incl. margin -> repay + withdraw max atomically.
+        const coversAll = got >= cap;
         if (goal.kind === "close" && coversAll) steps.push({ fn: "withdraw", reserveId: rp.collId, amount: MAX_UINT256 });
-        txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.debtToken, cfg.debt.symbol, got)), ...(await this.spokeReqs(steps, rp))])));
+        txs.push(...(await this.exec(ctx, [...(await this.approveReqs(rp.debtToken, cfg.debt.symbol, rep)), ...(await this.spokeReqs(steps, rp))])));
         if (goal.kind === "close" && coversAll) finished = true;
       }
+      } catch (e) {
+        if (ctx.dryRun) throw e;
+        const note = await this.recover(ctx, rp, anchor, e, txs);
+        return { ok: false, txs, detail: `${this.id} ${pairId}: unwind stopped: ${errMsg(e)}; ${note}` };
+      }
       if (ctx.dryRun) return { ok: true, txs, detail: `${this.id} ${pairId}: [dry-run] first unwind step simulated; later steps depend on swaps. ${planText}` };
+      await this.resetAllowances(ctx, rp, txs);
 
       const end = await this.snapshot(rp);
       const collAfter = await erc20Balance(this.env, rp.collToken);
