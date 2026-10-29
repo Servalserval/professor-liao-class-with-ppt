@@ -58,7 +58,6 @@ import {
 } from "@incentive-router/live-common";
 import {
   assertChainId,
-  ensureAllowance,
   erc20Abi,
   erc20Balance,
   sendTx,
@@ -219,6 +218,18 @@ export function isRevertError(e: unknown): boolean {
   return /execution reverted|\brevert(ed)?\b/i.test((e as Error | undefined)?.message ?? "");
 }
 
+/** true once any tx of the current call is unconfirmed: send nothing more. */
+function halted(txs: readonly TxRecord[]): boolean {
+  return txs.some((t) => t.unconfirmed);
+}
+
+class HaltedError extends Error {
+  constructor(description: string) {
+    super(`not sending "${description}": an earlier tx of this call is unconfirmed (no follow-up txs until it resolves)`);
+    this.name = "HaltedError";
+  }
+}
+
 function unconfirmedRecord(chain: string, e: BroadcastUnconfirmedError): TxRecord {
   return { chain, id: e.id, description: e.description, simulated: false, unconfirmed: true, nonce: e.nonce };
 }
@@ -274,8 +285,16 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
         if (prev) throw new Error(`${this.id}: pairs ${prev} and ${p.pairId} share asset ${a} in one market (one Aave account); use separate wallets / adapters`);
         owner.set(a, p.pairId);
       }
+    if (this.pairs.size && (o.supply ?? []).length) {
+      const clash = (o.supply ?? []).map((sp) => sp.marketId ?? sp.asset.symbol).find((id) => this.pairs.has(id));
+      if (clash) throw new Error(`${this.id}: supply marketId ${clash} equals a loop pairId (claimRewards routing clash)`);
+      throw new Error(
+        `${this.id}: loop pairs and plain deposits on the same market share ONE Aave account (deposits would become loop collateral); use a separate wallet or market for plain deposits`
+      );
+    }
     for (const sp of o.supply ?? []) {
       const marketId = sp.marketId ?? sp.asset.symbol;
+      if (this.pairs.has(marketId)) throw new Error(`${this.id}: supply marketId ${marketId} equals a loop pairId (claimRewards routing clash)`);
       if (sp.asset.chain !== this.chain) throw new Error(`${this.id}: supply ${marketId} asset ${sp.asset.symbol} is on ${sp.asset.chain}`);
       if (this.supplies.has(marketId)) throw new Error(`${this.id}: duplicate supply marketId ${marketId}`);
       const a = lc(sp.asset.address);
@@ -581,7 +600,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       if (batch.supported && !batch.ok) return fail(`pre-simulation failed at step ${(batch.failedIndex ?? 0) + 1} "${prefix[batch.failedIndex ?? 0]?.description}": ${batch.error}`);
 
       if (ctx.dryRun) {
-        txs.push(await sendTx(this.env, ctx, prefix[0]!));
+        await this.send(ctx, prefix[0]!, txs);
         if (batch.supported) txs.push(...batch.records.slice(1));
         let swapNote = "";
         const firstBorrow = plan.steps.find((s) => s.kind === "borrow");
@@ -596,12 +615,12 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       }
 
       // ---- live, sequential
-      txs.push(...(await ensureAllowance(this.env, ctx, p.collateral.address as Address, pool, approveNeed)));
-      if (setEMode) txs.push(await sendTx(this.env, ctx, this.req("setUserEMode", [mode.categoryId], `setUserEMode(${mode.categoryId})`)));
-      txs.push(await sendTx(this.env, ctx, this.req("supply", [p.collateral.address, equity, this.env.account, REFERRAL_CODE], `supply ${equity} ${p.collateral.symbol}`)));
+      await this.approveExact(p.collateral.address as Address, approveNeed, ctx, txs);
+      if (setEMode) await this.send(ctx, this.req("setUserEMode", [mode.categoryId], `setUserEMode(${mode.categoryId})`), txs);
+      await this.send(ctx, this.req("supply", [p.collateral.address, equity, this.env.account, REFERRAL_CODE], `supply ${equity} ${p.collateral.symbol}`), txs);
       const cfgAfter = await this.env.publicClient.readContract({ address: pool, abi: POOL_ABI, functionName: "getUserConfiguration", args: [this.env.account] });
       if (!userConfigFlags(cfgAfter.data, R.cs.id).collateral)
-        txs.push(await sendTx(this.env, ctx, this.req("setUserUseReserveAsCollateral", [p.collateral.address, true], `enable ${p.collateral.symbol} as collateral`)));
+        await this.send(ctx, this.req("setUserUseReserveAsCollateral", [p.collateral.address, true], `enable ${p.collateral.symbol} as collateral`), txs);
 
       let a = await this.readAccount(p);
       const Dt = targetLoopDebt(toHuman(a.S, p.collateral.decimals), toHuman(a.D, p.debt.decimals), targetLtv, a.r, swapCost);
@@ -614,13 +633,12 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
         const dBefore = await this.walletBalance(p.debt);
         const cBefore = same ? dBefore : await this.walletBalance(p.collateral);
         try {
-          txs.push(await sendTx(this.env, ctx, this.req("borrow", [p.debt.address, b, VARIABLE_RATE_MODE, REFERRAL_CODE, this.env.account], `borrow ${b} ${p.debt.symbol}`)));
+          await this.send(ctx, this.req("borrow", [p.debt.address, b, VARIABLE_RATE_MODE, REFERRAL_CODE, this.env.account], `borrow ${b} ${p.debt.symbol}`), txs);
         } catch (e) {
           if (!isUnconfirmed(e)) throw e;
-          // it may have landed: undo whatever the wallet shows (delta-based)
-          txs.push(unconfirmedRecord(this.chain, e));
-          const rb = await this.rollbackBorrow(p, b, dBefore, cBefore, ctx, txs);
-          return fail(`UNCONFIRMED borrow ${e.id} (nonce ${e.nonce ?? "?"}); rollback from re-read balances: ${rb}. Resolve the tx before retrying.`);
+          // it may have landed: report what the wallet shows, send nothing more in this call
+          const dNow = (await this.walletBalance(p.debt)) - dBefore;
+          return fail(`UNCONFIRMED borrow ${e.id} (nonce ${e.nonce ?? "?"}); no follow-up txs sent; wallet ${p.debt.symbol} change at re-read ${dNow}. Resolve the tx before retrying (a landed borrow must be repaid).`);
         }
         // everything after the borrow is rolled back on any failure: no idle debt left in the wallet
         try {
@@ -630,8 +648,8 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
             if (got.error) throw new Error(got.error);
             supplyAmt = got.received;
           }
-          txs.push(...(await ensureAllowance(this.env, ctx, p.collateral.address as Address, pool, supplyAmt)));
-          txs.push(await sendTx(this.env, ctx, this.req("supply", [p.collateral.address, supplyAmt, this.env.account, REFERRAL_CODE], `supply ${supplyAmt} ${p.collateral.symbol}`)));
+          await this.approveExact(p.collateral.address as Address, supplyAmt, ctx, txs);
+          await this.send(ctx, this.req("supply", [p.collateral.address, supplyAmt, this.env.account, REFERRAL_CODE], `supply ${supplyAmt} ${p.collateral.symbol}`), txs);
         } catch (e) {
           const rb = await this.rollbackBorrow(p, b, dBefore, cBefore, ctx, txs);
           return fail(`step after borrow failed in iteration ${iterations + 1}: ${(e as Error).message.split("\n")[0]} | borrow rolled back: ${rb}`);
@@ -657,6 +675,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
         amountUsd: toHuman(equity, p.collateral.decimals) * acct.priceC,
       };
     } catch (e) {
+      if (!ctx.dryRun) await this.resetAllowance(p.collateral.address as Address, ctx, txs);
       return fail((e as Error).message.split("\n")[0]!);
     }
   }
@@ -773,21 +792,48 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       claimed.push({ token: m.symbol, amount: amounts[i]!, decimals: m.decimals });
     }
     if (!claimed.length) return { ok: true, txs: [], claimed, detail: "nothing to claim" };
+    const txs: TxRecord[] = [];
     try {
-      const rec = await sendTx(this.env, ctx, {
-        to: controller,
-        data: encodeFunctionData({ abi: REWARDS_CONTROLLER_ABI, functionName: "claimAllRewardsToSelf", args: [tokens] }),
-        description: `claimAllRewardsToSelf(${tokens.length} tokens)`,
-      });
-      return { ok: true, txs: [rec], claimed, detail: claimed.map((c) => `${toHuman(c.amount, c.decimals)} ${c.token}`).join(", ") };
+      await this.send(
+        ctx,
+        {
+          to: controller,
+          data: encodeFunctionData({ abi: REWARDS_CONTROLLER_ABI, functionName: "claimAllRewardsToSelf", args: [tokens] }),
+          description: `claimAllRewardsToSelf(${tokens.length} tokens)`,
+        },
+        txs
+      );
+      return { ok: true, txs, claimed, detail: claimed.map((c) => `${toHuman(c.amount, c.decimals)} ${c.token}`).join(", ") };
     } catch (e) {
-      return { ok: false, txs: [], claimed: [], detail: `${this.id} claim: ${(e as Error).message.split("\n")[0]}` };
+      const detail = isUnconfirmed(e)
+        ? `${this.id} claim: UNCONFIRMED ${e.id} (nonce ${e.nonce ?? "?"}) may still land; re-check unclaimed rewards before retrying`
+        : `${this.id} claim: ${(e as Error).message.split("\n")[0]}`;
+      return { ok: false, txs, claimed: [], detail };
     }
   }
 
   // -------------------------------------------------------------------------
   // SupplyAdapter: plain deposits (no borrow)
   // -------------------------------------------------------------------------
+
+  /** totalDebtBase of our Aave account (any reserve). */
+  private async accountDebtBase(): Promise<bigint> {
+    const d = await this.env.publicClient.readContract({ address: this.market.pool, abi: POOL_ABI, functionName: "getUserAccountData", args: [this.env.account] });
+    return d[1];
+  }
+
+  /**
+   * Plain-deposit reads / exits refuse an account that carries debt (e.g. a loop
+   * left on this pool by an earlier run): its aTokens back that debt, they are
+   * not a plain deposit, and withdrawing them would move the loop's HF.
+   */
+  private async assertNoDebt(what: string): Promise<void> {
+    const debt = await this.accountDebtBase();
+    if (debt > 0n)
+      throw new Error(
+        `${this.id} ${what}: the Aave account ${this.env.account} has debt (${debt} base units, e.g. a loop on this pool); its aTokens are loop collateral, not a plain deposit — refusing. Use a separate wallet for plain deposits.`
+      );
+  }
 
   private supplyAsset(marketId: string): AssetRef {
     const a = this.supplies.get(marketId);
@@ -825,7 +871,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
         { address: st.aToken, abi: AAVE_TOKEN_ABI, functionName: "balanceOf", args: [this.env.account] }
       );
     }
-    const [res, asOf] = await Promise.all([this.readMany(calls), this.blockTimeMs()]);
+    const [res, asOf, acctDebt] = await Promise.all([this.readMany(calls), this.blockTimeMs(), this.accountDebtBase().catch(() => 0n)]);
     const out: SupplyMarket[] = [];
     for (let i = 0; i < entries.length; i++) {
       const [marketId, a] = entries[i]!;
@@ -849,6 +895,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
         if (r.isFrozen) notes.push("frozen: new deposits disabled, withdrawals still allowed");
         if (r.isPaused) notes.push("paused: deposits AND withdrawals disabled");
         if (!r.isActive) notes.push("reserve inactive");
+        if (acctDebt > 0n) notes.push("account has debt (loop on this pool?): plain deposits refused, aTokens are loop collateral");
         out.push({
           protocol: this.market.protocol,
           chain: this.chain,
@@ -859,9 +906,10 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
           supplyAprBase: rayToApr(r.liquidityRate),
           rewards: await this.legRewards(a, st, t, price, "supply"),
           irm: irmFromRay(r, r.reserveFactor),
-          withdrawableUsd: toHuman(this.withdrawableUnits(r), r.decimals) * price,
+          // paused / inactive: withdrawals disabled; frozen still allows them
+          withdrawableUsd: r.isPaused || !r.isActive ? 0 : toHuman(this.withdrawableUnits(r), r.decimals) * price,
           supplyCapRemainingUsd: room === null ? undefined : toHuman(room, r.decimals) * price,
-          paused: r.isFrozen || r.isPaused || !r.isActive,
+          paused: r.isFrozen || r.isPaused || !r.isActive || acctDebt > 0n,
           myDepositUsd: toHuman(mine, r.decimals) * price,
           dataAsOfMs: asOf,
           note: notes.length ? notes.join("; ") : undefined,
@@ -878,6 +926,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
     const st = (await this.reserveStatics([a.address as Address])).get(lc(a.address))!;
     const units = await this.env.publicClient.readContract({ address: st.aToken, abi: AAVE_TOKEN_ABI, functionName: "balanceOf", args: [this.env.account] });
     if (units === 0n) return null;
+    await this.assertNoDebt(`supplyPosition ${marketId}`);
     const [price] = await this.oraclePrices([a.address as Address]);
     let rewardsUnclaimed: SupplyPositionView["rewardsUnclaimed"] = [];
     try {
@@ -909,29 +958,46 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       const room = capRemaining(r.supplyCap, r.decimals, aSupply + rayMul(r.accruedToTreasury, r.liquidityIndex));
       if (room !== null && room < amount) return fail(`supply cap: room ${room} < amount ${amount} ${a.symbol} units`);
       if (have < amount) return fail(`wallet has ${have} ${a.symbol} base units, need ${amount}`);
+      const debt = await this.accountDebtBase();
+      if (debt > 0n) return fail(`account has debt (${debt} base units): plain deposits would back it (Aave enables a first supply as collateral); use a separate wallet`);
       const price = this.priceOf(r, ui);
       const supplyReq = this.req("supply", [a.address, amount, this.env.account, REFERRAL_CODE], `supply ${amount} ${a.symbol}`);
       const reqs = [...(await this.approveRequests(a.address as Address, amount)), supplyReq];
       const batch = await this.simulateBatch(reqs, ctx);
       if (batch.supported && !batch.ok) return fail(`pre-simulation failed at step ${(batch.failedIndex ?? 0) + 1} "${reqs[batch.failedIndex ?? 0]?.description}": ${batch.error}`);
       if (ctx.dryRun) {
-        txs.push(await sendTx(this.env, ctx, reqs[0]!));
+        await this.send(ctx, reqs[0]!, txs);
         if (batch.supported) txs.push(...batch.records.slice(1));
         const note = reqs.length < 2 ? "simulated" : batch.supported ? "approve + supply simulated (eth_simulateV1)" : "simulated step 1 only (approve; supply needs it)";
         return { ok: true, txs, detail: `dry-run: ${note}`, amountUsd: toHuman(amount, a.decimals) * price };
       }
-      const approved = await this.ensureAllowanceWatched(a.address as Address, amount, ctx, txs);
-      if (approved) return fail(approved);
       try {
-        txs.push(await sendTx(this.env, ctx, supplyReq));
+        await this.approveExact(a.address as Address, amount, ctx, txs);
       } catch (e) {
-        if (!isUnconfirmed(e)) throw e;
-        txs.push(unconfirmedRecord(this.chain, e));
-        const now = await pc.readContract({ address: st.aToken, abi: AAVE_TOKEN_ABI, functionName: "balanceOf", args: [this.env.account] });
+        if (isUnconfirmed(e)) {
+          const cur = await pc.readContract({ address: a.address as Address, abi: erc20Abi, functionName: "allowance", args: [this.env.account, this.market.pool] });
+          return fail(`UNCONFIRMED: approve ${e.id} (nonce ${e.nonce ?? "?"}) may still land; allowance ${cur} at re-read; no follow-up txs sent. Resolve it before retrying.`);
+        }
         await this.resetAllowance(a.address as Address, ctx, txs);
+        throw e;
+      }
+      try {
+        await this.send(ctx, supplyReq, txs);
+      } catch (e) {
+        if (!isUnconfirmed(e)) {
+          // definite failure after the approve landed: do not leave the approval behind
+          await this.resetAllowance(a.address as Address, ctx, txs);
+          throw e;
+        }
+        const now = await pc.readContract({ address: st.aToken, abi: AAVE_TOKEN_ABI, functionName: "balanceOf", args: [this.env.account] });
         if (now + 2n >= before + amount)
-          return { ok: true, txs, detail: `supply ${e.id} unconfirmed but the aToken balance shows it landed (${before} -> ${now})`, amountUsd: toHuman(now - before, a.decimals) * price };
-        return fail(`UNCONFIRMED: supply ${e.id} (nonce ${e.nonce ?? "?"}) may still land; aToken balance ${before} -> ${now} at re-read. Resolve it before retrying.`);
+          return {
+            ok: true,
+            txs,
+            detail: `supply ${e.id} unconfirmed but the aToken balance shows it landed (${before} -> ${now}); no follow-up txs sent (a leftover allowance is reset on the next call)`,
+            amountUsd: toHuman(now - before, a.decimals) * price,
+          };
+        return fail(`UNCONFIRMED: supply ${e.id} (nonce ${e.nonce ?? "?"}) may still land; aToken balance ${before} -> ${now} at re-read; no follow-up txs sent. Resolve it before retrying.`);
       }
       await this.resetAllowance(a.address as Address, ctx, txs);
       const after = await pc.readContract({ address: st.aToken, abi: AAVE_TOKEN_ABI, functionName: "balanceOf", args: [this.env.account] });
@@ -945,6 +1011,8 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
     const txs: TxRecord[] = [];
     const fail = (d: string): LiveResult => ({ ok: false, txs, detail: `${this.id} withdraw ${marketId}: ${d}` });
     if (!(fraction > 0 && fraction <= 1)) return fail(`fraction must be in (0,1], got ${fraction}`);
+    this.supplyAsset(marketId);
+    await this.assertNoDebt(`withdraw ${marketId}`); // throws: loop collateral is not a plain deposit
     try {
       const a = this.supplyAsset(marketId);
       const st = (await this.reserveStatics([a.address as Address])).get(lc(a.address))!;
@@ -965,15 +1033,14 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       const price = this.priceOf(r, ui);
       const req = this.req("withdraw", [a.address, amount, this.env.account], `withdraw ${full ? "max" : amount} ${a.symbol}`);
       if (ctx.dryRun) {
-        txs.push(await sendTx(this.env, ctx, req));
+        await this.send(ctx, req, txs);
         return { ok: true, txs, detail: `dry-run: withdraw ${full ? "max" : amount} simulated`, amountUsd: toHuman(want, a.decimals) * price };
       }
       const wBefore = await this.walletBalance(a);
       try {
-        txs.push(await sendTx(this.env, ctx, req));
+        await this.send(ctx, req, txs);
       } catch (e) {
         if (!isUnconfirmed(e)) throw e;
-        txs.push(unconfirmedRecord(this.chain, e));
         const now = await pc.readContract({ address: st.aToken, abi: AAVE_TOKEN_ABI, functionName: "balanceOf", args: [this.env.account] });
         const got = (await this.walletBalance(a)) - wBefore;
         if (now + want <= bal + 2n && got > 0n)
@@ -993,6 +1060,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
     const st = (await this.reserveStatics([a.address as Address])).get(lc(a.address))!;
     const bal = await this.env.publicClient.readContract({ address: st.aToken, abi: AAVE_TOKEN_ABI, functionName: "balanceOf", args: [this.env.account] });
     if (bal === 0n) return true;
+    await this.assertNoDebt(`simulateWithdraw ${marketId}`); // unknown, not false
     try {
       await this.env.publicClient.call({ account: this.env.account, to: this.market.pool, data: this.req("withdraw", [a.address, MAX_UINT256, this.env.account], "withdraw(max)").data });
       return true;
@@ -1604,47 +1672,69 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
   ): Promise<{ received: bigint; error?: string }> {
     // Never throws: a quote rejection (the normal way an aggregator refuses an
     // expensive route) must reach the caller's rollback like any other failure.
+    if (halted(txs)) return { received: 0n, error: `not swapping ${from.symbol}->${to.symbol}: an earlier tx of this call is unconfirmed` };
     try {
       const before = await this.walletBalance(to);
       const q = await this.swapper!.quote(from, to, amount, ctx);
       if (!(q.costBps <= maxCostBps)) return { received: 0n, error: `swap ${from.symbol}->${to.symbol} costs ${q.costBps.toFixed(1)} bps > ${maxCostBps}` };
       const r = await this.swapper!.swap(q, from, to, ctx);
       txs.push(...r.txs);
+      if (halted(txs)) return { received: 0n, error: `UNCONFIRMED swap ${from.symbol}->${to.symbol}: ${r.detail ?? "a swap tx may still land"}` };
       if (!r.ok) return { received: 0n, error: r.detail ?? "swap failed" };
       const after = await this.walletBalance(to);
       const got = after - before;
       if (got <= 0n) return { received: 0n, error: `swap reported ok but ${to.symbol} balance did not increase` };
       return { received: got };
     } catch (e) {
+      if (isUnconfirmed(e)) {
+        txs.push(unconfirmedRecord(this.chain, e));
+        return { received: 0n, error: `UNCONFIRMED swap ${e.id}: may still land` };
+      }
       return { received: 0n, error: `swap ${from.symbol}->${to.symbol}: ${(e as Error).message.split("\n")[0]}` };
     }
   }
 
   /**
-   * ensureAllowance that survives an unconfirmed broadcast: re-reads the
-   * allowance and continues if the approval landed. Returns an error string
-   * (not-ok detail) when it cannot be established.
+   * Every adapter send goes through here (sendTx: simulate -> gas cap -> dry-run
+   * stop -> sign -> send -> receipt). An unconfirmed broadcast is recorded with
+   * unconfirmed:true and rethrown, and after it NOTHING more is sent in the same
+   * call (the tx may still land; follow-ups would race it).
    */
-  private async ensureAllowanceWatched(token: Address, amount: bigint, ctx: LiveContext, txs: TxRecord[]): Promise<string | null> {
+  private async send(ctx: LiveContext, req: TxRequest, txs: TxRecord[]): Promise<TxRecord> {
+    if (halted(txs)) throw new HaltedError(req.description);
     try {
-      txs.push(...(await ensureAllowance(this.env, ctx, token, this.market.pool, amount)));
-      return null;
+      const rec = await sendTx(this.env, ctx, req);
+      txs.push(rec);
+      return rec;
     } catch (e) {
-      if (!isUnconfirmed(e)) throw e;
-      txs.push(unconfirmedRecord(this.chain, e));
-      const cur = await this.env.publicClient.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [this.env.account, this.market.pool] });
-      if (cur >= amount) return null;
-      return `UNCONFIRMED: approve ${e.id} (nonce ${e.nonce ?? "?"}) may still land; allowance ${cur} < ${amount} at re-read. Resolve it before retrying.`;
+      if (isUnconfirmed(e)) txs.push(unconfirmedRecord(this.chain, e));
+      throw e;
     }
   }
 
-  /** Reset a leftover pool allowance to 0 (exact approvals can leave dust when live amounts differ from the plan). */
+  /** Exact approval (reset to 0 first when changing a non-zero allowance, for USDT-style tokens). */
+  private async approveExact(token: Address, amount: bigint, ctx: LiveContext, txs: TxRecord[]): Promise<void> {
+    const pool = this.market.pool;
+    const cur = await this.env.publicClient.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [this.env.account, pool] });
+    if (cur >= amount) return;
+    if (cur > 0n)
+      await this.send(ctx, { to: token, data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [pool, 0n] }), description: `reset allowance ${token} -> pool` }, txs);
+    await this.send(ctx, { to: token, data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [pool, amount] }), description: `approve ${amount} ${token} -> pool` }, txs);
+  }
+
+  /**
+   * Reset a leftover pool allowance to 0 (exact approvals can leave dust when
+   * live amounts differ from the plan, or after a failed supply). Skipped after
+   * an unconfirmed tx of this call; an unconfirmed reset stays recorded in txs.
+   */
   private async resetAllowance(token: Address, ctx: LiveContext, txs: TxRecord[]): Promise<void> {
+    if (halted(txs) || ctx.dryRun) return;
     try {
       const cur = await this.env.publicClient.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [this.env.account, this.market.pool] });
       if (cur > 0n)
-        txs.push(await sendTx(this.env, ctx, { to: token, data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [this.market.pool, 0n] }), description: `reset leftover allowance ${token}` }));
+        await this.send(ctx, { to: token, data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [this.market.pool, 0n] }), description: `reset leftover allowance ${token}` }, txs);
     } catch (e) {
+      if (isUnconfirmed(e)) return; // recorded by send(); nothing more this call
       this.log("warn", `${this.id}: resetting allowance of ${token} failed: ${(e as Error).message.split("\n")[0]}`);
     }
   }
@@ -1662,7 +1752,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
     ctx: LiveContext,
     txs: TxRecord[]
   ): Promise<string> {
-    const pool = this.market.pool;
+    if (halted(txs)) return `skipped: a tx of this call is unconfirmed (no follow-up txs); wallet ${p.debt.symbol} change ${(await this.walletBalance(p.debt)) - dBefore}`;
     const notes: string[] = [];
     try {
       if (!this.isSame(p)) {
@@ -1676,8 +1766,8 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       const dHeld = (await this.walletBalance(p.debt)) - dBefore;
       const amt = dHeld < borrowed ? dHeld : borrowed;
       if (amt > 0n) {
-        txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, amt)));
-        txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, amt, VARIABLE_RATE_MODE, this.env.account], `rollback: repay ${amt} ${p.debt.symbol}`)));
+        await this.approveExact(p.debt.address as Address, amt, ctx, txs);
+        await this.send(ctx, this.req("repay", [p.debt.address, amt, VARIABLE_RATE_MODE, this.env.account], `rollback: repay ${amt} ${p.debt.symbol}`), txs);
         notes.push(`repaid ${amt}/${borrowed} ${p.debt.symbol}`);
       } else notes.push(`nothing to repay (borrowed ${borrowed} ${p.debt.symbol} not in wallet)`);
     } catch (e) {
@@ -1690,7 +1780,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
 
   /** Re-supply collateral withdrawn for an unwind step whose swap / repay failed (wallet delta since `cBefore`, bounded by `withdrawn`). */
   private async rollbackWithdraw(p: AavePairConfig, withdrawn: bigint, cBefore: bigint, dBefore: bigint, ctx: LiveContext, txs: TxRecord[]): Promise<string> {
-    const pool = this.market.pool;
+    if (halted(txs)) return `skipped: a tx of this call is unconfirmed (no follow-up txs); wallet ${p.collateral.symbol} change ${(await this.walletBalance(p.collateral)) - cBefore}`;
     const notes: string[] = [];
     try {
       const dHeld = (await this.walletBalance(p.debt)) - dBefore;
@@ -1703,8 +1793,8 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       const cHeld = (await this.walletBalance(p.collateral)) - cBefore;
       const amt = cHeld < withdrawn ? cHeld : withdrawn;
       if (amt > 0n) {
-        txs.push(...(await ensureAllowance(this.env, ctx, p.collateral.address as Address, pool, amt)));
-        txs.push(await sendTx(this.env, ctx, this.req("supply", [p.collateral.address, amt, this.env.account, REFERRAL_CODE], `rollback: re-supply ${amt} ${p.collateral.symbol}`)));
+        await this.approveExact(p.collateral.address as Address, amt, ctx, txs);
+        await this.send(ctx, this.req("supply", [p.collateral.address, amt, this.env.account, REFERRAL_CODE], `rollback: re-supply ${amt} ${p.collateral.symbol}`), txs);
         notes.push(`re-supplied ${amt}/${withdrawn} ${p.collateral.symbol}`);
       } else notes.push(`no ${p.collateral.symbol} to re-supply`);
     } catch (e) {
@@ -1730,15 +1820,15 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
     const pool = this.market.pool;
     const buffered = a.D + a.D / 10_000n + 1n;
     if ("targetDebt" in g && g.targetDebt === 0n && wallet >= buffered) {
-      txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, buffered)));
-      txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, MAX_UINT256, VARIABLE_RATE_MODE, this.env.account], `repay all ${p.debt.symbol}`)));
+      await this.approveExact(p.debt.address as Address, buffered, ctx, txs);
+      await this.send(ctx, this.req("repay", [p.debt.address, MAX_UINT256, VARIABLE_RATE_MODE, this.env.account], `repay all ${p.debt.symbol}`), txs);
       return a.D;
     }
     let amt = wallet < need ? wallet : need;
     if (amt > a.D) amt = a.D;
     if (amt < this.minUnits(a.priceD, p.debt.decimals) && amt < need) return 0n; // dust: let the next withdraw cover it
-    txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, amt)));
-    txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, amt, VARIABLE_RATE_MODE, this.env.account], `repay ${amt} ${p.debt.symbol}`)));
+    await this.approveExact(p.debt.address as Address, amt, ctx, txs);
+    await this.send(ctx, this.req("repay", [p.debt.address, amt, VARIABLE_RATE_MODE, this.env.account], `repay ${amt} ${p.debt.symbol}`), txs);
     return amt;
   }
 
@@ -1792,7 +1882,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
         const first = plan.steps[0];
         if (!first || first.kind !== "withdraw") return { ok: plan.complete, txs, detail: `dry-run: nothing to do (${summary})` };
         const req = this.req("withdraw", [p.collateral.address, first.amount, this.env.account], `withdraw ${this.amt(first.amount)} ${p.collateral.symbol}`);
-        txs.push(await sendTx(this.env, ctx, req));
+        await this.send(ctx, req, txs);
         let note = "";
         const swapStep = plan.steps[1];
         if (swapStep && swapStep.kind === "swap") {
@@ -1835,12 +1925,11 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
         const dBefore = await this.walletBalance(p.debt);
         // a failing withdraw changes nothing (outer catch); everything after it is rolled back
         try {
-          txs.push(await sendTx(this.env, ctx, this.req("withdraw", [p.collateral.address, st.withdraw, this.env.account], `withdraw ${st.withdraw} ${p.collateral.symbol}`)));
+          await this.send(ctx, this.req("withdraw", [p.collateral.address, st.withdraw, this.env.account], `withdraw ${st.withdraw} ${p.collateral.symbol}`), txs);
         } catch (e) {
           if (!isUnconfirmed(e)) throw e;
-          txs.push(unconfirmedRecord(this.chain, e));
-          const rb = await this.rollbackWithdraw(p, st.withdraw, cBefore, dBefore, ctx, txs);
-          return fail(`UNCONFIRMED withdraw ${e.id} (nonce ${e.nonce ?? "?"}); rollback from re-read balances: ${rb}. Resolve the tx before retrying.`);
+          const cNow = (await this.walletBalance(p.collateral)) - cBefore;
+          return fail(`UNCONFIRMED withdraw ${e.id} (nonce ${e.nonce ?? "?"}); no follow-up txs sent; wallet ${p.collateral.symbol} change at re-read ${cNow}. Resolve the tx before retrying (landed collateral must be re-supplied or swapped + repaid).`);
         }
         try {
           const got = await this.swapMeasured(p.collateral, p.debt, st.withdraw, ctx, maxExit, txs);
@@ -1865,7 +1954,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       if ("fraction" in goal) {
         if (full) {
           if (a.D > 0n) return fail(`debt ${a.D} left after repay`);
-          txs.push(await sendTx(this.env, ctx, this.req("withdraw", [p.collateral.address, MAX_UINT256, this.env.account], `withdraw all ${p.collateral.symbol}`)));
+          await this.send(ctx, this.req("withdraw", [p.collateral.address, MAX_UINT256, this.env.account], `withdraw all ${p.collateral.symbol}`), txs);
           // sell back the debt-asset overshoot bought as repay buffer
           const left = (await this.walletBalance(p.debt)) - startD;
           const leftUsd = toHuman(left > 0n ? left : 0n, p.debt.decimals) * a.priceD;
@@ -1878,7 +1967,7 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
           const keep = a.D > 0n && ltv0 > 0 ? fromHumanFloor(toHuman(a.D, p.debt.decimals) / (ltv0 * a.r), p.collateral.decimals) + 1n : a.S - mulFrac(acct0.S, goal.fraction);
           const extra = a.S > keep ? a.S - keep : 0n;
           if (extra > 0n)
-            txs.push(await sendTx(this.env, ctx, this.req("withdraw", [p.collateral.address, extra, this.env.account], `withdraw ${extra} ${p.collateral.symbol}`)));
+            await this.send(ctx, this.req("withdraw", [p.collateral.address, extra, this.env.account], `withdraw ${extra} ${p.collateral.symbol}`), txs);
         }
       }
       await this.resetAllowance(p.debt.address as Address, ctx, txs);
@@ -1893,6 +1982,10 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
           (spentIdle > 0n ? `; used ${spentIdle} ${p.debt.symbol} already in the wallet to repay (repaid from wallet total ${walletRepaid})` : ""),
       };
     } catch (e) {
+      if (!ctx.dryRun) {
+        await this.resetAllowance(p.debt.address as Address, ctx, txs);
+        await this.resetAllowance(p.collateral.address as Address, ctx, txs);
+      }
       return fail((e as Error).message.split("\n")[0]!);
     }
   }
@@ -1963,13 +2056,13 @@ export class AaveV3Adapter implements LendingAdapter, SupplyAdapter {
       if (batch.supported && !batch.ok)
         return { ok: false, txs, detail: `${this.id} ${what}: pre-simulation failed at step ${(batch.failedIndex ?? 0) + 1} "${reqs[batch.failedIndex ?? 0]?.description}": ${batch.error}` };
       if (ctx.dryRun) {
-        txs.push(await sendTx(this.env, ctx, reqs[0]!));
+        await this.send(ctx, reqs[0]!, txs);
         if (batch.supported) txs.push(...batch.records.slice(1));
         const note =
           reqs.length < 2 ? "simulated" : batch.supported ? `simulated all ${reqs.length} steps (eth_simulateV1)` : `simulated step 1 of ${reqs.length} (no eth_simulateV1)`;
         return { ok: true, txs, detail: `dry-run ${what}: ${note}: ${reqs.map((r) => r.description).join(" -> ")}` };
       }
-      for (const r of reqs) txs.push(await sendTx(this.env, ctx, r));
+      for (const r of reqs) await this.send(ctx, r, txs);
       return { ok: true, txs, detail: `${what}: ${reqs.map((r) => r.description).join(" -> ")}` };
     } catch (e) {
       return { ok: false, txs, detail: `${this.id} ${what}: ${(e as Error).message.split("\n")[0]}` };

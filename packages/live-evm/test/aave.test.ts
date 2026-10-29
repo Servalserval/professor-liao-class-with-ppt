@@ -403,6 +403,8 @@ class MockAave {
   ltvTrace: { op: string; ltv: number }[] = [];
   providerPool: Address = POOL;
   layout: UiLayout = "v3.4";
+  /** Test hook: freeze this reserve when an approval for it lands. */
+  freezeOnApprove?: string;
 
   clone(): MockAave {
     const c = new MockAave();
@@ -416,7 +418,7 @@ class MockAave {
     c.emode = this.emode;
     c.pendingReward = this.pendingReward;
     c.providerPool = this.providerPool;
-    c.layout = this.layout;
+    c.layout = this.layout; // freezeOnApprove is NOT copied: it fires only on real (landed) approvals
     return c;
   }
   res(asset: string): MockReserve {
@@ -578,6 +580,7 @@ class MockAave {
       const [spender, amt] = args as readonly [Address, bigint];
       if (lc(spender) !== lc(POOL)) throw new Error("approve to unexpected spender");
       this.allowance.set(lc(r.asset), amt);
+      if (amt > 0n && this.freezeOnApprove === lc(r.asset)) r.frozen = true;
       return;
     }
     throw new Error(`mock: unknown target ${to}`);
@@ -781,16 +784,25 @@ function makeMarket(): MockAave {
 const signed = new Map<string, { to: Address; data: Hex }>();
 let signCounter = 0;
 
-type MockState = { m: MockAave; rpcDown?: boolean; raw?: "ok" | "lost" | "landed-but-error" };
+type RawMode = "ok" | "lost" | "landed-but-error";
+type MockState = { m: MockAave; rpcDown?: boolean; raw?: RawMode; rawFor?: (to: Address, data: Hex) => RawMode | undefined };
+const poolFn = (data: Hex): string | undefined => {
+  try {
+    return decodeFunctionData({ abi: POOL_ABI, data }).functionName;
+  } catch {
+    return undefined;
+  }
+};
 
 function makeClient(state: MockState, opts: { simulateCalls: boolean }) {
   const client: Record<string, unknown> = {
     sendRawTransaction: async (a: { serializedTransaction: Hex }) => {
       const tx = signed.get(a.serializedTransaction);
       if (!tx) throw new Error("unknown raw tx");
-      if (state.raw === "lost") throw new Error("request timed out");
+      const mode = state.rawFor?.(tx.to, tx.data) ?? state.raw ?? "ok";
+      if (mode === "lost") throw new Error("request timed out");
       state.m.apply(tx.to, tx.data);
-      if (state.raw === "landed-but-error") throw new Error("502 bad gateway");
+      if (mode === "landed-but-error") throw new Error("502 bad gateway");
       return "0xabc";
     },
     getBlock: async () => ({ timestamp: 1_800_000_000n }),
@@ -1395,8 +1407,12 @@ describe("AaveV3Adapter as SupplyAdapter (plain deposits)", () => {
     const { env } = setupSupply();
     assert.throws(
       () => new AaveV3Adapter({ env, market, pairs: [pairs[0]!], supply: [{ asset: usdc }] }),
-      /also an asset of loop pair USDC\/USDC.*separate wallet/
+      /loop pairs and plain deposits on the same market share ONE Aave account.*separate wallet or market/
     );
+    // with the pair-vs-deposit refusal in place, the asset-level check still guards configs with distinct assets
+    const t0: AavePairConfig = { pairId: "USDT0/USDT0", collateral: usdt0, debt: usdt0 };
+    assert.throws(() => new AaveV3Adapter({ env, market, pairs: [t0], supply: [{ asset: usdc }] }), /loop pairs and plain deposits/);
+    assert.throws(() => new AaveV3Adapter({ env, market, pairs: [t0], supply: [{ asset: usdc, marketId: "USDT0/USDT0" }] }), /equals a loop pairId/);
     assert.throws(() => new AaveV3Adapter({ env, market, pairs: [], supply: [{ asset: usdc }, { asset: usdc, marketId: "x" }] }), /configured twice/);
   });
 
@@ -1420,7 +1436,7 @@ describe("AaveV3Adapter as SupplyAdapter (plain deposits)", () => {
     assert.equal(m.totalBorrowUsd, 30_000_000);
     assert.equal(m.withdrawableUsd, 20_000_000);
     assert.equal(m.supplyCapRemainingUsd, 50_000_000);
-    assert.equal(m.paused, false);
+    assert.equal(m.paused, false, m.note);
     assert.equal(m.myDepositUsd, 0);
     assert.equal(m.dataAsOfMs, 1_800_000_000_000);
     assert.deepEqual(m.rewards, [{ token: "USDC-merkl", apr: 0.03 }]);
@@ -1507,24 +1523,32 @@ describe("AaveV3Adapter as SupplyAdapter (plain deposits)", () => {
     await assert.rejects(adapter.simulateWithdraw("USDC", ctx(true)), /fetch failed/);
   });
 
-  it("unconfirmed broadcast: re-reads balances; landed -> ok, lost -> UNCONFIRMED not-ok", async () => {
+  it("unconfirmed broadcast: re-reads state and sends NOTHING more in that call", async () => {
     const { state, adapter } = setupSupply();
+    // approve lands but the submit errors: stop right there (no supply)
     state.raw = "landed-but-error";
+    const ap = await adapter.deposit("USDC", 100n * USDC_UNIT, ctx(false));
+    assert.equal(ap.ok, false);
+    assert.match(ap.detail!, /UNCONFIRMED: approve 0x[0-9a-f]+ \(nonce 7\) may still land; allowance 100000000 at re-read; no follow-up txs sent/);
+    assert.equal(ap.txs.length, 1);
+    assert.ok(ap.txs[0]!.unconfirmed && ap.txs[0]!.nonce === 7 && ap.txs[0]!.id);
+    assert.equal(state.m.bal(state.m.aBal, USDC), 0n);
+
+    // the approval is in place now; the supply lands but the submit errors -> ok from the re-read, no reset tx after it
     const landed = await adapter.deposit("USDC", 100n * USDC_UNIT, ctx(false));
     assert.equal(landed.ok, true, landed.detail);
-    assert.match(landed.detail!, /unconfirmed but the aToken balance shows it landed/);
-    assert.ok(landed.txs.some((t) => t.unconfirmed && t.nonce === 7));
+    assert.match(landed.detail!, /unconfirmed but the aToken balance shows it landed.*no follow-up txs sent/);
+    assert.equal(landed.txs.length, 1);
+    assert.ok(landed.txs[0]!.unconfirmed);
 
-    assert.equal(state.m.bal(state.m.allowance, USDC), 0n, "allowance reset after the re-read");
-
+    // supply lost: not-ok, and the leftover approval is NOT reset in this call
     state.raw = "lost";
-    const lostApprove = await adapter.deposit("USDC", 100n * USDC_UNIT, ctx(false));
-    assert.equal(lostApprove.ok, false);
-    assert.match(lostApprove.detail!, /UNCONFIRMED: approve 0x[0-9a-f]+ \(nonce 7\) may still land; allowance 0/);
-    state.m.allowance.set(lc(USDC), 100n * USDC_UNIT); // approval already in place: the supply itself is lost
+    state.m.allowance.set(lc(USDC), 100n * USDC_UNIT);
     const lost = await adapter.deposit("USDC", 100n * USDC_UNIT, ctx(false));
     assert.equal(lost.ok, false);
     assert.match(lost.detail!, /UNCONFIRMED: supply 0x[0-9a-f]+ \(nonce 7\) may still land/);
+    assert.equal(lost.txs.length, 1);
+    assert.equal(state.m.bal(state.m.allowance, USDC), 100n * USDC_UNIT);
     assert.equal(state.m.bal(state.m.aBal, USDC), 100n * USDC_UNIT);
 
     const w = await adapter.withdraw("USDC", 1, ctx(false));
@@ -1536,6 +1560,66 @@ describe("AaveV3Adapter as SupplyAdapter (plain deposits)", () => {
     assert.equal(state.m.bal(state.m.aBal, USDC), 0n);
   });
 
+  it("definite supply failure after the approve landed resets the approval to 0", async () => {
+    const { state, adapter } = setupSupply();
+    state.m.freezeOnApprove = lc(USDC); // reserve frozen right after our approve
+    const r = await adapter.deposit("USDC", 100n * USDC_UNIT, ctx(false));
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /RESERVE_FROZEN/);
+    assert.equal(state.m.bal(state.m.allowance, USDC), 0n);
+    assert.ok(r.txs.some((t) => /reset leftover allowance/.test(t.description)));
+  });
+
+  it("unconfirmed claim keeps the digest", async () => {
+    const { state, adapter } = setupSupply();
+    assert.equal((await adapter.deposit("aUSDe", 1_000n * 10n ** 18n, ctx(false))).ok, true);
+    state.m.pendingReward = 2n * 10n ** 18n;
+    state.raw = "lost";
+    const r = await adapter.claimRewards(ctx(false), "aUSDe");
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /UNCONFIRMED 0x[0-9a-f]+/);
+    assert.equal(r.txs.length, 1);
+    assert.ok(r.txs[0]!.unconfirmed && r.txs[0]!.id);
+  });
+
+  it("supplyMarkets: paused reserve reports withdrawableUsd 0; frozen keeps it", async () => {
+    const { state, adapter } = setupSupply();
+    state.m.reserves[2]!.paused = true;
+    let m = (await adapter.supplyMarkets()).find((x) => x.marketId === "USDC")!;
+    assert.equal(m.withdrawableUsd, 0);
+    assert.equal(m.paused, true);
+    state.m.reserves[2]!.paused = false;
+    state.m.reserves[2]!.frozen = true;
+    m = (await adapter.supplyMarkets()).find((x) => x.marketId === "USDC")!;
+    assert.equal(m.withdrawableUsd, 20_000_000);
+    assert.equal(m.paused, true);
+  });
+
+  it("shared account (reviewer repro): a loop on the pool blocks plain deposits and their reads / exits", async () => {
+    const { state, adapter: supplyAdapter, env } = setupSupply();
+    // the same wallet + pool also carries a USDC/USDC loop (left from an earlier run)
+    const loop = new AaveV3Adapter({ env, market, pairs: [pairs[0]!] });
+    assert.equal((await loop.open("USDC/USDC", 1_000n * USDC_UNIT, 0.7, ctx(false))).ok, true);
+    const hf0 = (await loop.position("USDC/USDC"))!.healthFactor!;
+    const usdt = new AaveV3Adapter({ env, market, pairs: [], supply: [{ asset: usdt0 }] });
+    state.m.wallet.set(lc(USDT0), 5_000n * USDC_UNIT);
+    const dep = await usdt.deposit("USDT0", 5_000n * USDC_UNIT, ctx(false));
+    assert.equal(dep.ok, false);
+    assert.match(dep.detail!, /account has debt.*plain deposits would back it/);
+    assert.equal(dep.txs.length, 0);
+    assert.equal((await loop.position("USDC/USDC"))!.healthFactor, hf0, "HF unchanged");
+    // aTokens already in the account (earlier run) are not reported / withdrawn as a plain deposit
+    state.m.aBal.set(lc(USDT0), 500n * USDC_UNIT);
+    state.m.coll.add(0);
+    await assert.rejects(usdt.supplyPosition("USDT0"), /has debt.*loop collateral, not a plain deposit/);
+    await assert.rejects(usdt.withdraw("USDT0", 1, ctx(false)), /has debt/);
+    await assert.rejects(usdt.simulateWithdraw("USDT0", ctx(true)), /has debt/);
+    const mk = (await usdt.supplyMarkets())[0]!;
+    assert.equal(mk.paused, true);
+    assert.match(mk.note!, /account has debt/);
+    void supplyAdapter;
+  });
+
   it("claimRewards by supply marketId", async () => {
     const { state, adapter } = setupSupply();
     assert.equal((await adapter.deposit("aUSDe", 1_000n * 10n ** 18n, ctx(false))).ok, true);
@@ -1545,5 +1629,18 @@ describe("AaveV3Adapter as SupplyAdapter (plain deposits)", () => {
     assert.equal(r.ok, true, r.detail);
     assert.deepEqual(r.claimed, [{ token: "XPL", amount: 2n * 10n ** 18n, decimals: 18 }]);
     await assert.rejects(adapter.claimRewards(ctx(false), "nope"), /unknown pair \/ supply market/);
+  });
+});
+
+describe("loop side: no follow-up tx after an unconfirmed broadcast", () => {
+  it("open: an unconfirmed borrow stops the call (no rollback repay sent)", async () => {
+    const { state, adapter } = setup();
+    let borrows = 0;
+    state.rawFor = (to, data) => (lc(to) === lc(POOL) && poolFn(data) === "borrow" && ++borrows === 2 ? "landed-but-error" : undefined);
+    const r = await adapter.open("USDe/USDT0", 1_000n * 10n ** 18n, 0.8, ctx(false));
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /UNCONFIRMED borrow 0x[0-9a-f]+ .*no follow-up txs sent; wallet USDT0 change at re-read \d+/);
+    assert.ok(r.txs.at(-1)!.unconfirmed, "the unconfirmed borrow is the last tx");
+    assert.ok(state.m.bal(state.m.wallet, USDT0) > 0n, "landed borrow sits in the wallet (reported, not touched)");
   });
 });
