@@ -4,3 +4,13 @@ export * from "./swap/index.js";
 export * from "./rewards/index.js";
 export * as morpho from "./morpho/index.js";
 export { MorphoBlueAdapter, type MorphoBlueAdapterOptions, type MorphoPairConfig } from "./morpho/index.js";
+export * as aave from "./aave/index.js";
+export {
+  AaveV3Adapter,
+  aaveMarketFromAddressBook,
+  aaveAssetFromAddressBook,
+  listAaveAddressBookMarkets,
+  type AaveV3AdapterOptions,
+  type AaveMarketConfig,
+  type AavePairConfig,
+} from "./aave/index.js";

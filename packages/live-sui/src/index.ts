@@ -6,3 +6,5 @@ export * as scallop from "./scallop/index.js";
 export { ScallopAdapter, type ScallopAdapterOptions, type ScallopPairConfig } from "./scallop/index.js";
 export * as navi from "./navi/index.js";
 export { NaviAdapter, type NaviAdapterOptions, type NaviPairConfig } from "./navi/index.js";
+export * as suilend from "./suilend/index.js";
+export { SuilendAdapter, type SuilendAdapterConfig, type SuilendPairConfig } from "./suilend/index.js";

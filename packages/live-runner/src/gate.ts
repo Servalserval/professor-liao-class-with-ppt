@@ -19,6 +19,8 @@ export interface VerifyStamp {
   configHash: string;
   /** component id -> issues found (all must be empty for live). */
   results: Record<string, string[]>;
+  /** Non-fatal findings (printed, never block). */
+  warnings?: Record<string, string[]>;
 }
 
 /** Stable JSON (sorted keys) so the hash does not depend on key order. */
