@@ -89,6 +89,7 @@ import {
   rayMul,
   rayToApr,
   refPriceToUsd,
+  repayNeeded,
   rewardAprFromEmission,
   selectEMode,
   targetLoopDebt,
@@ -207,6 +208,7 @@ export class AaveV3Adapter implements LendingAdapter {
   private readonly statics = new Map<string, ReserveStatic>();
   private eModeCache?: { atMs: number; legacy: boolean; cats: EModeCategoryInfo[] };
   private readonly swapCache = new Map<string, { atMs: number; costFrac: number; depthUsd: number; error?: string }>();
+  private readonly lastSwapCost = new Map<string, number>();
   private readonly rewardMeta = new Map<string, { symbol: string; decimals: number; oracle?: Address }>();
   private priceOracleAddr?: Address;
   private controllerAddr?: Address | null;
@@ -231,6 +233,15 @@ export class AaveV3Adapter implements LendingAdapter {
         throw new Error(`${this.id}: swapper ${o.swapper.id} is on ${o.swapper.chain}`);
       this.pairs.set(p.pairId, p);
     }
+    // All pairs of one market share ONE Aave account per wallet: a reserve used by two
+    // pairs would be counted in both positions (and unwinding one would touch the other).
+    const owner = new Map<string, string>();
+    for (const p of this.pairs.values())
+      for (const a of new Set([lc(p.collateral.address), lc(p.debt.address)])) {
+        const prev = owner.get(a);
+        if (prev) throw new Error(`${this.id}: pairs ${prev} and ${p.pairId} share asset ${a} in one market (one Aave account); use separate wallets / adapters`);
+        owner.set(a, p.pairId);
+      }
   }
 
   // -------------------------------------------------------------------------
@@ -554,27 +565,27 @@ export class AaveV3Adapter implements LendingAdapter {
         const D = toHuman(a.D, p.debt.decimals);
         const b = fromHumanFloor(nextLoopBorrow(S, D, targetLtv, a.r, Dt - D) * (1 - 1e-9), p.debt.decimals);
         if (b < minBorrow || b <= 0n) break;
+        const dBefore = await this.walletBalance(p.debt);
+        const cBefore = same ? dBefore : await this.walletBalance(p.collateral);
         txs.push(await sendTx(this.env, ctx, this.req("borrow", [p.debt.address, b, VARIABLE_RATE_MODE, REFERRAL_CODE, this.env.account], `borrow ${b} ${p.debt.symbol}`)));
-        let supplyAmt = b;
-        if (!same) {
-          const got = await this.swapMeasured(p.debt, p.collateral, b, ctx, p.maxEntrySwapCostBps ?? 50, txs);
-          if (got.error) {
-            // put the borrowed funds back so no debt sits idle in the wallet
-            const back = await this.walletBalance(p.debt);
-            const amt = back < b ? back : b;
-            if (amt > 0n) {
-              txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, amt)));
-              txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, amt, VARIABLE_RATE_MODE, this.env.account], `rollback: repay ${amt} ${p.debt.symbol}`)));
-            }
-            return fail(`swap failed after ${iterations} iteration(s), borrow rolled back: ${got.error}`);
+        // everything after the borrow is rolled back on any failure: no idle debt left in the wallet
+        try {
+          let supplyAmt = b;
+          if (!same) {
+            const got = await this.swapMeasured(p.debt, p.collateral, b, ctx, p.maxEntrySwapCostBps ?? 50, txs);
+            if (got.error) throw new Error(got.error);
+            supplyAmt = got.received;
           }
-          supplyAmt = got.received;
+          txs.push(...(await ensureAllowance(this.env, ctx, p.collateral.address as Address, pool, supplyAmt)));
+          txs.push(await sendTx(this.env, ctx, this.req("supply", [p.collateral.address, supplyAmt, this.env.account, REFERRAL_CODE], `supply ${supplyAmt} ${p.collateral.symbol}`)));
+        } catch (e) {
+          const rb = await this.rollbackBorrow(p, b, dBefore, cBefore, ctx, txs);
+          return fail(`step after borrow failed in iteration ${iterations + 1}: ${(e as Error).message.split("\n")[0]} | borrow rolled back: ${rb}`);
         }
-        txs.push(...(await ensureAllowance(this.env, ctx, p.collateral.address as Address, pool, supplyAmt)));
-        txs.push(await sendTx(this.env, ctx, this.req("supply", [p.collateral.address, supplyAmt, this.env.account, REFERRAL_CODE], `supply ${supplyAmt} ${p.collateral.symbol}`)));
         iterations++;
         a = await this.readAccount(p);
       }
+      await this.resetAllowance(p.collateral.address as Address, ctx, txs);
       const Sv = toHuman(a.S, p.collateral.decimals) * a.r;
       const Dv = toHuman(a.D, p.debt.decimals);
       const ltv = Dv / Math.max(1e-18, Sv);
@@ -1241,51 +1252,58 @@ export class AaveV3Adapter implements LendingAdapter {
   }
 
   /**
-   * swapCostFrac = worst cost of the smallest probe over both directions;
-   * swapDepthUsd = largest probe whose cost stays within maxSlippageBps of the
-   * smallest probe's cost and within the entry / exit cost budgets (both directions).
+   * Swap metrics from quotes at increasing USD sizes (default 10k / 100k / 1M), both directions.
+   *  - swapCostFrac = worst cost of the smallest probe (unknown -> last known value, else Infinity).
+   *  - swapDepthUsd = size up to which cost <= min(cost budget, smallest-probe cost + maxSlippageBps),
+   *    linearly interpolated between the last passing and the first failing probe; the largest
+   *    probe when all pass; 0 when even the smallest probe is over budget; NaN (= unknown) when
+   *    any quote errors (the core then keeps its last known depth).
    */
   private async swapMetrics(p: AavePairConfig, pc: number, pd: number): Promise<{ costFrac: number; depthUsd: number; atMs: number; error?: string }> {
     const hit = this.swapCache.get(p.pairId);
     const ttl = this.opts.swapCacheMs ?? 300_000;
     if (hit && Date.now() - hit.atMs < ttl) return hit;
     const ctx = this.readCtx();
-    const probes = [...(p.swapProbeUsd ?? DEFAULT_PROBES_USD)].sort((a, b) => a - b);
-    try {
-      const dir = async (from: AssetRef, to: AssetRef, priceIn: number, budgetBps: number) => {
-        let base: number | undefined;
-        let depth = 0;
-        for (const usd of probes) {
-          const amt = fromHumanFloor(usd / priceIn, from.decimals);
-          let cost: number;
-          try {
-            const q = await this.swapper!.quote(from, to, amt, ctx);
-            cost = Number.isFinite(q.costBps) ? q.costBps / 1e4 : NaN;
-            if (!(q.amountOut > 0n)) cost = NaN;
-          } catch (e) {
-            if (base === undefined) throw e;
-            break;
-          }
-          if (!Number.isFinite(cost)) break;
-          if (base === undefined) base = Math.max(0, cost);
-          if (cost * 1e4 > budgetBps || (cost - base) * 1e4 > ctx.limits.maxSlippageBps) break;
-          depth = usd;
+    const probes = [...(p.swapProbeUsd ?? DEFAULT_PROBES_USD)].filter((x) => x > 0).sort((a, b) => a - b);
+    const slip = ctx.limits.maxSlippageBps / 1e4;
+    const dir = async (from: AssetRef, to: AssetRef, priceIn: number, budgetBps: number): Promise<{ base: number; depth: number; error?: string }> => {
+      let base: number | undefined;
+      let prev: { usd: number; cost: number } | undefined;
+      for (const usd of probes) {
+        const amt = fromHumanFloor(usd / priceIn, from.decimals);
+        let cost = NaN;
+        let err = "";
+        try {
+          const q = await this.swapper!.quote(from, to, amt, ctx);
+          cost = Number.isFinite(q.costBps) && q.amountOut > 0n ? q.costBps / 1e4 : NaN;
+          if (Number.isNaN(cost)) err = "no output";
+        } catch (e) {
+          err = (e as Error).message.split("\n")[0]!;
         }
-        return { base: base ?? Infinity, depth };
-      };
-      const entry = await dir(p.debt, p.collateral, pd, p.maxEntrySwapCostBps ?? 50);
-      const exit = await dir(p.collateral, p.debt, pc, p.maxExitSwapCostBps ?? 200);
-      const v = { atMs: Date.now(), costFrac: Math.max(entry.base, exit.base), depthUsd: Math.min(entry.depth, exit.depth) };
-      this.swapCache.set(p.pairId, v);
-      return v;
-    } catch (e) {
-      const msg = (e as Error).message.split("\n")[0]!;
-      this.log("warn", `${this.id} ${p.pairId}: swap quote failed: ${msg}`);
-      // Infinity cost makes the core skip the pair instead of assuming a free swap
-      const v = { atMs: Date.now(), costFrac: Infinity, depthUsd: 0, error: msg };
-      this.swapCache.set(p.pairId, v);
-      return v;
-    }
+        if (Number.isNaN(cost)) return { base: base ?? NaN, depth: NaN, error: `${from.symbol}->${to.symbol} quote at $${usd} failed: ${err}` };
+        if (base === undefined) base = Math.max(0, cost);
+        const limit = Math.min(budgetBps / 1e4, base + slip);
+        if (cost > limit) {
+          if (!prev) return { base, depth: 0 };
+          const frac = cost > prev.cost ? (limit - prev.cost) / (cost - prev.cost) : 0;
+          return { base, depth: prev.usd + (usd - prev.usd) * Math.min(1, Math.max(0, frac)) };
+        }
+        prev = { usd, cost };
+      }
+      return { base: base ?? NaN, depth: prev?.usd ?? NaN };
+    };
+    const entry = await dir(p.debt, p.collateral, pd, p.maxEntrySwapCostBps ?? 50);
+    const exit = await dir(p.collateral, p.debt, pc, p.maxExitSwapCostBps ?? 200);
+    const error = [entry.error, exit.error].filter(Boolean).join("; ") || undefined;
+    let costFrac = Math.max(entry.base, exit.base);
+    if (Number.isNaN(costFrac)) costFrac = this.lastSwapCost.get(p.pairId) ?? Infinity;
+    else this.lastSwapCost.set(p.pairId, costFrac);
+    const depthUsd = Number.isNaN(entry.depth) || Number.isNaN(exit.depth) ? NaN : Math.min(entry.depth, exit.depth);
+    if (error) this.log("warn", `${this.id} ${p.pairId}: swap probe failed (${error}); depth unknown`);
+    // failures are retried after 1 minute instead of the full cache TTL
+    const v = { atMs: error ? Date.now() - ttl + 60_000 : Date.now(), costFrac, depthUsd, error };
+    this.swapCache.set(p.pairId, v);
+    return v;
   }
 
   /** Quote + swap, returning the measured wallet delta of `to`. */
@@ -1297,16 +1315,126 @@ export class AaveV3Adapter implements LendingAdapter {
     maxCostBps: number,
     txs: TxRecord[]
   ): Promise<{ received: bigint; error?: string }> {
-    const before = await this.walletBalance(to);
-    const q = await this.swapper!.quote(from, to, amount, ctx);
-    if (q.costBps > maxCostBps) return { received: 0n, error: `swap ${from.symbol}->${to.symbol} costs ${q.costBps.toFixed(1)} bps > ${maxCostBps}` };
-    const r = await this.swapper!.swap(q, from, to, ctx);
-    txs.push(...r.txs);
-    if (!r.ok) return { received: 0n, error: r.detail ?? "swap failed" };
-    const after = await this.walletBalance(to);
-    const got = after - before;
-    if (got <= 0n) return { received: 0n, error: `swap reported ok but ${to.symbol} balance did not increase` };
-    return { received: got };
+    // Never throws: a quote rejection (the normal way an aggregator refuses an
+    // expensive route) must reach the caller's rollback like any other failure.
+    try {
+      const before = await this.walletBalance(to);
+      const q = await this.swapper!.quote(from, to, amount, ctx);
+      if (!(q.costBps <= maxCostBps)) return { received: 0n, error: `swap ${from.symbol}->${to.symbol} costs ${q.costBps.toFixed(1)} bps > ${maxCostBps}` };
+      const r = await this.swapper!.swap(q, from, to, ctx);
+      txs.push(...r.txs);
+      if (!r.ok) return { received: 0n, error: r.detail ?? "swap failed" };
+      const after = await this.walletBalance(to);
+      const got = after - before;
+      if (got <= 0n) return { received: 0n, error: `swap reported ok but ${to.symbol} balance did not increase` };
+      return { received: got };
+    } catch (e) {
+      return { received: 0n, error: `swap ${from.symbol}->${to.symbol}: ${(e as Error).message.split("\n")[0]}` };
+    }
+  }
+
+  /** Reset a leftover pool allowance to 0 (exact approvals can leave dust when live amounts differ from the plan). */
+  private async resetAllowance(token: Address, ctx: LiveContext, txs: TxRecord[]): Promise<void> {
+    try {
+      const cur = await this.env.publicClient.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [this.env.account, this.market.pool] });
+      if (cur > 0n)
+        txs.push(await sendTx(this.env, ctx, { to: token, data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [this.market.pool, 0n] }), description: `reset leftover allowance ${token}` }));
+    } catch (e) {
+      this.log("warn", `${this.id}: resetting allowance of ${token} failed: ${(e as Error).message.split("\n")[0]}`);
+    }
+  }
+
+  /**
+   * Undo a borrow whose follow-up failed: repay with the debt asset received
+   * since `dBefore` (bounded by `borrowed`); if a swap already turned it into
+   * collateral that could not be supplied, swap that collateral back first.
+   */
+  private async rollbackBorrow(
+    p: AavePairConfig,
+    borrowed: bigint,
+    dBefore: bigint,
+    cBefore: bigint,
+    ctx: LiveContext,
+    txs: TxRecord[]
+  ): Promise<string> {
+    const pool = this.market.pool;
+    const notes: string[] = [];
+    try {
+      if (!this.isSame(p)) {
+        const cHeld = (await this.walletBalance(p.collateral)) - cBefore;
+        const dHeld = (await this.walletBalance(p.debt)) - dBefore;
+        if (cHeld > 0n && dHeld < borrowed) {
+          const back = await this.swapMeasured(p.collateral, p.debt, cHeld, ctx, p.maxExitSwapCostBps ?? 200, txs);
+          notes.push(back.error ? `swap-back failed: ${back.error}` : `swapped ${cHeld} ${p.collateral.symbol} back`);
+        }
+      }
+      const dHeld = (await this.walletBalance(p.debt)) - dBefore;
+      const amt = dHeld < borrowed ? dHeld : borrowed;
+      if (amt > 0n) {
+        txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, amt)));
+        txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, amt, VARIABLE_RATE_MODE, this.env.account], `rollback: repay ${amt} ${p.debt.symbol}`)));
+        notes.push(`repaid ${amt}/${borrowed} ${p.debt.symbol}`);
+      } else notes.push(`nothing to repay (borrowed ${borrowed} ${p.debt.symbol} not in wallet)`);
+    } catch (e) {
+      notes.push(`ROLLBACK FAILED: ${(e as Error).message.split("\n")[0]} — ${p.debt.symbol} debt may sit idle in the wallet`);
+      this.log("error", `${this.id} ${p.pairId}: borrow rollback failed: ${(e as Error).message.split("\n")[0]}`);
+    }
+    await this.resetAllowance(p.collateral.address as Address, ctx, txs);
+    return notes.join("; ");
+  }
+
+  /** Re-supply collateral withdrawn for an unwind step whose swap / repay failed (wallet delta since `cBefore`, bounded by `withdrawn`). */
+  private async rollbackWithdraw(p: AavePairConfig, withdrawn: bigint, cBefore: bigint, dBefore: bigint, ctx: LiveContext, txs: TxRecord[]): Promise<string> {
+    const pool = this.market.pool;
+    const notes: string[] = [];
+    try {
+      const dHeld = (await this.walletBalance(p.debt)) - dBefore;
+      const cHeld0 = (await this.walletBalance(p.collateral)) - cBefore;
+      if (dHeld > 0n && cHeld0 < withdrawn) {
+        // the swap went through but the repay failed: buy the collateral back
+        const back = await this.swapMeasured(p.debt, p.collateral, dHeld, ctx, p.maxExitSwapCostBps ?? 200, txs);
+        notes.push(back.error ? `swap-back failed: ${back.error}` : `swapped ${dHeld} ${p.debt.symbol} back`);
+      }
+      const cHeld = (await this.walletBalance(p.collateral)) - cBefore;
+      const amt = cHeld < withdrawn ? cHeld : withdrawn;
+      if (amt > 0n) {
+        txs.push(...(await ensureAllowance(this.env, ctx, p.collateral.address as Address, pool, amt)));
+        txs.push(await sendTx(this.env, ctx, this.req("supply", [p.collateral.address, amt, this.env.account, REFERRAL_CODE], `rollback: re-supply ${amt} ${p.collateral.symbol}`)));
+        notes.push(`re-supplied ${amt}/${withdrawn} ${p.collateral.symbol}`);
+      } else notes.push(`no ${p.collateral.symbol} to re-supply`);
+    } catch (e) {
+      notes.push(`ROLLBACK FAILED: ${(e as Error).message.split("\n")[0]} — position is at the unwind ceiling`);
+      this.log("error", `${this.id} ${p.pairId}: withdraw rollback failed: ${(e as Error).message.split("\n")[0]}`);
+    }
+    return notes.join("; ");
+  }
+
+  /**
+   * Repay with debt-asset already in the wallet, bounded by the debt and by
+   * max(what the goal still needs, `ownProceeds`): idle wallet balance is only
+   * used as far as the goal needs it, our own swap output is repaid in full.
+   * Full close (targetDebt 0) repays with type(uint256).max once the wallet
+   * covers the debt plus 1 bp.
+   */
+  private async repayFromWallet(p: AavePairConfig, a: Account, g: UnwindGoal, ctx: LiveContext, txs: TxRecord[], ownProceeds = 0n): Promise<bigint> {
+    const wallet = await this.walletBalance(p.debt);
+    if (wallet <= 0n || a.D <= 0n) return 0n;
+    const goalNeed = repayNeeded(a.S, a.D, g, { priceRatio: a.r, collateralDecimals: p.collateral.decimals, debtDecimals: p.debt.decimals });
+    const need = goalNeed > ownProceeds ? goalNeed : ownProceeds;
+    if (need <= 0n) return 0n;
+    const pool = this.market.pool;
+    const buffered = a.D + a.D / 10_000n + 1n;
+    if ("targetDebt" in g && g.targetDebt === 0n && wallet >= buffered) {
+      txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, buffered)));
+      txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, MAX_UINT256, VARIABLE_RATE_MODE, this.env.account], `repay all ${p.debt.symbol}`)));
+      return a.D;
+    }
+    let amt = wallet < need ? wallet : need;
+    if (amt > a.D) amt = a.D;
+    if (amt < this.minUnits(a.priceD, p.debt.decimals) && amt < need) return 0n; // dust: let the next withdraw cover it
+    txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, amt)));
+    txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, amt, VARIABLE_RATE_MODE, this.env.account], `repay ${amt} ${p.debt.symbol}`)));
+    return amt;
   }
 
   // -------------------------------------------------------------------------
@@ -1375,46 +1503,52 @@ export class AaveV3Adapter implements LendingAdapter {
       }
 
       const startD = await this.walletBalance(p.debt);
-      let carry = 0n;
       let a = acct0;
       let iterations = 0;
+      let walletRepaid = 0n;
+      const ltvOf = (x: Account) => toHuman(x.D, p.debt.decimals) / Math.max(1e-18, toHuman(x.S, p.collateral.decimals) * x.r);
       for (let i = 0; i < maxIter; i++) {
         const prm = { ...params, priceRatio: a.r };
+        if (unwindStep(a.S, a.D, g, prm).done) break;
+        // 1) debt asset already in the wallet goes first (bounded by what the goal still needs)
+        const fromWallet = await this.repayFromWallet(p, a, g, ctx, txs);
+        if (fromWallet > 0n) {
+          walletRepaid += fromWallet;
+          a = await this.readAccount(p);
+          continue;
+        }
+        // 2) withdraw -> swap -> repay
         let st = unwindStep(a.S, a.D, g, prm);
         if (st.done) break;
         if (st.stuck) {
           st = unwindStep(a.S, a.D, g, { ...prm, ceilingLtv: a.liqThreshold / 1.01 });
-          if (st.stuck || st.withdraw === 0n) return fail(`no safe withdrawal possible at LTV ${(toHuman(a.D, p.debt.decimals) / (toHuman(a.S, p.collateral.decimals) * a.r)).toFixed(4)}; needs external ${p.debt.symbol} to repay`);
+          if (st.stuck || st.withdraw === 0n)
+            return fail(`stuck: no safe withdrawal at LTV ${ltvOf(a).toFixed(4)} (HF ${a.healthFactor.toFixed(3)}) and no ${p.debt.symbol} in the wallet; needs external ${p.debt.symbol} to repay`);
+          this.log("warn", `${this.id} ${p.pairId}: LTV ${ltvOf(a).toFixed(4)} at the unwind ceiling; stepping with emergency HF 1.01`);
         }
+        const cBefore = await this.walletBalance(p.collateral);
+        const dBefore = await this.walletBalance(p.debt);
+        // a failing withdraw changes nothing (outer catch); everything after it is rolled back
         txs.push(await sendTx(this.env, ctx, this.req("withdraw", [p.collateral.address, st.withdraw, this.env.account], `withdraw ${st.withdraw} ${p.collateral.symbol}`)));
-        const got = await this.swapMeasured(p.collateral, p.debt, st.withdraw, ctx, maxExit, txs);
-        if (got.error) {
-          // put the collateral back so HF returns to where it was
-          const bal = await this.walletBalance(p.collateral);
-          const back = bal < st.withdraw ? bal : st.withdraw;
-          if (back > 0n) {
-            txs.push(...(await ensureAllowance(this.env, ctx, p.collateral.address as Address, pool, back)));
-            txs.push(await sendTx(this.env, ctx, this.req("supply", [p.collateral.address, back, this.env.account, REFERRAL_CODE], `rollback: re-supply ${back} ${p.collateral.symbol}`)));
-          }
-          return fail(`swap failed after ${iterations} iteration(s), collateral re-supplied: ${got.error}`);
-        }
-        const avail = carry + got.received;
-        const debtNow = await this.env.publicClient.readContract({ address: (await this.reserveStatics([p.debt.address as Address])).get(lc(p.debt.address))!.vToken, abi: AAVE_TOKEN_ABI, functionName: "balanceOf", args: [this.env.account] });
-        if (full && avail > debtNow + debtNow / 10_000n) {
-          const approve = debtNow + debtNow / 10_000n + 1n;
-          txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, approve)));
-          txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, MAX_UINT256, VARIABLE_RATE_MODE, this.env.account], `repay all ${p.debt.symbol}`)));
-          carry = avail - debtNow;
-        } else {
-          const amt = avail < debtNow ? avail : debtNow;
-          txs.push(...(await ensureAllowance(this.env, ctx, p.debt.address as Address, pool, amt)));
-          txs.push(await sendTx(this.env, ctx, this.req("repay", [p.debt.address, amt, VARIABLE_RATE_MODE, this.env.account], `repay ${amt} ${p.debt.symbol}`)));
-          carry = avail - amt;
+        try {
+          const got = await this.swapMeasured(p.collateral, p.debt, st.withdraw, ctx, maxExit, txs);
+          if (got.error) throw new Error(got.error);
+          const a2 = await this.readAccount(p);
+          const need = repayNeeded(a2.S, a2.D, g, { priceRatio: a2.r, collateralDecimals: p.collateral.decimals, debtDecimals: p.debt.decimals });
+          const repaid = await this.repayFromWallet(p, a2, g, ctx, txs, got.received);
+          if (repaid === 0n && need > 0n) throw new Error(`swap output ${got.received} ${p.debt.symbol} was not repaid`);
+        } catch (e) {
+          const rb = await this.rollbackWithdraw(p, st.withdraw, cBefore, dBefore, ctx, txs);
+          await this.resetAllowance(p.debt.address as Address, ctx, txs);
+          return fail(`step ${iterations + 1} failed after the withdraw: ${(e as Error).message.split("\n")[0]} | rollback: ${rb}`);
         }
         iterations++;
         a = await this.readAccount(p);
       }
-      if (!unwindStep(a.S, a.D, g, { ...params, priceRatio: a.r }).done) return fail(`stopped after ${iterations} iteration(s) before reaching the goal`);
+      if (!unwindStep(a.S, a.D, g, { ...params, priceRatio: a.r }).done) {
+        await this.resetAllowance(p.debt.address as Address, ctx, txs);
+        return fail(`stopped after ${iterations} iteration(s) before reaching the goal (LTV ${ltvOf(a).toFixed(4)})`);
+      }
 
       if ("fraction" in goal) {
         if (full) {
@@ -1435,9 +1569,17 @@ export class AaveV3Adapter implements LendingAdapter {
             txs.push(await sendTx(this.env, ctx, this.req("withdraw", [p.collateral.address, extra, this.env.account], `withdraw ${extra} ${p.collateral.symbol}`)));
         }
       }
+      await this.resetAllowance(p.debt.address as Address, ctx, txs);
       const fin = await this.readAccount(p);
       const ltv = fin.S > 0n ? toHuman(fin.D, p.debt.decimals) / (toHuman(fin.S, p.collateral.decimals) * fin.r) : 0;
-      return { ok: true, txs, detail: `${iterations} iteration(s), LTV ${ltv.toFixed(4)}, HF ${fin.healthFactor === Infinity ? "inf" : fin.healthFactor.toFixed(3)}` };
+      const spentIdle = startD > (await this.walletBalance(p.debt)) ? startD - (await this.walletBalance(p.debt)) : 0n;
+      return {
+        ok: true,
+        txs,
+        detail:
+          `${iterations} withdraw->swap->repay iteration(s), LTV ${ltv.toFixed(4)}, HF ${fin.healthFactor === Infinity ? "inf" : fin.healthFactor.toFixed(3)}` +
+          (spentIdle > 0n ? `; used ${spentIdle} ${p.debt.symbol} already in the wallet to repay (repaid from wallet total ${walletRepaid})` : ""),
+      };
     } catch (e) {
       return fail((e as Error).message.split("\n")[0]!);
     }

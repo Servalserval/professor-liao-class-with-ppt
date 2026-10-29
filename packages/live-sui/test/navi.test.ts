@@ -476,6 +476,45 @@ describe("NaviAdapter", () => {
     assert.equal(p.collateral.borrowFeeFrac, undefined);
   });
 
+  test("markets(): failed swap probe reports depth NaN (unknown), never 0; cost falls back to last known", async () => {
+    const h = mkHarness();
+    let mode: "ok" | "fail" | "expensive" | "partial" = "fail";
+    const swapper: PtbSwapper = {
+      quote: async (_f, _t, amountIn) => {
+        const usd = Number(amountIn) / 1e6;
+        if (mode === "fail") throw new Error("aggregator down");
+        if (mode === "partial" && usd > 20_000) throw new Error("timeout");
+        const costBps = mode === "expensive" ? 80 : usd <= 20_000 ? 2 : usd <= 200_000 ? 5 : 50;
+        return { amountIn, amountOut: amountIn, costBps, routeData: null };
+      },
+      appendSwap: async (tx) => tx.moveCall({ target: "0x1::mock::swap" }),
+    };
+    const a = new NaviAdapter({ env: h.env, pairs: [{ pairId: "USDC/USDT", collateral: USDC, debt: USDT }], sdk: h.sdk, swapper });
+    // 1) no successful probe yet: depth unknown, cost = budget fallback (30 bp)
+    let [p] = await a.markets();
+    assert.ok(p && Number.isNaN(p.swapDepthUsd), `depth ${p?.swapDepthUsd}`);
+    close(p.swapCostFrac, 0.003);
+    // 2) success records the last known cost
+    mode = "ok";
+    [p] = await a.markets();
+    assert.equal(p!.swapDepthUsd, 100_000);
+    close(p!.swapCostFrac, 0.0002);
+    // 3) failure again: depth NaN, cost = last known
+    mode = "fail";
+    [p] = await a.markets();
+    assert.ok(Number.isNaN(p!.swapDepthUsd));
+    close(p!.swapCostFrac, 0.0002);
+    // 4) probes succeed but nothing fits the budget: a real 0
+    mode = "expensive";
+    [p] = await a.markets();
+    assert.equal(p!.swapDepthUsd, 0);
+    close(p!.swapCostFrac, 0.008);
+    // 5) smallest probe ok, larger one fails: depth reported as the measured lower bound
+    mode = "partial";
+    [p] = await a.markets();
+    assert.equal(p!.swapDepthUsd, 10_000);
+  });
+
   test("position(): reads the e-mode cap account, USD at oracle prices, HF and rewards", async () => {
     const h = mkHarness({ caps: [{ marketId: 0, emodeId: 2, accountCap: CAP_ID }], state: { [CAP_ID]: { coll: 1000, debt: 0 } } });
     // same-asset view: put the debt on USDC too

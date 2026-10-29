@@ -430,6 +430,24 @@ export interface UnwindStep {
   finalRepay: boolean;
 }
 
+/** LTV-goal tolerance: float rounding only. */
+export const UNWIND_LTV_TOL = 1e-9;
+
+/**
+ * Debt (base units) that must be repaid with funds already at hand to meet
+ * the goal without withdrawing: targetDebt goal -> D - targetDebt; LTV goal ->
+ * D - t * S * r (rounded up). Never more than D.
+ */
+export function repayNeeded(S: bigint, D: bigint, goal: UnwindGoal, p: Pick<UnwindParams, "priceRatio" | "collateralDecimals" | "debtDecimals">): bigint {
+  if (D <= 0n) return 0n;
+  if ("targetDebt" in goal) return D > goal.targetDebt ? D - goal.targetDebt : 0n;
+  const keep = toHuman(S, p.collateralDecimals) * p.priceRatio * goal.targetLtv;
+  const need = toHuman(D, p.debtDecimals) - keep;
+  if (!(need > 0)) return 0n;
+  const u = fromHumanFloor(need, p.debtDecimals) + 1n;
+  return u > D ? D : u;
+}
+
 /**
  * One withdraw -> swap -> repay iteration for a two-asset unwind.
  * Withdraw w (collateral) is bounded so that LTV after the withdrawal stays
@@ -451,7 +469,7 @@ export function unwindStep(S: bigint, D: bigint, goal: UnwindGoal, p: UnwindPara
   } else {
     const t = goal.targetLtv;
     const ltv = Sh > 0 ? Dh / (Sh * r) : Infinity;
-    if (ltv <= t) return { ...none, done: true };
+    if (ltv <= t + UNWIND_LTV_TOL) return { ...none, done: true };
     if (!(1 - s > t)) throw new Error(`cannot deleverage to ${t}: swap cost ${s} makes each step raise LTV`);
     wNeed = ((Dh - t * Sh * r) / (r * (1 - s - t))) * (1 + 1e-6);
   }
@@ -462,9 +480,14 @@ export function unwindStep(S: bigint, D: bigint, goal: UnwindGoal, p: UnwindPara
   if (wu > S) wu = S;
   const minW = p.minWithdraw ?? 1n;
   if (wu < minW) {
-    // dust left: within rounding of the LTV target, or withdraw the minimum step to clear a debt remainder
-    if (!("targetDebt" in goal)) return { ...none, done: true };
-    wu = minW < wMaxU ? minW : wMaxU;
+    // Below the minimum step. Either the remainder is dust (needed withdrawal is
+    // tiny but fits under the ceiling: take one minimum / ceiling-bounded step),
+    // or the ceiling itself is what limits us (LTV too close to the ceiling):
+    // that is `stuck`, never `done` — done is only decided by the goal checks above.
+    const wNeedU = fromHumanFloor(wNeed, p.collateralDecimals);
+    if (wMaxU >= minW) wu = minW;
+    else if (wNeedU <= wMaxU && wMaxU > 0n) wu = wMaxU;
+    else return { ...none, stuck: true };
     if (wu > S) wu = S;
     if (wu <= 0n) return { ...none, stuck: true };
   }

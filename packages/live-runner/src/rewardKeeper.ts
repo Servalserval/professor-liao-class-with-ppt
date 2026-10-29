@@ -82,7 +82,9 @@ export class RewardKeeper {
   }
 
   private wctx(): LiveContext {
-    return { ...this.d.ctx, dryRun: this.d.mode === "shadow" || this.d.ctx.dryRun };
+    // live broadcasts, shadow simulates — the mode alone decides (the shared
+    // base ctx is dry-run by default and must not silently disable live claims).
+    return { ...this.d.ctx, dryRun: this.d.mode !== "live" };
   }
 
   /** Run once if due (or when forced). Returns human-readable lines for logs / Telegram. */

@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getChainAddresses, MarketUtils, SharesMath } from "@morpho-org/blue-sdk";
-import { decodeFunctionData, erc20Abi, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
+import { decodeFunctionData, erc20Abi, keccak256, type Address, type Hex, type PublicClient, type WalletClient } from "viem";
 import { Mutex, viemChainFor, type EvmEnv } from "@incentive-router/live-evm-base";
 import type { AssetRef, LiveContext, RewardRateQuery, SwapAdapter, SwapQuote } from "@incentive-router/live-common";
 import {
@@ -121,14 +121,17 @@ function replay(start: LoopState, plan: LoopPlan, cap: number): LoopState {
 
 const CAP = 0.915 * 0.95;
 
-test("planLoopSteps reaches the target LTV without breaching the step cap", () => {
+test("planLoopSteps: every borrow keeps post-borrow LTV <= target; converges within the tolerance", () => {
   const start = { collateral: 0n, debt: 0n };
-  const plan = planLoopSteps(start, 1000n * E18, 0.8, { price: PRICE, stepLtvCap: CAP, swapCostFrac: 0.001, maxIterations: 20 });
+  const plan = planLoopSteps(start, 1000n * E18, 0.8, { price: PRICE, stepLtvCap: CAP, swapCostFrac: 0.001, maxIterations: 40, ltvTolerance: 0.005 });
   assert.equal(plan.reachedTarget, true);
-  assert.ok(Math.abs(plan.finalLtv - 0.8) < 1e-6, `final ${plan.finalLtv}`);
-  assert.ok(plan.iterations >= 5 && plan.iterations <= 9, `iterations ${plan.iterations}`);
+  assert.ok(plan.finalLtv <= 0.8 && plan.finalLtv >= 0.795, `final ${plan.finalLtv}`);
+  // remaining debt shrinks by t(1-c) ~ 0.8 per iteration
+  assert.ok(plan.iterations >= 14 && plan.iterations <= 18, `iterations ${plan.iterations}`);
   assert.equal(plan.steps[0]!.kind, "supplyCollateral");
-  replay(start, plan, CAP);
+  replay(start, plan, 0.8); // the TARGET is the intermediate cap, not LLTV x 0.95
+  const firstBorrow = plan.steps[1]!;
+  assert.ok(firstBorrow.kind === "borrow" && firstBorrow.assets === 960n * E6, "first borrow = 0.8 x $1200");
   // Dt = tV/(1 - t(1-c)) with V = 1200 USDC
   assert.ok(Math.abs(Number(plan.targetDebt) / 1e6 - (0.8 * 1200) / (1 - 0.8 * 0.999)) < 0.01);
 
@@ -136,6 +139,9 @@ test("planLoopSteps reaches the target LTV without breaching the step cap", () =
   assert.equal(short.reachedTarget, false);
   assert.equal(short.iterations, 3);
   assert.ok(short.finalLtv < 0.8 && short.finalLtv > 0.6);
+  // a target above the step cap is still capped by the step cap
+  const capped = planLoopSteps(start, 1000n * E18, 0.9, { price: PRICE, stepLtvCap: CAP, swapCostFrac: 0, maxIterations: 60 });
+  replay(start, capped, CAP);
 });
 
 test("planLoopSteps respects liquidity, min debt and existing debt", () => {
@@ -225,6 +231,13 @@ class FakeChain {
   sent: { to: Address; fn: string; args: readonly unknown[] }[] = [];
   simulated: { to: Address; fn: string; args: readonly unknown[] }[] = [];
   bundles: number[] = [];
+  /** LTV right after each broadcast borrow (before the swap output is supplied). */
+  postBorrowLtv: number[] = [];
+
+  ltv(st = this.s): number {
+    const debt = SharesMath.toAssets(st.pos.borrowShares, st.market.totalBorrowAssets, st.market.totalBorrowShares, "Up");
+    return oracleLtv(st.pos.collateral, debt, this.price);
+  }
 
   constructor(o: { flavor?: "morpho" | "lista"; supply?: bigint; borrow?: bigint } = {}) {
     this.flavor = o.flavor ?? "morpho";
@@ -296,6 +309,7 @@ class FakeChain {
           if (!this.healthy(st)) throw new Error("insufficient collateral");
           if (m.totalBorrowAssets > m.totalSupplyAssets) throw new Error("insufficient liquidity");
           this.move(st, LOAN, this.morpho, ACCOUNT, assets);
+          if (st === this.s) this.postBorrowLtv.push(this.ltv());
           break;
         }
         case "repay": {
@@ -403,46 +417,72 @@ class FakeChain {
         });
         return { results, assetChanges: [], block: {} };
       },
+      sendRawTransaction: this.sendRaw,
+      getTransaction: async () => null,
       waitForTransactionReceipt: async () => ({ status: "success", gasUsed: 150_000n, effectiveGasPrice: 1_000_000_000n }),
     } as unknown as PublicClient;
   }
 
+  /** Signed-but-unsent txs, keyed by the fake raw tx (sendTx signs locally, then sendRawTransaction). */
+  raws = new Map<string, { to: Address; data: Hex }>();
+  private nonce = 0;
+
   walletClient(): WalletClient {
     const self = this;
-    let n = 0;
     return {
       account: { address: ACCOUNT },
-      sendTransaction: async ({ to, data }: { to: Address; data: Hex }) => {
-        const r = self.apply(self.s, to, data);
-        self.sent.push({ to, ...r });
-        return `0x${(++n).toString(16).padStart(64, "0")}` as Hex;
+      prepareTransactionRequest: async (req: { to: Address; data: Hex }) => req,
+      signTransaction: async ({ to, data }: { to: Address; data: Hex }) => {
+        const raw = `0x${(++self.nonce).toString(16).padStart(8, "0")}${data.slice(2)}` as Hex;
+        self.raws.set(raw, { to, data });
+        return raw;
+      },
+      sendTransaction: async () => {
+        throw new Error("adapter must go through sendTx (sign + sendRawTransaction)");
       },
     } as unknown as WalletClient;
   }
+
+  /** sendRawTransaction: execute the signed tx against the real state. */
+  sendRaw = async ({ serializedTransaction }: { serializedTransaction: Hex }) => {
+    const tx = this.raws.get(serializedTransaction);
+    if (!tx) throw new Error("unknown raw tx");
+    const r = this.apply(this.s, tx.to, tx.data);
+    this.sent.push({ to: tx.to, ...r });
+    return keccak256(serializedTransaction);
+  };
 
   env(): EvmEnv {
     return { chain: "base", viemChain: viemChainFor("base", "http://127.0.0.1:1"), publicClient: this.publicClient(), walletClient: this.walletClient(), account: ACCOUNT, lock: new Mutex() };
   }
 
-  /** A swapper that trades at the oracle price minus a size-dependent cost. */
-  swapper(costBps: (usd: number) => number = (usd) => 5 + usd / 10_000): SwapAdapter & { quotes: { from: string; amountIn: bigint }[] } {
+  /**
+   * A swapper that trades at the oracle price minus a size-dependent cost.
+   * Knobs (mutable): costBps, failQuote / failSwap (called with the 1-based
+   * quote / swap count; true = throw "API down" / return ok:false).
+   */
+  swapper(costBps: (usd: number) => number = (usd) => 5 + usd / 10_000): FakeSwapper {
     const self = this;
-    const quotes: { from: string; amountIn: bigint }[] = [];
-    return {
+    const sw: FakeSwapper = {
       id: "fake-swap",
       chain: "base",
-      quotes,
+      quotes: [],
+      swaps: 0,
+      costBps,
       async quote(from: AssetRef, to: AssetRef, amountIn: bigint): Promise<SwapQuote> {
-        quotes.push({ from: from.symbol, amountIn });
+        sw.quotes.push({ from: from.symbol, amountIn });
+        if (sw.failQuote?.(sw.quotes.length, from.symbol)) throw new Error("aggregator API down (503)");
         const toLoan = lc(from.address) === lc(COLL);
         const fair = toLoan ? collateralValue(amountIn, self.price) : (amountIn * 10n ** 36n) / self.price;
         const usd = toLoan ? Number(fair) / 1e6 : Number(amountIn) / 1e6;
-        const c = costBps(usd);
+        const c = sw.costBps(usd);
         const amountOut = (fair * BigInt(Math.round((1 - c / 1e4) * 1e9))) / 1_000_000_000n;
         return { amountIn, amountOut, costBps: c, route: "fake", validUntilMs: Date.now() + 60_000 };
       },
       async swap(q: SwapQuote, from: AssetRef, to: AssetRef, ctx: LiveContext) {
         if (ctx.dryRun) return { ok: true, txs: [{ chain: "base", description: "swap", simulated: true }] };
+        sw.swaps++;
+        if (sw.failSwap?.(sw.swaps)) return { ok: false, txs: [], detail: "min-out not met" };
         const fb = self.bal(from.address, ACCOUNT);
         if (fb < q.amountIn) return { ok: false, txs: [], detail: "insufficient balance" };
         self.s.balances.set(k(from.address, ACCOUNT), fb - q.amountIn);
@@ -450,8 +490,17 @@ class FakeChain {
         return { ok: true, txs: [{ chain: "base", id: "0xswap", description: `swap ${from.symbol}->${to.symbol}`, simulated: false }] };
       },
     };
+    return sw;
   }
 }
+
+type FakeSwapper = SwapAdapter & {
+  quotes: { from: string; amountIn: bigint }[];
+  swaps: number;
+  costBps: (usd: number) => number;
+  failQuote?: (n: number, from: string) => boolean;
+  failSwap?: (n: number) => boolean;
+};
 
 const logs: string[] = [];
 function ctx(over: Partial<LiveContext> = {}): LiveContext {
@@ -575,13 +624,16 @@ test("open() dry-run: approve -> supplyCollateral -> borrow simulated as one bun
   assert.deepEqual(fc.simulated.map((s) => s.fn), ["approve", "supplyCollateral", "borrow"]);
   assert.equal(fc.simulated[1]!.args[1], 1000n * E18);
   const borrowed = fc.simulated[2]!.args[1] as bigint;
-  // first borrow = step cap (LLTV*0.95) x 1200 USDC
-  assert.ok(Math.abs(Number(borrowed) / 1e6 - 0.915 * 0.95 * 1200) < 0.01, `borrow ${borrowed}`);
+  // first borrow is capped at the TARGET LTV: 0.8 x 1200 USDC
+  assert.equal(borrowed, 960n * E6);
   assert.equal(r.txs.length, 3);
   assert.ok(r.txs.every((t) => t.simulated && t.gasUsd! > 0));
   assert.ok(Math.abs(r.amountUsd! - 1200) < 1e-9);
-  assert.match(r.detail!, /projected LTV 80\.00%/);
+  // 10 iterations of target-capped borrows approach 80% from below
+  assert.match(r.detail!, /10 borrow->swap->supply iteration\(s\), projected LTV 78\.\d\d% \(target 80\.00%, not reached/);
   assert.equal(fc.sent.length, 0, "dry-run must not broadcast");
+  const long = await a.open("sUSDe/USDC", 1000n * E18, 0.8, ctx({ limits: { maxGasUsd: { default: 5 }, maxSlippageBps: 15, maxLoopIterations: 30 } }));
+  assert.match(long.detail!, /projected LTV 79\.[5-9]\d% \(target 80\.00%\)/);
 });
 
 test("open(): refuses above maxLtv, without balance; bundle revert -> not ok; no eth_simulateV1 -> step 1 only", async () => {
@@ -612,17 +664,25 @@ test("open() live then close() live on the in-memory Morpho", async () => {
   const fc = new FakeChain();
   const a = adapter(fc);
   const live = ctx({ dryRun: false });
-  const r = await a.open("sUSDe/USDC", 1000n * E18, 0.8, live);
+  const r = await a.open("sUSDe/USDC", 1000n * E18, 0.8, ctx({ dryRun: false, limits: { maxGasUsd: { default: 5 }, maxSlippageBps: 15, maxLoopIterations: 30 } }));
   assert.equal(r.ok, true, r.detail);
   const v = (await a.position("sUSDe/USDC"))!;
-  assert.ok(Math.abs(v.ltv - 0.8) < 2e-4, `ltv ${v.ltv} (${r.detail})`);
+  assert.ok(v.ltv <= 0.8 + 1e-9 && v.ltv >= 0.795, `ltv ${v.ltv} (${r.detail})`);
+  // no intermediate borrow ever pushed LTV above the target
+  assert.ok(fc.postBorrowLtv.length >= 14);
+  assert.ok(Math.max(...fc.postBorrowLtv) <= 0.8 + 1e-6, `max post-borrow LTV ${Math.max(...fc.postBorrowLtv)}`);
   assert.equal(fc.bal(COLL, ACCOUNT), 0n);
   assert.ok(fc.bal(LOAN, ACCOUNT) < 10n, "borrowed USDC must all be swapped");
   assert.ok(r.txs.every((t) => !t.simulated && t.id));
   const fns = fc.sent.map((s) => s.fn);
   assert.equal(fns[0], "approve");
   assert.equal(fns[1], "supplyCollateral");
-  assert.ok(fns.filter((f) => f === "borrow").length >= 5);
+
+  // with the default 10 iterations the target is approached, never exceeded
+  const fc2 = new FakeChain();
+  const r2 = await adapter(fc2).open("sUSDe/USDC", 1000n * E18, 0.8, live);
+  assert.equal(r2.ok, true, r2.detail);
+  assert.ok(fc2.ltv() < 0.8 && fc2.ltv() > 0.77, `ltv ${fc2.ltv()}`);
 
   // simulateClose on the levered position
   assert.equal(await a.simulateClose("sUSDe/USDC", ctx()), true);
@@ -706,4 +766,150 @@ test("lista flavor prices through Moolah.getPrice and enforces minLoan in plans"
   assert.equal(r.ok, true, r.detail);
   assert.deepEqual(fc.simulated.map((s) => s.fn), ["approve", "supplyCollateral"]);
   assert.match(r.detail!, /0 borrow->swap->supply iteration\(s\).*not reached/);
+});
+
+// ---------------------------------------------------------------------------
+// Failure handling (review fixes)
+// ---------------------------------------------------------------------------
+
+const LONG = { maxGasUsd: { default: 5 }, maxSlippageBps: 15, maxLoopIterations: 10 };
+
+test("open(): a swap failing after a borrow repays that borrow from the wallet", async () => {
+  for (const mode of ["swap not ok", "quote throws"] as const) {
+    const fc = new FakeChain();
+    const sw = fc.swapper();
+    const a = adapter(fc, { swapper: sw });
+    // quote #1 = planning (before any tx), #2 = iteration 1, #3 = iteration 2
+    if (mode === "swap not ok") sw.failSwap = (n) => n === 2;
+    else sw.failQuote = (n) => n === 3;
+    const r = await a.open("sUSDe/USDC", 1000n * E18, 0.8, ctx({ dryRun: false }));
+    assert.equal(r.ok, false, mode);
+    assert.match(r.detail!, /iteration 2 failed after borrowing \d+ USDC: .*rolled back: repaid \d+ USDC from the wallet/, r.detail);
+    assert.equal(fc.sent.filter((s) => s.fn === "borrow").length, 2);
+    assert.equal(fc.sent.at(-1)!.fn, "repay", "the last tx is the rollback repay");
+    // back to the state after iteration 1: debt = the first borrow (960), borrowed USDC no longer in the wallet
+    const debt = SharesMath.toAssets(fc.s.pos.borrowShares, fc.s.market.totalBorrowAssets, fc.s.market.totalBorrowShares, "Up");
+    assert.ok(debt >= 960n * E6 && debt <= 960n * E6 + 1n, `debt ${debt}`);
+    assert.ok(fc.bal(LOAN, ACCOUNT) < 10n, `wallet USDC ${fc.bal(LOAN, ACCOUNT)}`);
+    assert.ok(fc.ltv() < 0.8 && Math.max(...fc.postBorrowLtv) <= 0.8 + 1e-6);
+  }
+});
+
+test("unwind: any failure after a withdraw re-supplies the collateral", async () => {
+  for (const mode of ["swap not ok", "quote throws"] as const) {
+    const fc = new FakeChain();
+    const sw = fc.swapper();
+    const a = adapter(fc, { swapper: sw });
+    await a.open("sUSDe/USDC", 1000n * E18, 0.8, ctx({ dryRun: false }));
+    const before = fc.clone();
+    const sentBefore = fc.sent.length;
+    if (mode === "swap not ok") sw.failSwap = () => true;
+    else {
+      const q0 = sw.quotes.length;
+      sw.failQuote = (n) => n > q0 + 1; // the planning quote works, the step-1 quote (after the withdraw) fails
+    }
+    const r = await a.close("sUSDe/USDC", 1, ctx({ dryRun: false }));
+    assert.equal(r.ok, false, mode);
+    assert.match(r.detail!, /step 1 failed after withdrawing \d+ sUSDe: .*rolled back: re-supplied \d+ sUSDe/, r.detail);
+    assert.deepEqual(fc.sent.slice(sentBefore).map((s) => s.fn), ["withdrawCollateral", "approve", "supplyCollateral"]);
+    assert.deepEqual(fc.s.pos, before.pos, "position restored exactly");
+    assert.equal(fc.bal(COLL, ACCOUNT), before.balances.get(k(COLL, ACCOUNT)) ?? 0n);
+  }
+});
+
+test("unwind repays from loan tokens already in the wallet before withdrawing", async () => {
+  const fc = new FakeChain();
+  const a = adapter(fc);
+  await a.open("sUSDe/USDC", 1000n * E18, 0.8, ctx({ dryRun: false }));
+  fc.s.balances.set(k(LOAN, ACCOUNT), fc.bal(LOAN, ACCOUNT) + 100n * E6);
+  // dry-run: the wallet repay and the first withdraw are simulated as one sequence
+  fc.simulated = [];
+  const dry = await a.deleverage("sUSDe/USDC", 0.7, ctx());
+  assert.equal(dry.ok, true, dry.detail);
+  assert.deepEqual(fc.simulated.map((s) => s.fn), ["approve", "repay", "withdrawCollateral"]);
+  assert.match(dry.detail!, /repay \d+ USDC from the wallet, then/);
+  const sentBefore = fc.sent.length;
+  const r = await a.deleverage("sUSDe/USDC", 0.7, ctx({ dryRun: false }));
+  assert.equal(r.ok, true, r.detail);
+  const fns = fc.sent.slice(sentBefore);
+  assert.deepEqual(fns.slice(0, 2).map((s) => s.fn), ["approve", "repay"]);
+  assert.ok((fns[1]!.args[1] as bigint) >= 100n * E6, "wallet USDC used first");
+  assert.ok(fc.bal(LOAN, ACCOUNT) < 10_000n);
+  assert.ok(fc.ltv() <= 0.7 + 1e-6);
+});
+
+test("a position above LLTV x stepLtvFactor never withdraws: stuck until loan tokens are in the wallet", async () => {
+  const fc = new FakeChain();
+  const a = adapter(fc);
+  fc.s.pos = { supplyShares: 0n, borrowShares: 1080n * E6 * 1_000_000n, collateral: 1000n * E18 }; // LTV 0.90 > cap 0.869, < LLTV 0.915
+  assert.ok(fc.ltv() > 0.915 * 0.95 && fc.ltv() < 0.915);
+
+  const dry = await a.deleverage("sUSDe/USDC", 0.6, ctx());
+  assert.equal(dry.ok, false);
+  assert.match(dry.detail!, /stuck: LTV 90\.\d+% is at\/above the step cap 86\.9\d%.*needs USDC in the wallet/);
+  assert.equal(await a.simulateClose("sUSDe/USDC", ctx()), false);
+  const live = await a.close("sUSDe/USDC", 1, ctx({ dryRun: false }));
+  assert.equal(live.ok, false);
+  assert.match(live.detail!, /stuck/);
+  assert.equal(fc.sent.length, 0, "nothing withdrawn");
+
+  // 100 USDC in the wallet brings LTV to 0.817 < cap: repay first, then unwind normally
+  fc.s.balances.set(k(LOAN, ACCOUNT), 100n * E6);
+  assert.equal(await a.simulateClose("sUSDe/USDC", ctx({ limits: LONG })), true);
+  const ok = await a.deleverage("sUSDe/USDC", 0.6, ctx({ dryRun: false }));
+  assert.equal(ok.ok, true, ok.detail);
+  assert.deepEqual(fc.sent.slice(0, 2).map((s) => s.fn), ["approve", "repay"]);
+  assert.ok(fc.ltv() <= 0.6 + 1e-6);
+});
+
+test("exit budget: entries stop at maxSwapCostBps, exits run up to maxExitSwapCostBps", async () => {
+  const fc = new FakeChain();
+  const sw = fc.swapper();
+  const a = adapter(fc, { swapper: sw });
+  await a.open("sUSDe/USDC", 500n * E18, 0.7, ctx({ dryRun: false }));
+  sw.costBps = () => 100; // depeg: 1% to sell
+  const more = await a.open("sUSDe/USDC", 100n * E18, 0.7, ctx({ dryRun: false }));
+  assert.equal(more.ok, false);
+  assert.match(more.detail!, /costs 100bps > max 30bps/);
+  assert.equal(await a.simulateClose("sUSDe/USDC", ctx()), true);
+  const c = await a.close("sUSDe/USDC", 1, ctx({ dryRun: false }));
+  assert.equal(c.ok, true, c.detail);
+  assert.equal(fc.s.pos.borrowShares, 0n);
+  sw.costBps = () => 250;
+  const fc2 = new FakeChain();
+  const sw2 = fc2.swapper();
+  const a2 = adapter(fc2, { swapper: sw2 });
+  await a2.open("sUSDe/USDC", 500n * E18, 0.7, ctx({ dryRun: false }));
+  sw2.costBps = () => 250;
+  const blocked = await a2.close("sUSDe/USDC", 1, ctx({ dryRun: false }));
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.detail!, /exit swap .* costs 250bps > max 200bps/);
+  assert.equal(fc2.sent.at(-1)!.fn, "supplyCollateral", "nothing was withdrawn by the refused close");
+});
+
+test("markets(): a failed swap probe reports depth NaN (unknown) and is not cached", async () => {
+  const fc = new FakeChain();
+  const sw = fc.swapper();
+  const a = adapter(fc, { swapper: sw });
+  sw.failQuote = () => true;
+  const [p] = await a.markets();
+  assert.ok(Number.isNaN(p!.swapDepthUsd));
+  assert.ok(Number.isFinite(p!.swapCostFrac) && Math.abs(p!.swapCostFrac - 0.003) < 1e-12, "cost falls back to the entry budget");
+  sw.failQuote = undefined;
+  const [q] = await a.markets();
+  assert.equal(q!.swapDepthUsd, 100_000, "re-probed after the failure");
+  // a later failure reuses the last known cost
+  sw.failQuote = (n, from) => from === "USDC";
+  const b = adapter(fc, { swapper: sw, swapProbeTtlMs: 0 });
+  await b.markets().then(() => undefined);
+  sw.failQuote = undefined;
+  const [ok] = await b.markets();
+  assert.equal(ok!.swapDepthUsd, 100_000);
+  sw.failQuote = () => true;
+  const [bad] = await b.markets();
+  assert.ok(Number.isNaN(bad!.swapDepthUsd));
+  assert.ok(Math.abs(bad!.swapCostFrac - ok!.swapCostFrac) < 1e-12);
+  // no swapper at all = genuinely no depth (0), not unknown
+  const [none] = await adapter(fc, { swapper: undefined }).markets();
+  assert.equal(none!.swapDepthUsd, 0);
 });

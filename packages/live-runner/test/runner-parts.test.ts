@@ -122,27 +122,23 @@ describe("PairRegistry", () => {
 });
 
 describe("BucketReader", () => {
-  it("keeps the last value briefly on a failed read, then throws", async () => {
-    let now = 0;
-    let fail = false;
+  it("omits buckets whose read failed (router keeps its value); throws only when every read fails", async () => {
+    let fail = new Set<string>();
     const r = new BucketReader({
       assets: [USDT0, USDE, USDT0],
       balance: async (a) => {
-        if (fail && a.symbol === "USDe") throw new Error("rpc down");
+        if (fail.has(a.symbol)) throw new Error("rpc down");
         return a.symbol === "USDe" ? 3n * 10n ** 18n : 2_000_000n;
       },
       priceUsd: async () => 1,
       log: () => {},
-      maxStaleMs: 60_000,
-      now: () => now,
     });
     assert.deepEqual(r.keys(), ["plasma:USDT0", "plasma:USDe"]);
     assert.deepEqual(await r.read(), { "plasma:USDT0": 2, "plasma:USDe": 3 });
-    fail = true;
-    now = 30_000;
-    assert.deepEqual(await r.read(), { "plasma:USDT0": 2, "plasma:USDe": 3 });
-    now = 120_000;
-    await assert.rejects(r.read(), /no recent value/);
+    fail = new Set(["USDe"]);
+    assert.deepEqual(await r.read(), { "plasma:USDT0": 2 }, "no stale substitution");
+    fail = new Set(["USDe", "USDT0"]);
+    await assert.rejects(r.read(), /every wallet balance read failed/);
   });
   it("rejects one symbol configured with two addresses", () => {
     assert.throws(() => new BucketReader({ assets: [USDT0, A("plasma", "USDT0", "0x99")], balance: async () => 0n, priceUsd: async () => 1, log: () => {} }), /two addresses/);
@@ -217,5 +213,57 @@ describe("PairRegistry depeg reference", () => {
     assert.ok((await run()) > 0.1, "1:1 reference: sUSDe looks depegged (would force exit)");
     const d = await run("oracle");
     assert.ok(Math.abs(d - (1.17 / 1.168 - 1)) < 1e-9, `market vs oracle ratio, got ${d}`);
+  });
+});
+
+describe("runner safety: lock, mode marker, gate, stablecoin scope", async () => {
+  const { takeLock, checkModeMarker } = await import("../src/cli-lib.js");
+  it("lock: second holder refused while the first is alive; stale lock taken over", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lock-"));
+    const release = takeLock(dir);
+    assert.throws(() => takeLock(dir), /another runner/);
+    release();
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(join(dir, "runner.lock"), "999999"); // dead pid
+    const r2 = takeLock(dir);
+    r2();
+  });
+  it("mode marker: a shadow state dir cannot be reused for live", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mode-"));
+    checkModeMarker(dir, "shadow");
+    checkModeMarker(dir, "shadow");
+    assert.throws(() => checkModeMarker(dir, "live"), /separate state_dir/);
+  });
+  it("canary executor refuses entries while the live gate is closed, exits still run", async () => {
+    let reason: string | null = "live gate closed: stamp 8 days old";
+    let exits = 0;
+    const inner = {
+      enter: async () => ({ ok: true }),
+      exit: async () => (exits++, { ok: true }),
+      rebalance: async () => ({ ok: true }),
+      simulateExit: async () => true,
+      claim: async () => ({ ok: true }),
+      sell: async () => ({ ok: true }),
+      hedge: async () => ({ ok: false }),
+    };
+    const ex = new CanaryExecutor(inner, { max_position_usd: 1e6, max_total_deployed_usd: 1e7 }, () => [], () => reason);
+    assert.match((await ex.enter({ id: "a" } as never, 100)).detail!, /gate closed/);
+    await ex.exit({ oppId: "a", equityUsd: 1 } as never, 1);
+    assert.equal(exits, 1);
+    reason = null;
+    assert.equal((await ex.enter({ id: "a" } as never, 100)).ok, true);
+  });
+  it("live config refuses non-stable loop assets unless explicitly allowed", async () => {
+    const { validateLiveConfig } = await import("../src/liveConfig.js");
+    const base = {
+      mode: "shadow",
+      chains: { arbitrum: { rpc: "x" } },
+      assets: { arbitrum: { WETH: { address: "0x1", decimals: 18 }, USDC: { address: "0x2", decimals: 6 } } },
+      lending: [{ type: "aave-v3", chain: "arbitrum", market: "AaveV3Arbitrum", pairs: [{ pairId: "w", collateral: "WETH", debt: "WETH" }] }],
+      canary: { max_position_usd: 1, max_total_deployed_usd: 1 },
+      limits: { max_slippage_bps: 10, max_gas_usd: {}, max_loop_iterations: 8 },
+    } as never;
+    assert.ok(validateLiveConfig(base).some((x) => x.includes("not a stablecoin")));
+    assert.ok(!validateLiveConfig({ ...(base as object), allow_non_stable: true } as never).some((x) => x.includes("not a stablecoin")));
   });
 });

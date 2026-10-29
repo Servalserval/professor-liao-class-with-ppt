@@ -4,7 +4,9 @@
  * send(t):  hop = t.path[t.hop]; amount = t.receivedUsd ?? t.amountUsd; kind -> adapter;
  *           (chain, symbol) -> AssetRef via the registry; USD -> units with ctx.priceUsd,
  *           clamped to the wallet balance (hop > 0 always; hop 0 only within 0.5%);
- *           recipient = our own address on the destination; returns the adapter handle as `ref`.
+ *           recipient = our own address on the destination; quotes the hop and refuses (nothing
+ *           sent) when the live fee+gas exceeds max(1.25 x planned, planned + $0.50), planned =
+ *           routeCostUsd(hop, amount); returns the adapter handle as `ref`.
  *           ok:false only when nothing left the wallet (adapters guarantee ok:true + handle
  *           once anything was broadcast).
  * poll(t):  adapter.status(t.ref):
@@ -15,7 +17,7 @@
  *             failed    -> failed (+ refundedUsd when the adapter proved nothing left)
  *                          "recoverable: ..." details -> stuck (retryable, funds not lost)
  */
-import type { BridgeExecutor, BridgePollResult, InFlightTransfer, RouteKind, RouteSpec } from "@incentive-router/core";
+import { routeCostUsd, type BridgeExecutor, type BridgePollResult, type InFlightTransfer, type RouteKind, type RouteSpec } from "@incentive-router/core";
 import type { AssetRef, BridgeAdapter, LiveContext } from "@incentive-router/live-common";
 import { unitsToUsd, usdToUnits } from "@incentive-router/live-common";
 import { errMsg, RECOVERABLE, type LiveBridgeStatus } from "../common.js";
@@ -37,6 +39,9 @@ export interface LiveBridgeExecutorOptions {
   balance?: (asset: AssetRef) => Promise<bigint>;
   /** Hop 0: clamp to the balance when it is at most this far below the request (default 50 bps = 0.5%). */
   hop0ClampBps?: number;
+  /** Live-cost guard: refuse when quoted cost > max(costRatio x planned, planned + costSlackUsd). Defaults 1.25 / 0.5. */
+  costRatio?: number;
+  costSlackUsd?: number;
   now?: () => number;
 }
 
@@ -119,7 +124,20 @@ export class LiveBridgeExecutor implements BridgeExecutor {
       return { ok: false, detail: `${adapter.kind} pre-send: ${errMsg(e)}` };
     }
     const sentUsd = unitsToUsd(units, price, from.decimals);
-    const what = `sent ${sentUsd.toFixed(6)} USD (${units} units ${from.symbol} ${from.chain} -> ${to.chain})${note ? `; ${note}` : ""}`;
+
+    // Live cost guard (the one-day friction rule was checked against the planned RouteSpec costs).
+    let costNote: string;
+    try {
+      const q = await adapter.quote(from, to, units, ctx);
+      const quoted = q.feeUsd + q.gasSrcUsd + q.gasDstUsd;
+      const planned = routeCostUsd(hop, sentUsd);
+      const limit = Math.max((this.o.costRatio ?? 1.25) * planned, planned + (this.o.costSlackUsd ?? 0.5));
+      costNote = `quoted cost $${quoted.toFixed(4)} (fee ${q.feeUsd.toFixed(4)} + gas ${q.gasSrcUsd.toFixed(4)}/${q.gasDstUsd.toFixed(4)}) vs planned $${planned.toFixed(4)}, limit $${limit.toFixed(4)}`;
+      if (!(quoted <= limit)) return { ok: false, detail: `refused, nothing sent: ${costNote}` };
+    } catch (e) {
+      return { ok: false, detail: `${adapter.kind} quote failed, nothing sent: ${errMsg(e)}` };
+    }
+    const what = `sent ${sentUsd.toFixed(6)} USD (${units} units ${from.symbol} ${from.chain} -> ${to.chain})${note ? `; ${note}` : ""}; ${costNote}`;
 
     let res;
     try {
@@ -151,46 +169,49 @@ export class LiveBridgeExecutor implements BridgeExecutor {
     const { adapter, from, to } = r;
     const { ctx } = this.o;
 
+    let ref = t.ref;
     let st: LiveBridgeStatus;
     try {
-      st = (await adapter.status(t.ref, ctx)) as LiveBridgeStatus;
+      st = (await adapter.status(ref, ctx)) as LiveBridgeStatus;
     } catch (e) {
-      return this.pendingResult(t, hop, `status error: ${errMsg(e)}`);
+      return this.pendingResult(t, hop, ref, `status error: ${errMsg(e)}`);
     }
+    if (st.handle) ref = st.handle; // adapter advanced its handle (cursor / recovered ids): router persists poll refs
 
     if (st.state === "claimable") {
-      if (!adapter.complete) return { state: "claimable", ref: t.ref, detail: st.detail };
+      if (!adapter.complete) return { state: "claimable", ref, detail: st.detail };
       let res;
       try {
-        res = await adapter.complete(t.ref, ctx);
+        res = await adapter.complete(ref, ctx);
       } catch (e) {
-        return { state: "claimable", ref: t.ref, detail: `complete error: ${errMsg(e)}` };
+        return { state: "claimable", ref, detail: `complete error: ${errMsg(e)}` };
       }
-      if (!res.ok) return { state: "claimable", ref: t.ref, detail: res.detail ?? "complete failed" };
-      if (ctx.dryRun) return { state: "claimable", ref: t.ref, detail: `dry-run: ${res.detail ?? "complete simulated"}` };
+      if (!res.ok) return { state: "claimable", ref, detail: res.detail ?? "complete failed" };
+      if (ctx.dryRun) return { state: "claimable", ref, detail: `dry-run: ${res.detail ?? "complete simulated"}` };
       try {
-        st = (await adapter.status(t.ref, ctx)) as LiveBridgeStatus;
+        st = (await adapter.status(ref, ctx)) as LiveBridgeStatus;
       } catch (e) {
-        return { state: "in_flight", ref: t.ref, detail: `completed on destination; status re-check failed: ${errMsg(e)}` };
+        return { state: "in_flight", ref, detail: `completed on destination; status re-check failed: ${errMsg(e)}` };
       }
+      if (st.handle) ref = st.handle;
       if (st.state !== "completed") {
         const dst = res.txs.map((x) => x.id).filter(Boolean).join(",");
-        return { state: "in_flight", ref: t.ref, detail: `destination tx ${dst || "sent"}; waiting for confirmation` };
+        return { state: "in_flight", ref, detail: `destination tx ${dst || "sent"}; waiting for confirmation` };
       }
     }
-    return this.mapFinal(st, t, hop, from, to);
+    return this.mapFinal(st, t, hop, from, to, ref);
   }
 
   /** pending: in_flight, or stuck when progress could not be confirmed for > 2x the route ETA. */
-  private pendingResult(t: InFlightTransfer, hop: RouteSpec, unconfirmed?: string): BridgePollResult {
-    if (!unconfirmed) return { state: "in_flight", ref: t.ref };
+  private pendingResult(t: InFlightTransfer, hop: RouteSpec, ref: string | undefined, unconfirmed?: string): BridgePollResult {
+    if (!unconfirmed) return { state: "in_flight", ref };
     const started = t.hopStartedAtMs ?? (t.hop === 0 ? t.createdAtMs : undefined);
     const limitMs = 2 * Math.max(1, hop.etaMinutes) * 60_000;
     if (started !== undefined && this.now() - started > limitMs) {
       const mins = Math.round((this.now() - started) / 60_000);
-      return { state: "stuck", ref: t.ref, detail: `${RECOVERABLE} no confirmed progress for ${mins} min (> 2x ETA ${hop.etaMinutes} min): ${unconfirmed}` };
+      return { state: "stuck", ref, detail: `${RECOVERABLE} no confirmed progress for ${mins} min (> 2x ETA ${hop.etaMinutes} min): ${unconfirmed}` };
     }
-    return { state: "in_flight", ref: t.ref, detail: unconfirmed };
+    return { state: "in_flight", ref, detail: unconfirmed };
   }
 
   private async usd(units: bigint, asset: AssetRef): Promise<number | undefined> {
@@ -201,20 +222,20 @@ export class LiveBridgeExecutor implements BridgeExecutor {
     }
   }
 
-  private async mapFinal(st: LiveBridgeStatus, t: InFlightTransfer, hop: RouteSpec, from: AssetRef, to: AssetRef): Promise<BridgePollResult> {
+  private async mapFinal(st: LiveBridgeStatus, t: InFlightTransfer, hop: RouteSpec, from: AssetRef, to: AssetRef, ref: string | undefined): Promise<BridgePollResult> {
     switch (st.state) {
       case "pending":
-        return this.pendingResult(t, hop, st.unconfirmed);
+        return this.pendingResult(t, hop, ref, st.unconfirmed);
       case "claimable":
-        return { state: "claimable", ref: t.ref, detail: st.detail };
+        return { state: "claimable", ref, detail: st.detail };
       case "completed": {
         const receivedUsd = st.received !== undefined ? await this.usd(st.received, to) : undefined;
-        return { state: "completed", ref: t.ref, receivedUsd, detail: st.dstTx ? `dst tx ${st.dstTx}` : undefined };
+        return { state: "completed", ref, receivedUsd, detail: st.dstTx ? `dst tx ${st.dstTx}` : undefined };
       }
       case "failed": {
         const refundedUsd = st.refunded !== undefined ? await this.usd(st.refunded, from) : undefined;
         const state = st.detail.startsWith(RECOVERABLE) ? "stuck" : "failed";
-        return refundedUsd !== undefined ? { state, ref: t.ref, detail: st.detail, refundedUsd } : { state, ref: t.ref, detail: st.detail };
+        return refundedUsd !== undefined ? { state, ref, detail: st.detail, refundedUsd } : { state, ref, detail: st.detail };
       }
     }
   }

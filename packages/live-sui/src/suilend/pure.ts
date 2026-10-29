@@ -331,6 +331,22 @@ function legOf(asset: AssetRef, s: ReserveSnapshot, supplyRewards: RewardRate[],
   };
 }
 
+/**
+ * swapDepthUsd for a two-asset pair.
+ *  - depth unknown (probe failed / no swapper) => NaN ("missing data": the core
+ *    keeps the last known value instead of reading 0 = no exit capacity, which
+ *    would force an urgent exit). The outflow limit still reaches the core via
+ *    borrowCapRemainingUsd.
+ *  - depth known (probes succeeded, 0 = nothing within budget) => capped by the
+ *    lending market's remaining outflow (it gates the collateral withdrawals
+ *    of an unwind; the core derives exit capacity from swapDepthUsd).
+ */
+export function pairSwapDepthUsd(depthUsd: number, rateLimiterRemainingUsd: number): number {
+  if (Number.isNaN(depthUsd)) return NaN;
+  const depth = Math.max(0, depthUsd);
+  return rateLimiterRemainingUsd >= 0 ? Math.min(depth, rateLimiterRemainingUsd) : depth;
+}
+
 export function buildLoopPair(a: BuildPairArgs): LoopPair {
   const same = a.coll.coinType === a.debt.coinType;
   const drop = a.ineligibleReason !== null && !a.assumeEligible;
@@ -347,10 +363,7 @@ export function buildLoopPair(a: BuildPairArgs): LoopPair {
     maxLtv,
     liqLtv,
     swapCostFrac: same ? 0 : a.swapCostFrac,
-    // The outflow rate limiter also gates the collateral withdrawals of an
-    // unwind; for pairs it is folded in here (the core computes exit capacity
-    // from swapDepthUsd). Same-asset keeps the contract's Infinity.
-    swapDepthUsd: same ? Infinity : Math.max(0, Math.min(a.swapDepthUsd, a.rateLimiterRemainingUsd)),
+    swapDepthUsd: same ? Infinity : pairSwapDepthUsd(a.swapDepthUsd, a.rateLimiterRemainingUsd),
     dataAsOfMs: a.dataAsOfMs,
   };
   if (a.myLtv !== undefined) p.myLtv = a.myLtv;
@@ -696,15 +709,17 @@ export async function probeSwap(
   let usd = opts.probeUsd;
   let costAtProbe: number | undefined;
   let depth = 0;
-  while (usd <= opts.maxUsd * (1 + 1e-9)) {
+  // always quote the probe size at least once, then grow up to maxUsd
+  for (;;) {
     const amountIn = toUnits(usd / fromPriceUsd, from.decimals);
     const q = await swapper.quote(from.address, to.address, amountIn);
     if (costAtProbe === undefined) costAtProbe = q.costBps;
     if (!(q.costBps <= opts.budgetBps) || q.amountOut <= 0n) break;
     depth = usd;
     usd *= factor;
+    if (usd > opts.maxUsd * (1 + 1e-9)) break;
   }
-  return { costBpsAtProbe: costAtProbe ?? Infinity, depthUsd: depth };
+  return { costBpsAtProbe: costAtProbe!, depthUsd: depth };
 }
 
 /** cTokens to withdraw so that redeeming yields at least `tokensBase` (ratio only grows with interest). */

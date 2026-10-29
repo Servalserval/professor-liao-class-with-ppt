@@ -152,6 +152,33 @@ export async function suiNonceUsed(env: SuiEnv, cfg: SuiCctpConfig, nonce: Hex):
   return rv[0] === 1;
 }
 
+/**
+ * After executePtb built the tx: the gas coin (or first owned input) it consumes,
+ * as replay guard. undefined when the tx uses only address balances / shared objects.
+ */
+export function suiOwnedRef(tx: Transaction): { objectId: string; version: bigint } | undefined {
+  try {
+    const d = tx.getData();
+    const pay = d.gasData.payment?.[0];
+    if (pay) return { objectId: normalizeSuiAddress(pay.objectId), version: BigInt(pay.version) };
+    for (const i of d.inputs) {
+      const o = (i as { Object?: { ImmOrOwnedObject?: { objectId: string; version: string | number } } }).Object?.ImmOrOwnedObject;
+      if (o) return { objectId: normalizeSuiAddress(o.objectId), version: BigInt(o.version) };
+    }
+  } catch {
+    /* not built */
+  }
+  return undefined;
+}
+
+/** true when `objectId` now has a version newer than `version` (an input the tx needed was consumed elsewhere). */
+export async function suiObjectAdvanced(env: SuiEnv, objectId: string, version: bigint): Promise<boolean> {
+  const r = await env.grpc.core.getObjects({ objectIds: [objectId] });
+  const o = r.objects[0];
+  if (!o || o instanceof Error) return false; // deleted / unreadable: do not guess
+  return BigInt(o.version) > version;
+}
+
 /** Existence + type checks for every configured Sui CCTP object, and the USDC type against Circle's treasury. */
 export async function verifySuiCctp(env: SuiEnv, cfg: SuiCctpConfig, usdcType: string): Promise<string[]> {
   const issues: string[] = [];

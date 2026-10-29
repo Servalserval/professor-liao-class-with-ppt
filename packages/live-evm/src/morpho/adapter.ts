@@ -120,8 +120,12 @@ export interface MorphoBlueAdapterOptions {
   maxLtvFactor?: number;
   /** Max LTV at any intermediate loop / unwind step = LLTV * this (default 0.95, must be >= maxLtvFactor). */
   stepLtvFactor?: number;
-  /** Refuse a swap step whose quoted cost exceeds this; also the depth budget of the probe (default 30 bps). */
+  /** ENTRY budget: refuse an open-side swap whose quoted cost exceeds this; also the depth budget of the probe (default 30 bps). */
   maxSwapCostBps?: number;
+  /** EXIT budget used by close / deleverage / simulateClose, so a depegged position can still be unwound (default 200 bps). */
+  maxExitSwapCostBps?: number;
+  /** open(): stop iterating once LTV >= target - this (default 0.005). Borrows never push LTV above the target. */
+  ltvTolerance?: number;
   /** USD sizes probed (collateral -> loan) to measure swap depth. Default [1e3, 1e4, 1e5, 1e6]. */
   swapProbeUsd?: number[];
   /** Cache of swap probes (default 10 min). */
@@ -183,6 +187,8 @@ export class MorphoBlueAdapter implements LendingAdapter {
   private readonly maxLtvFactor: number;
   private readonly stepLtvFactor: number;
   private readonly maxSwapCostBps: number;
+  private readonly maxExitSwapCostBps: number;
+  private readonly ltvTolerance: number;
   private readonly swapProbeUsd: number[];
   private readonly swapProbeTtlMs: number;
   private readonly quoteCtx: LiveContext;
@@ -211,6 +217,9 @@ export class MorphoBlueAdapter implements LendingAdapter {
     if (!(this.maxLtvFactor > 0 && this.maxLtvFactor <= this.stepLtvFactor && this.stepLtvFactor < 1))
       throw new Error(`${this.id}: need 0 < maxLtvFactor (${this.maxLtvFactor}) <= stepLtvFactor (${this.stepLtvFactor}) < 1`);
     this.maxSwapCostBps = o.maxSwapCostBps ?? 30;
+    this.maxExitSwapCostBps = o.maxExitSwapCostBps ?? 200;
+    this.ltvTolerance = o.ltvTolerance ?? 0.005;
+    if (!(this.ltvTolerance >= 0 && this.ltvTolerance < 0.1)) throw new Error(`${this.id}: ltvTolerance ${this.ltvTolerance} not in [0, 0.1)`);
     this.swapProbeUsd = [...(o.swapProbeUsd ?? [1_000, 10_000, 100_000, 1_000_000])].sort((a, b) => a - b);
     this.swapProbeTtlMs = o.swapProbeTtlMs ?? 10 * 60_000;
     this.minStepUsd = o.minStepUsd ?? 1;
@@ -429,6 +438,12 @@ export class MorphoBlueAdapter implements LendingAdapter {
    * two directions at the smallest probe; depth = largest probe size of the
    * EXIT direction (collateral -> loan) within maxSwapCostBps. No swapper and
    * no override -> depth 0 (the core then sees no exit capacity).
+   *
+   * Core convention: depth NaN = UNKNOWN (the core keeps its last known
+   * value). A probe whose FIRST quote in either direction throws (API down,
+   * no route answer) reports NaN and is not cached; cost then stays finite
+   * (last known, else the entry budget). A larger exit probe throwing after
+   * smaller ones succeeded keeps the depth found so far (a known lower bound).
    */
   private async swapStats(pc: MorphoPairConfig, pColl: number, pDebt: number): Promise<{ costFrac: number; depthUsd: number }> {
     if (pc.swapCostFrac !== undefined && pc.swapDepthUsd !== undefined) return { costFrac: pc.swapCostFrac, depthUsd: pc.swapDepthUsd };
@@ -436,32 +451,40 @@ export class MorphoBlueAdapter implements LendingAdapter {
     if (hit && Date.now() - hit.atMs < this.swapProbeTtlMs) return { costFrac: pc.swapCostFrac ?? hit.costFrac, depthUsd: pc.swapDepthUsd ?? hit.depthUsd };
     let costFrac = 0;
     let depthUsd = 0;
-    if (this.swapper && this.swapProbeUsd.length && pColl > 0 && pDebt > 0) {
-      const ctx = this.quoteCtx;
-      let costIn = Number.NaN;
-      try {
-        const q = await this.swapper.quote(pc.debt, pc.collateral, usdToUnits(this.swapProbeUsd[0]!, pDebt, pc.debt.decimals), ctx);
-        costIn = q.costBps;
-      } catch (e) {
-        this.log("warn", `${this.id}: entry swap quote ${pc.debt.symbol}->${pc.collateral.symbol} failed: ${msg(e)}`);
-      }
-      let costOut = Number.NaN;
-      for (const usd of this.swapProbeUsd) {
-        let q: SwapQuote;
+    if (this.swapper && this.swapProbeUsd.length) {
+      if (!(pColl > 0 && pDebt > 0)) {
+        depthUsd = Number.NaN; // cannot size the probes: unknown, not "no depth"
+        costFrac = hit?.costFrac ?? this.maxSwapCostBps / 1e4;
+      } else {
+        const ctx = this.quoteCtx;
+        let costIn = Number.NaN;
         try {
-          q = await this.swapper.quote(pc.collateral, pc.debt, usdToUnits(usd, pColl, pc.collateral.decimals), ctx);
+          const q = await this.swapper.quote(pc.debt, pc.collateral, usdToUnits(this.swapProbeUsd[0]!, pDebt, pc.debt.decimals), ctx);
+          costIn = q.costBps;
         } catch (e) {
-          this.log("warn", `${this.id}: exit swap quote ${pc.collateral.symbol}->${pc.debt.symbol} $${usd} failed: ${msg(e)}`);
-          break;
+          this.log("warn", `${this.id}: entry swap quote ${pc.debt.symbol}->${pc.collateral.symbol} failed: ${msg(e)}`);
         }
-        if (Number.isNaN(costOut)) costOut = q.costBps;
-        if (!(q.costBps <= this.maxSwapCostBps)) break;
-        depthUsd = usd;
+        let costOut = Number.NaN;
+        for (const usd of this.swapProbeUsd) {
+          let q: SwapQuote;
+          try {
+            q = await this.swapper.quote(pc.collateral, pc.debt, usdToUnits(usd, pColl, pc.collateral.decimals), ctx);
+          } catch (e) {
+            this.log("warn", `${this.id}: exit swap quote ${pc.collateral.symbol}->${pc.debt.symbol} $${usd} failed: ${msg(e)}`);
+            break;
+          }
+          if (Number.isNaN(costOut)) costOut = q.costBps;
+          if (!(q.costBps <= this.maxSwapCostBps)) break;
+          depthUsd = usd;
+        }
+        if (Number.isNaN(costIn) || Number.isNaN(costOut)) {
+          depthUsd = Number.NaN;
+          costFrac = hit?.costFrac ?? this.maxSwapCostBps / 1e4;
+        } else {
+          costFrac = Math.max(0, costIn, costOut) / 1e4;
+          this.swapCache.set(pc.pairId, { atMs: Date.now(), costFrac, depthUsd });
+        }
       }
-      if (Number.isNaN(costIn) || Number.isNaN(costOut)) depthUsd = 0; // no route one way = no loop
-      const worst = Math.max(Number.isNaN(costIn) ? 0 : costIn, Number.isNaN(costOut) ? 0 : costOut);
-      costFrac = Math.max(0, worst) / 1e4;
-      this.swapCache.set(pc.pairId, { atMs: Date.now(), costFrac, depthUsd });
     }
     return { costFrac: pc.swapCostFrac ?? costFrac, depthUsd: pc.swapDepthUsd ?? depthUsd };
   }
@@ -637,35 +660,89 @@ export class MorphoBlueAdapter implements LendingAdapter {
     }
   }
 
-  private planParams(st: PairState, ctx: LiveContext, swapCostFrac: number, maxIterations: number, dust: bigint, unwind = false): PlanParams {
-    const lltv = fromWad(st.params.lltv);
-    let stepLtvCap = lltv * this.stepLtvFactor;
-    // A position already above the normal step cap could never withdraw;
-    // unwinds may then step up to 99% of LLTV (logged by the caller).
-    if (unwind && oracleLtv(st.collateral, st.debt, st.price) >= stepLtvCap) stepLtvCap = lltv * 0.99;
+  /** Intermediate LTV cap: LLTV * stepLtvFactor, never raised (also not for a position already above it). */
+  private stepCap(st: PairState): number {
+    return fromWad(st.params.lltv) * this.stepLtvFactor;
+  }
+
+  private planParams(st: PairState, ctx: LiveContext, swapCostFrac: number, maxIterations: number, dust: bigint): PlanParams {
     return {
       price: st.price,
-      stepLtvCap,
+      stepLtvCap: this.stepCap(st),
       swapCostFrac,
       maxIterations,
       minDebt: st.minDebt,
       dust,
       borrowLiquidity: st.liquidity,
       sellBufferBps: Math.max(this.closeBufferBps, ctx.limits.maxSlippageBps + 5),
+      ltvTolerance: this.ltvTolerance,
     };
   }
 
-  /** Quote, check cost, swap, and return what actually arrived (wallet delta). */
-  private async swapMeasured(from: AssetRef, to: AssetRef, amountIn: bigint, ctx: LiveContext, txs: TxRecord[]): Promise<{ received: bigint; costBps: number }> {
+  /** Quote, check cost against `maxCostBps`, swap, and return what actually arrived (wallet delta). */
+  private async swapMeasured(from: AssetRef, to: AssetRef, amountIn: bigint, ctx: LiveContext, txs: TxRecord[], maxCostBps: number): Promise<{ received: bigint; costBps: number }> {
     if (!this.swapper) throw new Error("no swapper configured");
     const q = await this.swapper.quote(from, to, amountIn, ctx);
-    if (!(q.costBps <= this.maxSwapCostBps)) throw new Error(`swap ${from.symbol}->${to.symbol} via ${q.route} costs ${q.costBps}bps > max ${this.maxSwapCostBps}bps`);
+    if (!(q.costBps <= maxCostBps)) throw new Error(`swap ${from.symbol}->${to.symbol} via ${q.route} costs ${q.costBps}bps > max ${maxCostBps}bps`);
     const before = await this.walletBalance(to);
     const r = await this.swapper.swap(q, from, to, ctx);
     txs.push(...r.txs);
     if (!r.ok) throw new Error(`swap ${from.symbol}->${to.symbol} failed: ${r.detail ?? "?"}`);
     const after = await this.walletBalance(to);
     return { received: after > before ? after - before : 0n, costBps: q.costBps };
+  }
+
+  /**
+   * Repay up to `want` (bounded by the debt and by `available` loan tokens).
+   * Repays by shares when `available` covers the whole debt + 1 bp accrual
+   * buffer and the caller wants it all; never leaves a non-zero debt under
+   * the fork's minimum loan. Returns the assets repaid (0 = nothing sent).
+   */
+  private async repayUpTo(pc: MorphoPairConfig, cur: PairState, available: bigint, want: bigint | "all", dust: bigint, ctx: LiveContext, txs: TxRecord[]): Promise<bigint> {
+    const rp = this.repayPlan(cur, available, want, dust);
+    if (!rp) return 0n;
+    txs.push(...(await ensureAllowance(this.env, ctx, pc.debt.address as Address, this.morpho, rp.approve)));
+    txs.push(await sendTx(this.env, ctx, this.repayReq(pc, cur.params, rp.assets, rp.shares)));
+    return rp.repaid;
+  }
+
+  /**
+   * Best-effort restore after a failed step, using wallet deltas since the
+   * step began: loan tokens the step left in the wallet repay debt, then
+   * collateral the step took out (and still sits in the wallet) is supplied
+   * back. Never throws; returns a description for the result detail.
+   */
+  private async rollbackStep(pc: MorphoPairConfig, collPre: bigint, loanPre: bigint, ctx: LiveContext, txs: TxRecord[]): Promise<string> {
+    const notes: string[] = [];
+    try {
+      const loanNow = await this.walletBalance(pc.debt);
+      const held = loanNow > loanPre ? loanNow - loanPre : 0n;
+      if (held > 0n) {
+        const r = await this.repayUpTo(pc, await this.state(pc), held, "all", 0n, ctx, txs);
+        notes.push(r > 0n ? `repaid ${r} ${pc.debt.symbol} from the wallet` : `${held} ${pc.debt.symbol} left in the wallet`);
+      }
+    } catch (e) {
+      notes.push(`repay of ${pc.debt.symbol} in the wallet FAILED (${msg(e)})`);
+    }
+    let held = 0n;
+    try {
+      const collNow = await this.walletBalance(pc.collateral);
+      held = collNow > collPre ? collNow - collPre : 0n;
+      if (held > 0n) {
+        txs.push(...(await ensureAllowance(this.env, ctx, pc.collateral.address as Address, this.morpho, held)));
+        txs.push(await sendTx(this.env, ctx, this.supplyCollateralReq(pc, (await this.state(pc)).params, held)));
+        notes.push(`re-supplied ${held} ${pc.collateral.symbol}`);
+      }
+    } catch (e) {
+      notes.push(`re-supply of ${held} ${pc.collateral.symbol} FAILED (${msg(e)}) — it is in the wallet`);
+    }
+    try {
+      const st = await this.state(pc);
+      notes.push(`position LTV now ${pct(oracleLtv(st.collateral, st.debt, st.price))}`);
+    } catch {
+      /* ignore */
+    }
+    return notes.length ? notes.join(", ") : "nothing to roll back";
   }
 
   private broadcastNote(txs: TxRecord[]): string {
@@ -730,15 +807,24 @@ export class MorphoBlueAdapter implements LendingAdapter {
       let iters = 0;
       while (iters < ctx.limits.maxLoopIterations) {
         const cur = await this.state(pc);
+        // planLoopSteps caps every borrow at post-borrow LTV <= targetLtv.
         const next = planLoopSteps(cur.loop, 0n, targetLtv, this.planParams(cur, ctx, cost, 1, dust));
         const b = next.steps.find((s) => s.kind === "borrow");
         if (!b || b.kind !== "borrow") break;
-        txs.push(await sendTx(this.env, ctx, this.borrowReq(pc, cur.params, b.assets)));
-        const sw = await this.swapMeasured(pc.debt, pc.collateral, b.assets, ctx, txs);
-        cost = Math.max(0, sw.costBps) / 1e4;
-        if (sw.received === 0n) throw new Error(`swap returned no ${pc.collateral.symbol}; ${b.assets} ${pc.debt.symbol} left in the wallet`);
-        txs.push(...(await ensureAllowance(this.env, ctx, pc.collateral.address as Address, this.morpho, sw.received)));
-        txs.push(await sendTx(this.env, ctx, this.supplyCollateralReq(pc, cur.params, sw.received)));
+        const collPre = await this.walletBalance(pc.collateral);
+        const loanPre = await this.walletBalance(pc.debt);
+        try {
+          // Inside the rollback scope: an unconfirmed broadcast may still land (rollback works on wallet deltas).
+          txs.push(await sendTx(this.env, ctx, this.borrowReq(pc, cur.params, b.assets)));
+          const sw = await this.swapMeasured(pc.debt, pc.collateral, b.assets, ctx, txs, this.maxSwapCostBps);
+          cost = Math.max(0, sw.costBps) / 1e4;
+          if (sw.received === 0n) throw new Error(`swap returned no ${pc.collateral.symbol}`);
+          txs.push(...(await ensureAllowance(this.env, ctx, pc.collateral.address as Address, this.morpho, sw.received)));
+          txs.push(await sendTx(this.env, ctx, this.supplyCollateralReq(pc, cur.params, sw.received)));
+        } catch (e) {
+          const rb = await this.rollbackStep(pc, collPre, loanPre, ctx, txs);
+          return fail(`iteration ${iters + 1} failed after borrowing ${b.assets} ${pc.debt.symbol}: ${msg(e)}; rolled back: ${rb}`);
+        }
         iters++;
       }
       const fin = await this.state(pc);
@@ -759,6 +845,60 @@ export class MorphoBlueAdapter implements LendingAdapter {
     return this.unwind(pairId, { kind: "ltv", ltv: targetLtv }, ctx, "deleverage");
   }
 
+  /** Pure part of repayUpTo: what a repay with `available` loan tokens would send. */
+  private repayPlan(cur: PairState, available: bigint, want: bigint | "all", dust: bigint): { assets: bigint; shares: bigint; approve: bigint; repaid: bigint } | null {
+    if (cur.debt === 0n || available === 0n) return null;
+    const wantAll = want === "all" || want >= cur.debt;
+    // 1 bp + 1 wei covers interest accrued until inclusion when repaying by shares.
+    const buffered = cur.debt + MathLib.mulDivUp(cur.debt, 1n, 10_000n) + 1n;
+    if (wantAll && available >= buffered) return { assets: 0n, shares: cur.borrowShares, approve: buffered, repaid: cur.debt };
+    let amt = min(available, cur.debt);
+    if (want !== "all") amt = min(amt, want);
+    if (cur.minDebt !== undefined) {
+      const left = cur.debt - amt;
+      if (left > 0n && left < cur.minDebt) amt = cur.debt > cur.minDebt ? cur.debt - cur.minDebt : 0n;
+    }
+    if (amt === 0n || (amt <= dust && amt < cur.debt)) return null;
+    return { assets: amt, shares: 0n, approve: amt, repaid: amt };
+  }
+
+  private stuckNote(st: PairState, walletLoan: bigint, pc: MorphoPairConfig): string {
+    return `stuck: LTV ${pct(oracleLtv(st.collateral, st.debt, st.price))} is at/above the step cap ${pct(this.stepCap(st))} (LLTV x ${this.stepLtvFactor}), so no collateral can be withdrawn; needs ${pc.debt.symbol} in the wallet to repay (wallet has ${walletLoan})`;
+  }
+
+  /**
+   * Exit plan from `st`: first repay from loan tokens already in the wallet,
+   * then withdraw -> sell -> repay iterations under the step cap. `stuck` =
+   * the planner cannot make progress (LTV at/above the cap) before
+   * maxIterations.
+   */
+  private async exitPlan(pc: MorphoPairConfig, st: PairState, target: UnwindTarget, ctx: LiveContext, dust: bigint) {
+    const walletLoan = st.debt > 0n ? await this.walletBalance(pc.debt) : 0n;
+    const base = this.planParams(st, ctx, 0, ctx.limits.maxLoopIterations, dust);
+    const mk = (c: number) => {
+      const pp: PlanParams = { ...base, swapCostFrac: c };
+      const resolved = resolveUnwindTarget(st.loop, target, pp);
+      const rp = this.repayPlan(st, walletLoan, resolved.repay, dust);
+      const wr = rp?.repaid ?? 0n;
+      const rest: UnwindTarget = { kind: "repay", repay: resolved.repay === "all" ? "all" : resolved.repay > wr ? resolved.repay - wr : 0n, withdrawTotal: resolved.withdrawTotal };
+      const plan = planUnwindSteps({ collateral: st.collateral, debt: st.debt - wr }, rest, pp);
+      return { resolved, rp, plan, stuck: !plan.reachedTarget && plan.iterations < pp.maxIterations };
+    };
+    let r = mk(0);
+    let quote: SwapQuote | undefined;
+    let cost = 0;
+    const s0 = r.plan.steps.find((s) => s.kind === "swapToLoan");
+    if (s0 && s0.kind === "swapToLoan") {
+      if (!this.swapper) throw new Error("no swapper configured (needed to sell collateral for the loan token)");
+      quote = await this.swapper.quote(pc.collateral, pc.debt, s0.collateralIn, ctx);
+      if (!(quote.costBps <= this.maxExitSwapCostBps))
+        throw new Error(`exit swap ${pc.collateral.symbol}->${pc.debt.symbol} via ${quote.route} costs ${quote.costBps}bps > max ${this.maxExitSwapCostBps}bps`);
+      cost = Math.max(0, quote.costBps) / 1e4;
+      r = mk(cost);
+    }
+    return { ...r, quote, cost, walletLoan };
+  }
+
   private async unwind(pairId: string, target: UnwindTarget, ctx: LiveContext, label: "close" | "deleverage"): Promise<LiveResult> {
     const txs: TxRecord[] = [];
     const fail = (detail: string): LiveResult => ({ ok: false, txs, detail: `${this.id} ${label} ${pairId}: ${detail}` });
@@ -767,72 +907,83 @@ export class MorphoBlueAdapter implements LendingAdapter {
       const st0 = await this.state(pc);
       if (st0.collateral === 0n && st0.borrowShares === 0n) return { ok: true, txs, detail: `${this.id} ${label} ${pairId}: no position` };
       if (await this.isPaused()) return fail("protocol is paused");
-      if (st0.debt > 0n && !this.swapper) return fail("no swapper configured (needed to sell collateral for the loan token)");
       const dust = await this.dust(pc, ctx);
-      const base = this.planParams(st0, ctx, 0, ctx.limits.maxLoopIterations, dust, true);
-      if (base.stepLtvCap > fromWad(st0.params.lltv) * this.stepLtvFactor)
-        ctx.log("warn", `${this.id} ${label} ${pairId}: LTV ${pct(oracleLtv(st0.collateral, st0.debt, st0.price))} is above the step cap; unwinding with steps up to 99% of LLTV`);
-      let plan = planUnwindSteps(st0.loop, target, base);
-      let cost = 0;
-      let quote: SwapQuote | undefined;
-      const s0 = plan.steps.find((s) => s.kind === "swapToLoan");
-      if (s0 && s0.kind === "swapToLoan") {
-        quote = await this.swapper!.quote(pc.collateral, pc.debt, s0.collateralIn, ctx);
-        if (!(quote.costBps <= this.maxSwapCostBps)) return fail(`swap ${pc.collateral.symbol}->${pc.debt.symbol} via ${quote.route} costs ${quote.costBps}bps > max ${this.maxSwapCostBps}bps`);
-        cost = Math.max(0, quote.costBps) / 1e4;
-        plan = planUnwindSteps(st0.loop, target, { ...base, swapCostFrac: cost });
-      }
-      const resolved = resolveUnwindTarget(st0.loop, target, { ...base, swapCostFrac: cost });
-      const summary = `plan: ${plan.iterations} withdraw->swap->repay iteration(s), projected LTV ${pct(plan.finalLtv)}, debt ${plan.final.debt}${plan.reachedTarget ? "" : " — target NOT reachable within maxLoopIterations"}`;
+      const ex = await this.exitPlan(pc, st0, target, ctx, dust);
+      const { plan, resolved, rp, quote } = ex;
+      let cost = ex.cost;
+      if (ex.stuck && !rp) return fail(this.stuckNote(st0, ex.walletLoan, pc));
+      const summary = `plan: ${rp ? `repay ${rp.repaid} ${pc.debt.symbol} from the wallet, then ` : ""}${plan.iterations} withdraw->swap->repay iteration(s), projected LTV ${pct(plan.finalLtv)}, debt ${plan.final.debt}${plan.reachedTarget ? "" : ex.stuck ? " — then stuck at the step cap" : " — target NOT reachable within maxLoopIterations"}`;
 
       if (ctx.dryRun) {
+        const reqs: TxRequest[] = [];
+        if (rp) reqs.push(...(await this.approveReqs(pc.debt.address as Address, this.morpho, rp.approve)), this.repayReq(pc, st0.params, rp.assets, rp.shares));
         const first = plan.steps[0];
-        if (first && first.kind === "withdrawCollateral") txs.push(await sendTx(this.env, ctx, this.withdrawCollateralReq(pc, st0.params, first.assets)));
-        const notes = [summary, quote ? `swap #1 ${quote.route} quoted ${quote.costBps}bps` : undefined, plan.iterations > 0 ? "only step 1 (withdrawCollateral) simulated; swap/repay need its output" : undefined];
+        if (first && first.kind === "withdrawCollateral") reqs.push(this.withdrawCollateralReq(pc, st0.params, first.assets));
+        const sim = await simulateBundle(this.env, ctx, reqs);
+        txs.push(...sim.records);
+        const notes = [
+          summary,
+          reqs.length > 1 ? (sim.bundled ? `simulated ${reqs.length} dependent call(s) in sequence` : sim.note) : undefined,
+          quote ? `exit swap #1 ${quote.route} quoted ${quote.costBps}bps` : undefined,
+          plan.iterations > 0 ? "swap/repay legs not simulated (they need the withdrawn collateral)" : undefined,
+        ];
         return { ok: plan.reachedTarget, txs, detail: `${this.id} ${label} ${pairId}: ${notes.filter(Boolean).join("; ")}` };
       }
 
       const collBefore = await this.walletBalance(pc.collateral);
+      const maxIter = ctx.limits.maxLoopIterations;
       let repaid = 0n;
       let withdrawn = 0n;
       let got = 0n;
       let spent = 0n;
       let iters = 0;
-      for (let guard = 0; guard <= ctx.limits.maxLoopIterations + 1; guard++) {
-        const cur = await this.state(pc);
-        const remaining: UnwindTarget = {
+      let stuck = "";
+      const remainingRepay = (): bigint | "all" => (resolved.repay === "all" ? "all" : resolved.repay > repaid ? resolved.repay - repaid : 0n);
+      for (let guard = 0; guard <= maxIter + 2; guard++) {
+        let cur = await this.state(pc);
+        // (1) Loan tokens already in the wallet repay first (no withdraw needed).
+        const want = remainingRepay();
+        if (cur.debt > 0n && (want === "all" || want > 0n)) {
+          const r = await this.repayUpTo(pc, cur, await this.walletBalance(pc.debt), want, dust, ctx, txs);
+          if (r > 0n) {
+            repaid += r;
+            spent += r;
+            cur = await this.state(pc);
+          }
+        }
+        const rem: UnwindTarget = {
           kind: "repay",
-          repay: resolved.repay === "all" ? "all" : resolved.repay > repaid ? resolved.repay - repaid : 0n,
+          repay: remainingRepay(),
           withdrawTotal:
             resolved.withdrawTotal === undefined ? undefined : resolved.withdrawTotal === "all" ? "all" : resolved.withdrawTotal > withdrawn ? resolved.withdrawTotal - withdrawn : 0n,
         };
-        const next = planUnwindSteps(cur.loop, remaining, this.planParams(cur, ctx, cost, iters < ctx.limits.maxLoopIterations ? 1 : 0, dust, true));
+        const next = planUnwindSteps(cur.loop, rem, this.planParams(cur, ctx, cost, iters < maxIter ? 1 : 0, dust));
         const w = next.steps[0];
-        if (!w || w.kind !== "withdrawCollateral") break;
-        txs.push(await sendTx(this.env, ctx, this.withdrawCollateralReq(pc, cur.params, w.assets)));
-        withdrawn += w.assets;
-        if (next.steps[1]?.kind !== "swapToLoan") break; // that was the final withdraw
-        const sw = await this.swapMeasured(pc.collateral, pc.debt, w.assets, ctx, txs);
-        cost = Math.max(0, sw.costBps) / 1e4;
-        got += sw.received;
-        const now = await this.state(pc);
-        const wantAll = resolved.repay === "all" || (remaining.repay as bigint) >= now.debt;
-        // 1 bp + 1 wei covers interest accrued until inclusion when repaying by shares.
-        const buffered = now.debt + MathLib.mulDivUp(now.debt, 1n, 10_000n) + 1n;
-        if (wantAll && sw.received >= buffered) {
-          txs.push(...(await ensureAllowance(this.env, ctx, pc.debt.address as Address, this.morpho, buffered)));
-          txs.push(await sendTx(this.env, ctx, this.repayReq(pc, now.params, 0n, now.borrowShares)));
-          repaid += now.debt;
-          spent += now.debt;
-        } else {
-          let amt = min(sw.received, now.debt);
-          if (resolved.repay !== "all") amt = min(amt, remaining.repay as bigint);
-          if (amt > 0n) {
-            txs.push(...(await ensureAllowance(this.env, ctx, pc.debt.address as Address, this.morpho, amt)));
-            txs.push(await sendTx(this.env, ctx, this.repayReq(pc, now.params, amt, 0n)));
-            repaid += amt;
-            spent += amt;
-          }
+        if (!w || w.kind !== "withdrawCollateral") {
+          if (!next.reachedTarget && iters < maxIter) stuck = this.stuckNote(cur, await this.walletBalance(pc.debt), pc);
+          break;
+        }
+        // (2) Withdraw (post-withdraw LTV <= LLTV x stepLtvFactor) -> sell -> repay.
+        const collPre = await this.walletBalance(pc.collateral);
+        const loanPre = await this.walletBalance(pc.debt);
+        const isFinal = next.steps[1]?.kind !== "swapToLoan";
+        try {
+          // Inside the rollback scope: an unconfirmed broadcast may still land (rollback works on wallet deltas).
+          txs.push(await sendTx(this.env, ctx, this.withdrawCollateralReq(pc, cur.params, w.assets)));
+          withdrawn += w.assets;
+          if (isFinal) break; // that was the final withdraw (debt target done): the collateral is meant to stay in the wallet
+          const sw = await this.swapMeasured(pc.collateral, pc.debt, w.assets, ctx, txs, this.maxExitSwapCostBps);
+          cost = Math.max(0, sw.costBps) / 1e4;
+          if (sw.received === 0n) throw new Error(`swap returned no ${pc.debt.symbol}`);
+          got += sw.received;
+          const r = await this.repayUpTo(pc, await this.state(pc), sw.received, remainingRepay(), 0n, ctx, txs);
+          repaid += r;
+          spent += r;
+        } catch (e) {
+          // Anything failing after the withdraw (quote rejected / API down /
+          // swap not ok / repay revert): put the position back.
+          const rb = await this.rollbackStep(pc, collPre, loanPre, ctx, txs);
+          return fail(`step ${iters + 1} failed after withdrawing ${w.assets} ${pc.collateral.symbol}: ${msg(e)}; rolled back: ${rb}`);
         }
         iters++;
       }
@@ -841,7 +992,7 @@ export class MorphoBlueAdapter implements LendingAdapter {
       const leftover = got > spent ? got - spent : 0n;
       if (label === "close" && leftover > dust && this.swapper) {
         try {
-          const back = await this.swapMeasured(pc.debt, pc.collateral, min(leftover, await this.walletBalance(pc.debt)), ctx, txs);
+          const back = await this.swapMeasured(pc.debt, pc.collateral, min(leftover, await this.walletBalance(pc.debt)), ctx, txs, this.maxExitSwapCostBps);
           leftoverNote = `; swapped leftover ${leftover} ${pc.debt.symbol} back to ${back.received} ${pc.collateral.symbol}`;
         } catch (e) {
           leftoverNote = `; leftover ${leftover} ${pc.debt.symbol} stays in the wallet (${msg(e)})`;
@@ -856,12 +1007,13 @@ export class MorphoBlueAdapter implements LendingAdapter {
           ? finLtv <= target.ltv + 1e-6
           : resolved.repay === "all"
             ? fin.borrowShares === 0n && (resolved.withdrawTotal !== "all" || fin.collateral === 0n)
-            : repaid >= (resolved.repay as bigint);
+            : repaid >= resolved.repay;
+      const why = reached ? "" : stuck ? ` — ${stuck}` : " — target NOT reached (maxLoopIterations); call again";
       return {
         ok: reached,
         txs,
         amountUsd: unitsToUsd(returned, await ctx.priceUsd(pc.collateral), pc.collateral.decimals),
-        detail: `${this.id} ${label} ${pairId}: ${iters} iteration(s), LTV ${pct(finLtv)}, debt ${fin.debt}, collateral ${fin.collateral}, returned ${returned} ${pc.collateral.symbol}${reached ? "" : " — target NOT reached (maxLoopIterations); call again"}${leftoverNote}`,
+        detail: `${this.id} ${label} ${pairId}: ${iters} iteration(s), repaid ${repaid}, LTV ${pct(finLtv)}, debt ${fin.debt}, collateral ${fin.collateral}, returned ${returned} ${pc.collateral.symbol}${why}${leftoverNote}`,
       };
     } catch (e) {
       return fail(msg(e) + this.broadcastNote(txs));
@@ -869,10 +1021,12 @@ export class MorphoBlueAdapter implements LendingAdapter {
   }
 
   /**
-   * Proves the exit path right now: the full sell size quotes within
-   * maxSwapCostBps (depth), the plan completes within maxLoopIterations, and
-   * the first withdrawCollateral simulates. The swap/repay legs depend on the
-   * withdrawn collateral and cannot be simulated without a flash loan.
+   * Proves the exit path right now: loan tokens in the wallet repay first;
+   * the remaining full sell size quotes within maxExitSwapCostBps (depth);
+   * the plan completes within maxLoopIterations without getting stuck at the
+   * step cap; and [wallet repay ->] the first withdrawCollateral simulate in
+   * sequence. The swap/repay legs depend on the withdrawn collateral and
+   * cannot be simulated without a flash loan.
    */
   async simulateClose(pairId: string, ctx: LiveContext): Promise<boolean> {
     const dry: LiveContext = { ...ctx, dryRun: true };
@@ -884,30 +1038,37 @@ export class MorphoBlueAdapter implements LendingAdapter {
         ctx.log("warn", `${this.id} simulateClose ${pairId}: protocol paused`);
         return false;
       }
-      if (st.debt === 0n) {
-        await sendTx(this.env, dry, this.withdrawCollateralReq(pc, st.params, st.collateral));
-        return true;
-      }
-      if (!this.swapper) {
-        ctx.log("warn", `${this.id} simulateClose ${pairId}: no swapper`);
-        return false;
-      }
       const dust = await this.dust(pc, dry);
-      const base = this.planParams(st, dry, 0, dry.limits.maxLoopIterations, dust, true);
-      const buf = BigInt(base.sellBufferBps ?? 0);
-      const sellAll = (loanToCollateral(st.debt, st.price, "Up") * (10_000n + buf)) / 10_000n;
-      const q = await this.swapper.quote(pc.collateral, pc.debt, min(sellAll, st.collateral), dry);
-      if (!(q.costBps <= this.maxSwapCostBps)) {
-        ctx.log("warn", `${this.id} simulateClose ${pairId}: selling ${sellAll} ${pc.collateral.symbol} costs ${q.costBps}bps > ${this.maxSwapCostBps}bps`);
-        return false;
+      const walletLoan = st.debt > 0n ? await this.walletBalance(pc.debt) : 0n;
+      const rp = this.repayPlan(st, walletLoan, "all", dust);
+      const debtLeft = st.debt - (rp?.repaid ?? 0n);
+      const base = this.planParams(st, dry, 0, dry.limits.maxLoopIterations, dust);
+      let cost = 0;
+      if (debtLeft > 0n) {
+        if (!this.swapper) {
+          ctx.log("warn", `${this.id} simulateClose ${pairId}: no swapper`);
+          return false;
+        }
+        const buf = BigInt(base.sellBufferBps ?? 0);
+        const sellAll = (loanToCollateral(debtLeft, st.price, "Up") * (10_000n + buf)) / 10_000n;
+        const q = await this.swapper.quote(pc.collateral, pc.debt, min(sellAll, st.collateral), dry);
+        if (!(q.costBps <= this.maxExitSwapCostBps)) {
+          ctx.log("warn", `${this.id} simulateClose ${pairId}: selling ${sellAll} ${pc.collateral.symbol} costs ${q.costBps}bps > exit max ${this.maxExitSwapCostBps}bps`);
+          return false;
+        }
+        cost = Math.max(0, q.costBps) / 1e4;
       }
-      const plan = planUnwindSteps(st.loop, { kind: "fraction", fraction: 1 }, { ...base, swapCostFrac: Math.max(0, q.costBps) / 1e4 });
+      const plan = planUnwindSteps({ collateral: st.collateral, debt: debtLeft }, { kind: "repay", repay: "all", withdrawTotal: "all" }, { ...base, swapCostFrac: cost });
       if (!plan.reachedTarget) {
-        ctx.log("warn", `${this.id} simulateClose ${pairId}: full close needs more than ${dry.limits.maxLoopIterations} iterations`);
+        const stuck = plan.iterations < dry.limits.maxLoopIterations;
+        ctx.log("warn", `${this.id} simulateClose ${pairId}: ${stuck ? this.stuckNote(st, walletLoan, pc) : `full close needs more than ${dry.limits.maxLoopIterations} iterations`}`);
         return false;
       }
+      const reqs: TxRequest[] = [];
+      if (rp) reqs.push(...(await this.approveReqs(pc.debt.address as Address, this.morpho, rp.approve)), this.repayReq(pc, st.params, rp.assets, rp.shares));
       const first = plan.steps[0];
-      if (first && first.kind === "withdrawCollateral") await sendTx(this.env, dry, this.withdrawCollateralReq(pc, st.params, first.assets));
+      if (first && first.kind === "withdrawCollateral") reqs.push(this.withdrawCollateralReq(pc, st.params, first.assets));
+      await simulateBundle(this.env, dry, reqs);
       return true;
     } catch (e) {
       ctx.log("warn", `${this.id} simulateClose ${pairId} failed: ${msg(e)}`);

@@ -22,7 +22,9 @@ export class CanaryExecutor implements Executor {
     private readonly inner: Executor,
     private readonly limits: CanaryLimits,
     /** Current positions (from the router's store) — read at call time. */
-    private readonly positions: () => Position[]
+    private readonly positions: () => Position[],
+    /** Live gate: a reason string blocks entries (exits always run). */
+    private readonly entriesAllowed?: () => string | null
   ) {
     if (inner.markToMarket) this.markToMarket = inner.markToMarket.bind(inner);
   }
@@ -40,6 +42,8 @@ export class CanaryExecutor implements Executor {
   }
 
   async enter(opp: Opportunity, deltaUsd: number): Promise<ExecResult> {
+    const gate = this.entriesAllowed?.();
+    if (gate) return { ok: false, detail: `entry refused: ${gate}` };
     const why = CanaryExecutor.check(this.limits, this.positions(), opp.id, deltaUsd);
     if (why) return { ok: false, detail: why };
     return this.inner.enter(opp, deltaUsd);

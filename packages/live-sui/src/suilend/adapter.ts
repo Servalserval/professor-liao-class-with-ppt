@@ -663,8 +663,9 @@ export class SuilendAdapter implements LendingAdapter {
       let swapDepthUsd = Infinity;
       let swapDiag: SuilendPairDiagnostics["swap"];
       if (!same) {
+        // unknown until the probes succeed: NaN = missing data (NOT 0, which the core reads as "no exit capacity")
         swapCostFrac = (this.cfg.fallbackSwapCostBps ?? 100) / 10_000;
-        swapDepthUsd = 0;
+        swapDepthUsd = NaN;
         if (!this.cfg.swapper) swapDiag = { error: "no swapper configured" };
         else {
           try {

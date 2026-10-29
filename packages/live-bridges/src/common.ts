@@ -3,7 +3,7 @@
  * JSON client, 32-byte address padding, handle codecs and integer math.
  * No chain SDK imports here.
  */
-import type { LiveContext } from "@incentive-router/live-common";
+import { BroadcastUnconfirmedError, type LiveContext } from "@incentive-router/live-common";
 import { isAddress, pad, type Hex } from "viem";
 
 // ---------------------------------------------------------------------------
@@ -178,11 +178,15 @@ export function decodeHandle(prefix: string, handle: string, n: number, maxN: nu
  *  - failed.refunded: base units that provably never left / came back to the source wallet.
  *  - failed.detail starting with "recoverable:" -> core "stuck" (funds not lost, needs action).
  */
-export type LiveBridgeStatus =
+export type LiveBridgeStatus = (
   | { state: "pending"; unconfirmed?: string }
   | { state: "claimable"; detail?: string }
   | { state: "completed"; dstTx?: string; received?: bigint }
-  | { state: "failed"; detail: string; refunded?: bigint };
+  | { state: "failed"; detail: string; refunded?: bigint }
+) & {
+  /** Updated handle (e.g. advanced log-scan cursor / recovered guid); the glue returns it as `ref` so the router persists it. */
+  handle?: string;
+};
 
 export const RECOVERABLE = "recoverable:";
 
@@ -191,18 +195,18 @@ export const RECOVERABLE = "recoverable:";
 // ---------------------------------------------------------------------------
 
 /**
- * Wrap ctx so tx hashes / digests that sendTx / executePtb log right after
- * broadcasting are captured (sendTx logs `{ hash }` before waiting for the
- * receipt; executePtb logs `{ digest }` before waitForTransaction). Lets an
- * adapter return ok:true + a handle when a receipt wait times out after the
- * tx already left. Prototype-based so class-instance contexts keep their methods.
+ * Fallback for base helpers that do not throw BroadcastUnconfirmedError: wrap
+ * ctx and capture ids from the logs sendTx / executePtb emit AFTER submission
+ * ("<chain>: sent ..." { hash } / "sui: executed ..." { digest }). The
+ * pre-submit "signed" log is deliberately ignored: a submit can still be
+ * definitively rejected after it. Prototype-based so class contexts keep their methods.
  */
 export function captureBroadcasts(ctx: LiveContext): { ctx: LiveContext; ids: string[] } {
   const ids: string[] = [];
   const wrapped = Object.create(ctx) as LiveContext;
   wrapped.log = (level, msg, data) => {
     const id = data?.hash ?? data?.digest;
-    if (typeof id === "string" && id.length > 0) ids.push(id);
+    if (typeof id === "string" && id.length > 0 && /^[\w-]+: (sent|executed) /.test(msg)) ids.push(id);
     ctx.log(level, msg, data);
   };
   return { ctx: wrapped, ids };
@@ -211,6 +215,59 @@ export function captureBroadcasts(ctx: LiveContext): { ctx: LiveContext; ids: st
 /** sendTx / executePtb error after broadcast meaning the tx itself failed (so funds did not move). */
 export function isOnChainFailure(e: unknown): boolean {
   return /reverted on-chain|failed on-chain/.test(errMsg(e));
+}
+
+/**
+ * Id of a tx that may have left the wallet although the helper threw:
+ * BroadcastUnconfirmedError.id first (live-evm-base / live-sui), else an id
+ * captured from the post-submit log. undefined = nothing was broadcast, or the
+ * tx failed on-chain (funds did not move).
+ */
+export function broadcastIdOnError(e: unknown, captured: string[]): string | undefined {
+  if (e instanceof BroadcastUnconfirmedError || (e as { name?: unknown })?.name === "BroadcastUnconfirmedError") {
+    const id = (e as { id?: unknown }).id;
+    if (typeof id === "string" && id) return id;
+  }
+  if (isOnChainFailure(e)) return undefined;
+  return captured[captured.length - 1];
+}
+
+/** A node's "this tx does not exist" (as opposed to a transport error). */
+export function isNotFoundError(e: unknown): boolean {
+  const n = (e as { name?: unknown })?.name;
+  return (typeof n === "string" && /NotFound/.test(n)) || /not[ _-]?found|could not be found/i.test(errMsg(e));
+}
+
+/** Minimum age before a missing source tx may be refunded (on top of the replay guard below). */
+export const MISSING_TX_REFUND_MS = 15 * 60_000;
+
+/**
+ * Replay guard stored in handles: proof material that a signed-but-missing tx
+ * can never land. EVM "n<nonce>" (dead once the account's confirmed nonce has
+ * passed it); Sui "o<objectId>@<version>" (dead once that owned input / gas
+ * coin has a newer version). "-" = unknown -> never auto-refund.
+ */
+export type TxGuard = { nonce: number } | { objectId: string; version: bigint };
+
+export function encodeGuard(g: TxGuard | undefined): string {
+  if (!g) return "-";
+  if ("nonce" in g) return `n${g.nonce}`;
+  return `o${g.objectId}@${g.version}`;
+}
+
+export function decodeGuard(s: string | undefined): TxGuard | undefined {
+  if (!s || s === "-") return undefined;
+  let m = /^n(\d+)$/.exec(s);
+  if (m) return { nonce: Number(m[1]) };
+  m = /^o(0x[0-9a-fA-F]+)@(\d+)$/.exec(s);
+  if (m) return { objectId: m[1]!, version: BigInt(m[2]!) };
+  return undefined;
+}
+
+/** EVM: the account's latest confirmed nonce has passed `nonce` (so a tx signed with it can never be mined). */
+export async function evmNoncePassed(client: { getTransactionCount(a: { address: `0x${string}`; blockTag: "latest" }): Promise<number> }, account: `0x${string}`, nonce: number): Promise<boolean> {
+  const confirmed = await client.getTransactionCount({ address: account, blockTag: "latest" });
+  return confirmed > nonce;
 }
 
 export function errMsg(e: unknown): string {

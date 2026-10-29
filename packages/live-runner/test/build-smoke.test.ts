@@ -24,7 +24,7 @@ describe("live runner wiring (offline smoke test of config/live.example.yaml)", 
   it("loads the example config and builds every component without touching the network", async () => {
     const dir = mkdtempSync(join(tmpdir(), "live-"));
     const src = readFileSync(join(ROOT, "config/live.example.yaml"), "utf8")
-      .replace("state_dir: state/live", `state_dir: ${dir}`)
+      .replace("state_dir: state/shadow", `state_dir: ${dir}`)
       .replace("router_config: config/live-router.yaml", `router_config: ${join(ROOT, "config/live-router.yaml")}`);
     const path = join(dir, "live.yaml");
     writeFileSync(path, src);

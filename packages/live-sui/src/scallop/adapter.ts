@@ -333,6 +333,7 @@ export class ScallopAdapter implements LendingAdapter {
     };
   }
 
+  /** No swapper = known inability to swap (depth 0); failed quotes = unknown (NaN, see summarizeSwapProbe). */
   private async swapProbe(p: ResolvedPair, snap: Snapshot): Promise<SwapProbe> {
     const sw = this.opts.swapper;
     if (!sw) return { costFrac: 1, depthUsd: 0 };

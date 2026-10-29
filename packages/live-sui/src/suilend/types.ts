@@ -318,7 +318,7 @@ export interface SuilendAdapterConfig {
   depthProbeMaxUsd?: number;
   /** Cost budget defining swapDepthUsd (default 50 bps). */
   depthBudgetBps?: number;
-  /** swapCostFrac used when no swapper / quote fails (default 100 bps; swapDepthUsd is then 0). */
+  /** swapCostFrac used when no swapper / quote fails (default 100 bps; swapDepthUsd is then NaN = unknown). */
   fallbackSwapCostBps?: number;
   /** Fraction of the open-LTV borrow limit planners may use (default 0.97). */
   stepSafety?: number;

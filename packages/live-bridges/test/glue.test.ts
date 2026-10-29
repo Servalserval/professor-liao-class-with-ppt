@@ -20,8 +20,11 @@ class FakeAdapter implements BridgeAdapter {
   supports(from: AssetRef, to: AssetRef) {
     return from.chain !== to.chain;
   }
+  quoteCost = { feeUsd: 0, gasSrcUsd: 0, gasDstUsd: 0 };
+  quoteError?: string;
   async quote() {
-    return { amountIn: 0n, minAmountOut: 0n, feeUsd: 0, gasSrcUsd: 0, gasDstUsd: 0, etaSeconds: 0 };
+    if (this.quoteError) throw new Error(this.quoteError);
+    return { amountIn: 0n, minAmountOut: 0n, ...this.quoteCost, etaSeconds: 0 };
   }
   async send(from: AssetRef, to: AssetRef, amount: bigint, recipient: string, ctx: LiveContext) {
     this.sends.push({ from, to, amount, recipient, dryRun: ctx.dryRun });
@@ -116,6 +119,34 @@ describe("LiveBridgeExecutor.send", () => {
     assert.equal(plenty.fake.sends[0]!.amount, 1_000_000_000n);
   });
 
+  it("live cost guard: refuses (nothing sent) above max(1.25 x planned, planned + $0.50)", async () => {
+    // ROUTE planned cost for $1000 = 0 bps + 0 + 0.05 + 0.02 = $0.07 -> limit = max(0.0875, 0.57) = $0.57
+    const ok = make(mockCtx(false, 1));
+    ok.fake.quoteCost = { feeUsd: 0.3, gasSrcUsd: 0.2, gasDstUsd: 0.05 };
+    const r1 = await ok.ex.send(transfer());
+    assert.equal(r1.ok, true);
+    assert.match(r1.detail!, /quoted cost \$0\.5500 .* planned \$0\.0700, limit \$0\.5700/);
+
+    const hi = make(mockCtx(false, 1));
+    hi.fake.quoteCost = { feeUsd: 0.4, gasSrcUsd: 0.2, gasDstUsd: 0.05 };
+    const r2 = await hi.ex.send(transfer());
+    assert.equal(r2.ok, false);
+    assert.match(r2.detail!, /^refused, nothing sent: quoted cost \$0\.6500/);
+    assert.equal(hi.fake.sends.length, 0);
+
+    // large planned cost: the 1.25x ratio dominates
+    const big = make(mockCtx(false, 1));
+    big.fake.quoteCost = { feeUsd: 4, gasSrcUsd: 0, gasDstUsd: 0 };
+    const r3 = await big.ex.send(transfer({ path: [{ ...ROUTE, feeFixedUsd: 3, gasSrcUsd: 0, gasDstUsd: 0 }] }));
+    assert.equal(r3.ok, false); // 4 > max(3.75, 3.5)
+
+    const qe = make(mockCtx(false, 1));
+    qe.fake.quoteError = "Fast Transfer allowance too low";
+    const r4 = await qe.ex.send(transfer());
+    assert.equal(r4.ok, false);
+    assert.match(r4.detail!, /quote failed, nothing sent/);
+  });
+
   it("dry-run returns ok without a ref", async () => {
     const { ex } = make(mockCtx(true));
     const r = await ex.send(transfer());
@@ -148,6 +179,12 @@ describe("LiveBridgeExecutor.poll", () => {
     const { fake, ex } = make(mockCtx());
     fake.statuses = [{ state: "pending" }];
     assert.deepEqual(await ex.poll(sent), { state: "in_flight", ref: sent.ref });
+  });
+
+  it("an advanced handle from status() is returned as ref (router persists it)", async () => {
+    const { fake, ex } = make(mockCtx());
+    fake.statuses = [{ state: "pending", handle: "cctp_v2_standard:arbitrum:sui:0xabc:42" }];
+    assert.deepEqual(await ex.poll(sent), { state: "in_flight", ref: "cctp_v2_standard:arbitrum:sui:0xabc:42" });
   });
 
   it("claimable -> complete() -> completed with receivedUsd from received units", async () => {

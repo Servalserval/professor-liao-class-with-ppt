@@ -13,6 +13,7 @@ import {
   encodeFunctionData,
   erc20Abi,
   http,
+  keccak256,
   type Abi,
   type Address,
   type Chain,
@@ -21,7 +22,7 @@ import {
   type WalletClient,
 } from "viem";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
-import { chainInfo, type AssetRef, type LiveContext, type TxRecord } from "@incentive-router/live-common";
+import { BroadcastUnconfirmedError, chainInfo, type AssetRef, type LiveContext, type TxRecord } from "@incentive-router/live-common";
 
 export { erc20Abi };
 export type { Abi, Address, Hex, PublicClient, WalletClient };
@@ -133,7 +134,9 @@ export async function sendTx(env: EvmEnv, ctx: LiveContext, req: TxRequest): Pro
       return { chain: env.chain, description: req.description, gasUsd, simulated: true };
     }
     if (!env.walletClient) throw new Error(`${env.chain}: no signer (read-only env) for "${req.description}"`);
-    const hash = await env.walletClient.sendTransaction({
+    // Sign locally and know the hash BEFORE submitting: a submit that times out
+    // or returns 5xx may still have been accepted by the node.
+    const prepared = await env.walletClient.prepareTransactionRequest({
       account: env.walletClient.account!,
       chain: env.viemChain,
       to: req.to,
@@ -141,11 +144,30 @@ export async function sendTx(env: EvmEnv, ctx: LiveContext, req: TxRequest): Pro
       value: req.value,
       gas: (gas * 12n) / 10n,
     });
+    const raw = await env.walletClient.signTransaction(prepared as Parameters<WalletClient["signTransaction"]>[0]);
+    const hash = keccak256(raw);
+    ctx.log("info", `${env.chain}: signed ${req.description}`, { hash });
+    try {
+      await env.publicClient.sendRawTransaction({ serializedTransaction: raw });
+    } catch (e) {
+      const msg = (e as Error).message.split("\n")[0] ?? "";
+      // Definitive pre-acceptance rejections: nothing was broadcast.
+      if (/nonce too low|insufficient funds|intrinsic gas too low|exceeds block gas limit|invalid sender|replacement transaction underpriced/i.test(msg) && !/already known/i.test(msg))
+        throw new Error(`${env.chain}: submit rejected for "${req.description}": ${msg}`);
+      // Anything else (timeout, 5xx, "already known"): it may be in the mempool.
+      const seen = await env.publicClient.getTransaction({ hash }).catch(() => null);
+      if (!seen) throw new BroadcastUnconfirmedError(env.chain, hash, req.description, `submit error: ${msg}`, prepared.nonce);
+    }
     ctx.log("info", `${env.chain}: sent ${req.description}`, { hash });
-    const receipt = await env.publicClient.waitForTransactionReceipt({ hash, timeout: 180_000 });
+    let receipt;
+    try {
+      receipt = await env.publicClient.waitForTransactionReceipt({ hash, timeout: 180_000 });
+    } catch (e) {
+      throw new BroadcastUnconfirmedError(env.chain, hash, req.description, `no receipt: ${(e as Error).message.split("\n")[0]}`, prepared.nonce);
+    }
     if (receipt.status !== "success") throw new Error(`${env.chain}: tx ${hash} reverted on-chain (${req.description})`);
     const realGasUsd = (Number(receipt.gasUsed * (receipt.effectiveGasPrice ?? gasPrice)) / 1e18) * native;
-    return { chain: env.chain, id: hash, description: req.description, gasUsd: realGasUsd, simulated: false };
+    return { chain: env.chain, id: hash, description: req.description, gasUsd: realGasUsd, simulated: false, nonce: prepared.nonce };
   });
 }
 
@@ -175,6 +197,12 @@ export async function ensureAllowance(env: EvmEnv, ctx: LiveContext, token: Addr
   const out: TxRecord[] = [];
   if (cur > 0n)
     out.push(await sendTx(env, ctx, { to: token, data: call(erc20Abi, "approve", [spender, 0n]), description: `reset allowance ${token} -> ${spender}` }));
+  if (ctx.dryRun && cur > 0n) {
+    // USDT-style tokens revert approve(x) over a non-zero allowance; in dry-run
+    // the reset above was only simulated, so approve(amount) cannot be.
+    out.push({ chain: env.chain, description: `approve ${amount} ${token} -> ${spender} (not simulated: needs the reset on-chain first)`, simulated: true });
+    return out;
+  }
   out.push(await sendTx(env, ctx, { to: token, data: call(erc20Abi, "approve", [spender, amount]), description: `approve ${amount} ${token} -> ${spender}` }));
   return out;
 }

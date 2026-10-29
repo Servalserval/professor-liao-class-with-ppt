@@ -24,6 +24,7 @@ import {
   Router,
   statusText,
   TelegramNotifier,
+  upsertPosition,
   valueAt,
   venueTier,
   type DecisionContext,
@@ -31,13 +32,17 @@ import {
   type Opportunity,
   type RouterState,
 } from "@incentive-router/core";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { buildRuntime, type Runtime } from "./build.js";
+import { checkModeMarker, takeLock } from "./cli-lib.js";
 import { liveBlockers, readStamp, writeStamp } from "./gate.js";
 import { loadLiveConfig } from "./liveConfig.js";
 
 type Flags = Record<string, string | boolean>;
+
+/** Live gate state shared with the executors (entries + bridge sends refused while set). */
+const gate = { reason: null as string | null };
 
 function parseArgs(argv: string[]): { cmd: string; flags: Flags } {
   const [cmd = "help", ...rest] = argv;
@@ -58,35 +63,6 @@ const str = (f: Flags, k: string) => (typeof f[k] === "string" ? (f[k] as string
 const pct = (x: number) => (Number.isFinite(x) ? `${(x * 100).toFixed(2)}%` : "n/a");
 const usd = (x: number) => `$${Math.round(x).toLocaleString("en-US")}`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** One runner per state dir: two processes on one wallet would double-send. */
-function takeLock(dir: string): () => void {
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, "runner.lock");
-  if (existsSync(path)) {
-    const pid = Number(readFileSync(path, "utf8").trim());
-    let alive = false;
-    if (pid > 0)
-      try {
-        process.kill(pid, 0);
-        alive = true;
-      } catch {
-        alive = false;
-      }
-    if (alive) throw new Error(`another runner (pid ${pid}) holds ${path}; refusing to start`);
-    unlinkSync(path);
-  }
-  const fd = openSync(path, "wx");
-  writeSync(fd, String(process.pid));
-  closeSync(fd);
-  return () => {
-    try {
-      unlinkSync(path);
-    } catch {
-      /* already gone */
-    }
-  };
-}
 
 function makeNotifier(): { notifier: Notifier; tg?: TelegramNotifier } {
   const tok = process.env.TG_BOT_TOKEN;
@@ -242,6 +218,33 @@ function cmdStatus(rt: Runtime): number {
   return 0;
 }
 
+/**
+ * Adopt on-chain loop positions the router does not know about (a crash
+ * between broadcast and save, an RPC error on the post-trade read). Without
+ * this an orphaned leveraged loop would get no health checks at all.
+ * Requires a DEDICATED wallet: anything found in a configured pair is managed.
+ */
+async function reconcile(rt: Runtime, store: FileStore, notifier: Notifier): Promise<void> {
+  try {
+    const st = store.load();
+    const opps = await fetchOpps(rt, st);
+    let changed = false;
+    for (const opp of opps) {
+      if (st.positions.some((p) => p.oppId === opp.id)) continue;
+      const b = rt.registry.bind(opp.id);
+      if (!b) continue;
+      const v = await b.adapter.position(b.pairId).catch(() => null);
+      if (!v || !(v.equityUsd > 10)) continue;
+      upsertPosition(st, opp, v.equityUsd, Date.now());
+      changed = true;
+      await notifier.send("critical", `adopted untracked on-chain position ${opp.id} ($${v.equityUsd.toFixed(2)}, LTV ${v.ltv.toFixed(3)}) — it is now managed by the router`);
+    }
+    if (changed) store.save(st);
+  } catch (e) {
+    await notifier.send("warn", `position reconcile failed: ${(e as Error).message}`);
+  }
+}
+
 async function cmdRun(rt: Runtime, f: Flags): Promise<number> {
   const mode = rt.cfg.mode;
   const stampPath = join(rt.cfg.state_dir, "verify-stamp.json");
@@ -249,13 +252,21 @@ async function cmdRun(rt: Runtime, f: Flags): Promise<number> {
     liveBlockers({ stamp: readStamp(stampPath), configHash: rt.hash, nowMs: Date.now(), maxAgeDays: rt.cfg.verify_max_age_days, modeIsLive: true, env: process.env });
   if (mode === "live") {
     const b = blockers();
-    if (b.length) {
-      console.error("live mode is blocked:\n  - " + b.join("\n  - "));
+    // Only an EXPIRED stamp is survivable: then the runner starts in exits-only
+    // mode so open loops keep their risk management (deleverage, depeg exits,
+    // kill switch). A missing LIVE_CONFIRM, a changed config or verify issues
+    // refuse to start: those are explicit operator states.
+    const fatal = b.filter((x) => !/days old/.test(x));
+    if (fatal.length) {
+      console.error("live mode is blocked:\n  - " + fatal.join("\n  - "));
       return 1;
     }
     if (!rt.canSign.evm && Object.keys(rt.evm).length) throw new Error("live mode without EVM_PRIVATE_KEY");
     if (!rt.canSign.sui && rt.sui) throw new Error("live mode without SUI_PRIVATE_KEY");
+    gate.reason = b.length ? `live gate closed: ${b.join("; ")}` : null;
+    if (gate.reason) console.error(`${gate.reason} — starting EXITS-ONLY (re-run verify to resume entries)`);
   }
+  checkModeMarker(rt.cfg.state_dir, mode);
   const release = takeLock(rt.cfg.state_dir);
   const store = storeFor(rt);
   // Shadow: seed the paper book from the real wallet once, so the simulation starts
@@ -292,17 +303,23 @@ async function cmdRun(rt: Runtime, f: Flags): Promise<number> {
 
   const cycles = Number(str(f, "cycles") ?? Infinity);
   const interval = Number(str(f, "interval") ?? rt.cfg.poll_seconds) * 1000;
-  let gatePaused = false;
+  let gateAlerted = false;
   try {
     for (let i = 0; i < cycles && !stopping; i++) {
       if (tg) for (const c of await tg.pollCommands()) await tg.send("info", router.handleCommand(c));
       if (mode === "live") {
+        // Re-evaluated EVERY cycle and enforced in the executors themselves
+        // (entries + bridge sends refused), so /resume cannot bypass it.
         const b = blockers();
-        if (b.length && !gatePaused) {
-          router.handleCommand({ cmd: "/pause", args: [] });
-          gatePaused = true;
-          await notifier.send("critical", `live gate closed (${b.join("; ")}): new entries paused, exits continue. Re-run verify, then /resume.`);
-        } else if (!b.length && gatePaused) gatePaused = false;
+        gate.reason = b.length ? `live gate closed: ${b.join("; ")}` : null;
+        if (gate.reason && !gateAlerted) {
+          gateAlerted = true;
+          await notifier.send("critical", `${gate.reason}. Entries and bridge sends are refused; exits continue. Re-run verify (same config) to reopen.`);
+        } else if (!gate.reason && gateAlerted) {
+          gateAlerted = false;
+          await notifier.send("info", "live gate open again");
+        }
+        if (i % 10 === 0) await reconcile(rt, store, notifier);
       }
       try {
         const r = await router.cycle();
@@ -314,7 +331,7 @@ async function cmdRun(rt: Runtime, f: Flags): Promise<number> {
         await notifier.send("critical", `cycle crashed: ${(e as Error).message}`);
       }
       try {
-        const lines = await rt.keeper.run();
+        const lines = gate.reason ? [] : await rt.keeper.run();
         if (lines.length) await notifier.send("info", `rewards:\n${lines.join("\n")}`);
       } catch (e) {
         await notifier.send("warn", `reward keeper failed: ${(e as Error).message}`);
@@ -352,7 +369,10 @@ async function main(): Promise<number> {
   const { raw, cfg, missingEnv } = loadLiveConfig(str(flags, "config") ?? "config/live.yaml");
   if (missingEnv.length && cmd !== "verify") console.error(`warning: unset environment variables: ${missingEnv.join(", ")}`);
   let store: FileStore | undefined;
-  const rt = await buildRuntime(cfg, raw, { positions: () => (store ??= new FileStore(join(cfg.state_dir, "state.json"), join(cfg.state_dir, "journal.jsonl"), 0)).load().positions });
+  const rt = await buildRuntime(cfg, raw, {
+    positions: () => (store ??= new FileStore(join(cfg.state_dir, "state.json"), join(cfg.state_dir, "journal.jsonl"), 0)).load().positions,
+    entriesAllowed: () => gate.reason,
+  });
   switch (cmd) {
     case "verify":
       return cmdVerify(rt, missingEnv);
@@ -367,7 +387,19 @@ async function main(): Promise<number> {
     case "status":
       return cmdStatus(rt);
     case "rewards": {
-      for (const l of await rt.keeper.run(true)) console.log(l);
+      if (cfg.mode === "live") {
+        const b = liveBlockers({ stamp: readStamp(join(cfg.state_dir, "verify-stamp.json")), configHash: rt.hash, nowMs: Date.now(), maxAgeDays: cfg.verify_max_age_days, modeIsLive: true, env: process.env });
+        if (b.length) {
+          console.error("live gate closed:\n  - " + b.join("\n  - "));
+          return 1;
+        }
+      }
+      const release = takeLock(cfg.state_dir);
+      try {
+        for (const l of await rt.keeper.run(true)) console.log(l);
+      } finally {
+        release();
+      }
       return 0;
     }
     default:

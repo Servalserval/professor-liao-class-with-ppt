@@ -513,6 +513,7 @@ class MockAave {
         }
         case "repay": {
           const r = this.res(a[0] as string);
+          if (r.paused) throw new Error("RESERVE_PAUSED");
           const debt = this.bal(this.vBal, r.asset);
           const amt = (a[1] as bigint) === MAX_UINT256 ? debt : (a[1] as bigint) < debt ? (a[1] as bigint) : debt;
           if (this.bal(this.allowance, r.asset) < amt) throw new Error("ERC20: insufficient allowance");
@@ -754,25 +755,38 @@ class MockAave {
 
 const USDT0 = A(0x2001);
 const USDE = A(0x2002);
+const USDC = A(0x2003);
 
 function makeMarket(): MockAave {
   const m = new MockAave();
   m.reserves = [
     { asset: USDT0, symbol: "USDT0", decimals: 6, id: 0, aToken: A(0x3001), vToken: A(0x3002), price: 100_000_000n, baseLtv: 7500, lt: 7800, borrowing: true, frozen: false, paused: false, otherSupply: 50_000_000n * 10n ** 6n, otherDebt: 30_000_000n * 10n ** 6n, eModeCategoryId: 1 },
     { asset: USDE, symbol: "USDe", decimals: 18, id: 1, aToken: A(0x3003), vToken: A(0x3004), price: 99_950_000n, baseLtv: 0, lt: 7500, borrowing: true, frozen: false, paused: false, otherSupply: 20_000_000n * 10n ** 18n, otherDebt: 1_000_000n * 10n ** 18n, eModeCategoryId: 1 },
+    { asset: USDC, symbol: "USDC", decimals: 6, id: 2, aToken: A(0x3005), vToken: A(0x3006), price: 100_000_000n, baseLtv: 7500, lt: 7800, borrowing: true, frozen: false, paused: false, otherSupply: 50_000_000n * 10n ** 6n, otherDebt: 30_000_000n * 10n ** 6n, eModeCategoryId: 0 },
   ];
   m.emodes = [
     { id: 1, ltv: 9000, lt: 9300, label: "USDe / USDT0", coll: 0b10n, borrow: 0b01n, ltvzero: 0n },
     { id: 2, ltv: 9100, lt: 9300, label: "USDe / USDT0,USDe", coll: 0b10n, borrow: 0b11n, ltvzero: 0n },
     { id: 3, ltv: 9500, lt: 9700, label: "ltv0", coll: 0b10n, borrow: 0b01n, ltvzero: 0b10n },
   ];
-  m.wallet.set(lc(USDT0), 100_000n * 10n ** 6n);
+  m.wallet.set(lc(USDC), 100_000n * 10n ** 6n);
   m.wallet.set(lc(USDE), 100_000n * 10n ** 18n);
   return m;
 }
 
+/** Signed-but-unsent txs of the mock wallet (sendTx signs locally, then sendRawTransaction). */
+const signed = new Map<string, { to: Address; data: Hex }>();
+let signCounter = 0;
+
 function makeClient(state: { m: MockAave }, opts: { simulateCalls: boolean }) {
   const client: Record<string, unknown> = {
+    sendRawTransaction: async (a: { serializedTransaction: Hex }) => {
+      const tx = signed.get(a.serializedTransaction);
+      if (!tx) throw new Error("unknown raw tx");
+      state.m.apply(tx.to, tx.data);
+      return "0xabc";
+    },
+    getTransaction: async () => null,
     readContract: async (a: { address: Address; functionName: string; args?: readonly unknown[] }) => state.m.read(a.address, a.functionName, a.args),
     multicall: async (a: { contracts: { address: Address; functionName: string; args?: readonly unknown[] }[] }) =>
       a.contracts.map((c) => {
@@ -814,18 +828,28 @@ class MockSwapper implements SwapAdapter {
   readonly id = "mock-swap";
   readonly chain = "plasma";
   costBps = 2;
+  /** Size-dependent cost (bps) by USD notional; overrides costBps. */
+  costAtUsd?: (usd: number) => number;
+  /** Throw from quote() (aggregator rejecting the route). */
+  throwQuote?: (from: AssetRef, usd: number) => boolean;
+  /** Called after a successful live swap. */
+  onSwap?: () => void;
   fail = false;
   swaps = 0;
   constructor(private readonly state: { m: MockAave }) {}
   async quote(from: AssetRef, to: AssetRef, amountIn: bigint): Promise<SwapQuote> {
     const pf = this.state.m.res(from.address).price;
     const pt = this.state.m.res(to.address).price;
-    const out = (amountIn * pf * 10n ** BigInt(to.decimals) * BigInt(10_000 - this.costBps)) / (pt * 10n ** BigInt(from.decimals) * 10_000n);
-    return { amountIn, amountOut: out, costBps: this.costBps, route: "mock", validUntilMs: Date.now() + 30_000 };
+    const usd = (toHuman(amountIn, from.decimals) * Number(pf)) / 1e8;
+    if (this.throwQuote?.(from, usd)) throw new Error("aggregator: route rejected");
+    const bps = this.costAtUsd ? this.costAtUsd(usd) : this.costBps;
+    const out = (amountIn * pf * 10n ** BigInt(to.decimals) * BigInt(10_000 - bps)) / (pt * 10n ** BigInt(from.decimals) * 10_000n);
+    return { amountIn, amountOut: out, costBps: bps, route: "mock", validUntilMs: Date.now() + 30_000 };
   }
   async swap(q: SwapQuote, from: AssetRef, to: AssetRef, ctx: LiveContext) {
     if (ctx.dryRun) return { ok: true, txs: [{ chain: "plasma", description: "swap", simulated: true }] };
     if (this.fail) return { ok: false, txs: [], detail: "mock swap failure" };
+    this.onSwap?.();
     this.state.m.add(this.state.m.wallet, from.address, -q.amountIn);
     this.state.m.add(this.state.m.wallet, to.address, q.amountOut);
     this.swaps++;
@@ -835,9 +859,10 @@ class MockSwapper implements SwapAdapter {
 
 const usdt0: AssetRef = { chain: "plasma", symbol: "USDT0", address: USDT0, decimals: 6 };
 const usde: AssetRef = { chain: "plasma", symbol: "USDe", address: USDE, decimals: 18 };
+const usdc: AssetRef = { chain: "plasma", symbol: "USDC", address: USDC, decimals: 6 };
 const market: AaveMarketConfig = { protocol: "aave-v3", chain: "plasma", pool: POOL, poolAddressesProvider: PROVIDER, uiPoolDataProvider: UI };
 const pairs: AavePairConfig[] = [
-  { pairId: "USDT0/USDT0", collateral: usdt0, debt: usdt0 },
+  { pairId: "USDC/USDC", collateral: usdc, debt: usdc },
   { pairId: "USDe/USDT0", collateral: usde, debt: usdt0 },
 ];
 const ctx = (dryRun: boolean): LiveContext => ({
@@ -854,9 +879,11 @@ function setup(opts: { simulateCalls?: boolean; extra?: boolean; layout?: UiLayo
   const publicClient = makeClient(state, { simulateCalls: opts.simulateCalls ?? true });
   const walletClient = {
     account: { address: ME },
-    sendTransaction: async (a: { to: Address; data: Hex }) => {
-      state.m.apply(a.to, a.data);
-      return "0xabc" as Hex;
+    prepareTransactionRequest: async (a: { to: Address; data: Hex }) => a,
+    signTransaction: async (a: { to: Address; data: Hex }) => {
+      const raw = `0x${(++signCounter).toString(16).padStart(64, "0")}` as Hex;
+      signed.set(raw, { to: a.to, data: a.data });
+      return raw;
     },
   } as unknown as WalletClient;
   const env: EvmEnv = { chain: "plasma", viemChain: viemChainFor("plasma", "http://127.0.0.1:1"), publicClient, walletClient, account: ME, lock: new Mutex() };
@@ -897,7 +924,7 @@ describe("AaveV3Adapter (mock chain)", () => {
     const { state, adapter } = setup();
     const out = await adapter.markets();
     assert.equal(out.length, 2);
-    const same = out.find((p) => p.pairId === "USDT0/USDT0")!;
+    const same = out.find((p) => p.pairId === "USDC/USDC")!;
     const pair = out.find((p) => p.pairId === "USDe/USDT0")!;
     assert.equal(same.maxLtv, 0.75);
     assert.equal(same.collateral, same.debt);
@@ -950,21 +977,21 @@ describe("AaveV3Adapter (mock chain)", () => {
       assert.equal(d.layout, l);
       assert.equal(d.reserves[1]!.symbol, "USDe");
       assert.equal(d.reserves[1]!.decimals, 18);
-      assert.equal(decodeUiReservesData(m.uiData(), l).reserves.length, 2);
+      assert.equal(decodeUiReservesData(m.uiData(), l).reserves.length, 3);
     }
     assert.throws(() => detectUiReservesData(m.uiData(), [USDE]), /no known layout/);
   });
 
   it("open dry-run: whole same-asset loop simulated in one eth_simulateV1 batch; state untouched", async () => {
     const { state, adapter } = setup();
-    const before = state.m.bal(state.m.wallet, USDT0);
-    const r = await adapter.open("USDT0/USDT0", 1_000n * 10n ** 6n, 0.7, ctx(true));
+    const before = state.m.bal(state.m.wallet, USDC);
+    const r = await adapter.open("USDC/USDC", 1_000n * 10n ** 6n, 0.7, ctx(true));
     assert.equal(r.ok, true, r.detail);
     assert.ok(r.txs.length > 10);
     assert.ok(r.txs.every((t) => t.simulated));
     assert.match(r.detail!, /eth_simulateV1/);
-    assert.equal(state.m.bal(state.m.wallet, USDT0), before);
-    assert.equal(state.m.bal(state.m.aBal, USDT0), 0n);
+    assert.equal(state.m.bal(state.m.wallet, USDC), before);
+    assert.equal(state.m.bal(state.m.aBal, USDC), 0n);
   });
 
   it("open dry-run without eth_simulateV1: only step 1, plan in detail", async () => {
@@ -979,7 +1006,7 @@ describe("AaveV3Adapter (mock chain)", () => {
 
   it("open refuses targetLtv > 0.95 x LTV and frozen markets", async () => {
     const { state, adapter } = setup();
-    const r = await adapter.open("USDT0/USDT0", 1_000n * 10n ** 6n, 0.72, ctx(true));
+    const r = await adapter.open("USDC/USDC", 1_000n * 10n ** 6n, 0.72, ctx(true));
     assert.equal(r.ok, false);
     assert.match(r.detail!, /0.95 x LTV 0.75/);
     state.m.reserves[1]!.frozen = true;
@@ -995,12 +1022,12 @@ describe("AaveV3Adapter (mock chain)", () => {
     const usdeSupply = q("USDe", "supply");
     assert.equal(usdeSupply.length, 1);
     assert.deepEqual(usdeSupply[0], { protocol: "aave-v3", chain: "plasma", asset: usde, side: "supply", marketId: state.m.res(USDE).aToken });
-    // borrow side of USDT0 (pair debt leg and same-asset loop) -> variableDebtToken
-    const usdtBorrow = q("USDT0", "borrow");
-    assert.ok(usdtBorrow.length >= 1);
-    for (const x of usdtBorrow) assert.equal(x.marketId, state.m.res(USDT0).vToken);
-    // same-asset loop supply side -> USDT0 aToken
-    assert.deepEqual(q("USDT0", "supply").map((x) => x.marketId), [state.m.res(USDT0).aToken]);
+    // borrow side of the pair debt leg -> USDT0 variableDebtToken
+    assert.deepEqual(q("USDT0", "borrow").map((x) => x.marketId), [state.m.res(USDT0).vToken]);
+    assert.equal(q("USDT0", "supply").length, 0);
+    // same-asset loop: one market, both sides
+    assert.deepEqual(q("USDC", "supply").map((x) => x.marketId), [state.m.res(USDC).aToken]);
+    assert.deepEqual(q("USDC", "borrow").map((x) => x.marketId), [state.m.res(USDC).vToken]);
     for (const x of queries) assert.ok(x.marketId, "every query has a marketId");
     // the receipt-matched campaign reaches the collateral leg
     const pair = out.find((p) => p.pairId === "USDe/USDT0")!;
@@ -1010,27 +1037,28 @@ describe("AaveV3Adapter (mock chain)", () => {
   it("live same-asset loop: LTV never above target; close x1 = repayWithATokens(max) + withdraw(max)", async () => {
     const { state, adapter, logs } = setup();
     const t = 0.7;
-    const r = await adapter.open("USDT0/USDT0", 1_000n * 10n ** 6n, t, ctx(false));
+    const r = await adapter.open("USDC/USDC", 1_000n * 10n ** 6n, t, ctx(false));
     assert.equal(r.ok, true, r.detail);
     // 8 iterations capped at the target cannot reach 0.7 (geometric): shortfall is reported
     assert.match(r.detail!, /BELOW TARGET \(iteration cap 8\): achieved LTV 0\.6\d+ \/ leverage 3\.\d+x vs target LTV 0\.7 \/ 3\.33x/);
     assert.ok(logs.some((l) => l.level === "warn" && l.msg.includes("BELOW TARGET")));
     assert.ok(maxTrace(state.m) <= t + 1e-9, `max ltv ${maxTrace(state.m)}`);
-    const pos = (await adapter.position("USDT0/USDT0"))!;
+    const pos = (await adapter.position("USDC/USDC"))!;
     assert.ok(pos.ltv > 0.6 && pos.ltv <= t);
     assert.ok(Math.abs(pos.equityUsd - 1000) < 1e-6);
     assert.ok(pos.healthFactor! > 1);
 
-    const dl = await adapter.deleverage("USDT0/USDT0", 0.3, ctx(false));
+    const dl = await adapter.deleverage("USDC/USDC", 0.3, ctx(false));
     assert.equal(dl.ok, true, dl.detail);
     assert.equal(dl.txs.length, 1);
-    assert.ok((await adapter.position("USDT0/USDT0"))!.ltv <= 0.3);
+    assert.ok((await adapter.position("USDC/USDC"))!.ltv <= 0.3);
 
-    const c = await adapter.close("USDT0/USDT0", 1, ctx(false));
+    const c = await adapter.close("USDC/USDC", 1, ctx(false));
     assert.equal(c.ok, true, c.detail);
     assert.equal(c.txs.length, 2);
-    assert.equal(await adapter.position("USDT0/USDT0"), null);
-    assert.equal(state.m.bal(state.m.wallet, USDT0), 100_000n * 10n ** 6n);
+    assert.equal(await adapter.position("USDC/USDC"), null);
+    assert.equal(state.m.bal(state.m.wallet, USDC), 100_000n * 10n ** 6n);
+    assert.equal(state.m.bal(state.m.allowance, USDC), 0n);
   });
 
   it("live USDe -> USDT0 loop and full unwind through the swapper", async () => {
@@ -1065,7 +1093,9 @@ describe("AaveV3Adapter (mock chain)", () => {
     const got = toHuman(state.m.bal(state.m.wallet, USDE), 18) - 90_000;
     assert.ok(got > 9_950 && got <= 10_000, `got ${got}`);
     // repay buffer sold back: no meaningful USDT0 left over
-    assert.ok(state.m.bal(state.m.wallet, USDT0) - 100_000n * 10n ** 6n < 1_000_000n);
+    assert.ok(state.m.bal(state.m.wallet, USDT0) < 1_000_000n);
+    assert.equal(state.m.bal(state.m.allowance, USDT0), 0n);
+    assert.equal(state.m.bal(state.m.allowance, USDE), 0n);
   });
 
   it("swap failure during open rolls the borrow back", async () => {
@@ -1105,14 +1135,14 @@ describe("AaveV3Adapter (mock chain)", () => {
 
   it("simulateClose: false when a reserve is paused; dry-run close batches both steps", async () => {
     const { state, adapter } = setup();
-    assert.equal((await adapter.open("USDT0/USDT0", 1_000n * 10n ** 6n, 0.7, ctx(false))).ok, true);
-    const dry = await adapter.close("USDT0/USDT0", 1, ctx(true));
+    assert.equal((await adapter.open("USDC/USDC", 1_000n * 10n ** 6n, 0.7, ctx(false))).ok, true);
+    const dry = await adapter.close("USDC/USDC", 1, ctx(true));
     assert.equal(dry.ok, true, dry.detail);
     assert.equal(dry.txs.length, 2);
-    assert.ok(state.m.bal(state.m.aBal, USDT0) > 0n);
-    assert.equal(await adapter.simulateClose("USDT0/USDT0", ctx(false)), true);
-    state.m.reserves[0]!.paused = true;
-    assert.equal(await adapter.simulateClose("USDT0/USDT0", ctx(false)), false);
+    assert.ok(state.m.bal(state.m.aBal, USDC) > 0n);
+    assert.equal(await adapter.simulateClose("USDC/USDC", ctx(false)), true);
+    state.m.reserves[2]!.paused = true;
+    assert.equal(await adapter.simulateClose("USDC/USDC", ctx(false)), false);
   });
 
   it("claimRewards claims through the RewardsController", async () => {
@@ -1165,5 +1195,155 @@ describe("aave address book helpers", () => {
     const u = aaveAssetFromAddressBook("AaveV3Plasma", "USDe");
     assert.equal(u.decimals, 18);
     assert.equal(u.chain, "plasma");
+  });
+});
+
+describe("AaveV3Adapter review fixes: rollbacks, stuck unwinds, swap depth", () => {
+  const P = { priceRatio: 1, collateralDecimals: 18, debtDecimals: 6, swapCostFrac: 0.0002, ceilingLtv: 0.93 / 1.04, minWithdraw: 10n ** 18n };
+
+  it("unwindStep: ceiling below the minimum step is stuck, not done (LTV goal and debt goal)", () => {
+    // LTV 0.8939, ceiling 0.89423: wMax ~0.03 units < minWithdraw 1 unit
+    const S = 100n * 10n ** 18n;
+    const D = 89_390_000n;
+    for (const goal of [{ targetLtv: 0.5 }, { targetDebt: 0n }]) {
+      const st = unwindStep(S, D, goal, P);
+      assert.equal(st.done, false, Object.keys(goal)[0]);
+      assert.equal(st.stuck, true, Object.keys(goal)[0]);
+    }
+    // already at target (within float tolerance) -> done
+    assert.equal(unwindStep(S, 50_000_000n, { targetLtv: 0.5 }, P).done, true);
+    // dust remainder that fits under the ceiling -> one minimum step
+    const dust = unwindStep(S, 50_000_100n, { targetLtv: 0.5 }, P);
+    assert.equal(dust.withdraw, 10n ** 18n);
+  });
+
+  it("construction refuses two pairs of one market sharing an asset", () => {
+    const { adapter } = setup();
+    const env = (adapter as unknown as { env: EvmEnv }).env;
+    const swapper = new MockSwapper({ m: makeMarket() });
+    assert.throws(
+      () =>
+        new AaveV3Adapter({
+          env,
+          market,
+          swapper,
+          pairs: [
+            { pairId: "USDT0/USDT0", collateral: usdt0, debt: usdt0 },
+            { pairId: "USDe/USDT0", collateral: usde, debt: usdt0 },
+          ],
+        }),
+      /share asset/
+    );
+  });
+
+  it("open: entry swap budget (50 bps) applies; quote rejection mid-loop repays that borrow", async () => {
+    const { state, adapter, swapper } = setup();
+    swapper.costAtUsd = () => 60;
+    const r0 = await adapter.open("USDe/USDT0", 1_000n * 10n ** 18n, 0.8, ctx(false));
+    assert.equal(r0.ok, false);
+    assert.match(r0.detail!, /60\.0 bps > 50/);
+    assert.equal(state.m.bal(state.m.aBal, USDE), 0n);
+
+    swapper.costAtUsd = undefined;
+    let quotes = 0;
+    swapper.throwQuote = (from) => from.symbol === "USDT0" && ++quotes === 4; // 1 planning quote + 2 swaps ok, 3rd swap rejected
+    const r = await adapter.open("USDe/USDT0", 1_000n * 10n ** 18n, 0.8, ctx(false));
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /route rejected.*borrow rolled back: repaid/);
+    assert.equal(state.m.bal(state.m.wallet, USDT0), 0n, "no idle debt asset left");
+    const pos = (await adapter.position("USDe/USDT0"))!;
+    assert.ok(pos.ltv > 0.5 && pos.ltv <= 0.8, `ltv ${pos.ltv}`);
+    assert.equal(state.m.bal(state.m.allowance, USDE), 0n);
+  });
+
+  it("open: supply failure after the swap swaps back and repays the borrow", async () => {
+    const { state, adapter, swapper } = setup();
+    swapper.onSwap = () => {
+      if (swapper.swaps === 0) state.m.reserves[1]!.frozen = true; // collateral frozen between the first swap and its supply
+    };
+    const r = await adapter.open("USDe/USDT0", 1_000n * 10n ** 18n, 0.8, ctx(false));
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /RESERVE_FROZEN.*swapped .* back.*repaid/);
+    // only the round-trip swap cost (2 x 2 bps of the ~800 USDT0 borrow) remains as debt
+    assert.ok(state.m.bal(state.m.vBal, USDT0) < 1_000_000n, `debt left ${state.m.bal(state.m.vBal, USDT0)}`);
+    assert.equal(state.m.bal(state.m.aBal, USDE), 1_000n * 10n ** 18n);
+    assert.ok(state.m.bal(state.m.wallet, USDT0) < 1_000n);
+  });
+
+  it("unwind: quote rejection after the withdraw re-supplies the collateral", async () => {
+    const { state, adapter, swapper } = setup();
+    assert.equal((await adapter.open("USDe/USDT0", 10_000n * 10n ** 18n, 0.86, ctx(false))).ok, true);
+    const before = (await adapter.position("USDe/USDT0"))!;
+    const S0 = state.m.bal(state.m.aBal, USDE);
+    const D0 = state.m.bal(state.m.vBal, USDT0);
+    // planning quote (before any withdraw) must pass: allow it, then reject the live swap quote
+    let n = 0;
+    swapper.throwQuote = (from) => from.symbol === "USDe" && ++n >= 2;
+    const r = await adapter.close("USDe/USDT0", 1, ctx(false));
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /route rejected.*re-supplied/);
+    assert.equal(state.m.bal(state.m.aBal, USDE), S0);
+    assert.equal(state.m.bal(state.m.vBal, USDT0), D0);
+    const after = (await adapter.position("USDe/USDT0"))!;
+    assert.ok(Math.abs(after.ltv - before.ltv) < 1e-9);
+  });
+
+  it("unwind: repay failure after the swap buys the collateral back and re-supplies it", async () => {
+    const { state, adapter, swapper } = setup();
+    assert.equal((await adapter.open("USDe/USDT0", 10_000n * 10n ** 18n, 0.86, ctx(false))).ok, true);
+    const D0 = state.m.bal(state.m.vBal, USDT0);
+    const ltv0 = (await adapter.position("USDe/USDT0"))!.ltv;
+    const swapsBefore = swapper.swaps;
+    swapper.onSwap = () => {
+      if (swapper.swaps === swapsBefore) state.m.reserves[0]!.paused = true; // debt reserve paused between swap and repay
+    };
+    const r = await adapter.close("USDe/USDT0", 1, ctx(false));
+    // paused debt reserve: the swap-back works, the re-supply of USDe works, repay is impossible
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /RESERVE_PAUSED.*swapped .* back.*re-supplied/);
+    assert.equal(state.m.bal(state.m.vBal, USDT0), D0);
+    const ltv1 = (await adapter.position("USDe/USDT0"))!.ltv;
+    assert.ok(ltv1 - ltv0 < 0.001, `ltv ${ltv0} -> ${ltv1}`);
+  });
+
+  it("deleverage near the ceiling: stuck without wallet funds, repays from the wallet first otherwise", async () => {
+    const { state, adapter } = setup();
+    assert.equal((await adapter.open("USDe/USDT0", 10_000n * 10n ** 18n, 0.86, ctx(false))).ok, true);
+    const ltv = (await adapter.position("USDe/USDT0"))!.ltv;
+    // USDe oracle drops until LTV = 0.925 (HF 1.005): above both the 1.04 and the emergency 1.01 ceilings
+    state.m.reserves[1]!.price = BigInt(Math.floor((99_950_000 * ltv) / 0.925));
+    const stuck = await adapter.deleverage("USDe/USDT0", 0.5, ctx(false));
+    assert.equal(stuck.ok, false);
+    assert.match(stuck.detail!, /stuck/);
+    assert.equal(stuck.txs.length, 0);
+
+    state.m.wallet.set(lc(USDT0), 10_000n * 10n ** 6n);
+    const r = await adapter.deleverage("USDe/USDT0", 0.5, ctx(false));
+    assert.equal(r.ok, true, r.detail);
+    assert.match(r.detail!, /already in the wallet/);
+    assert.ok((await adapter.position("USDe/USDT0"))!.ltv <= 0.5 + 1e-9);
+    assert.equal(state.m.bal(state.m.wallet, USDT0), 0n);
+  });
+
+  it("swap depth: interpolated between the last passing and first failing probe; NaN when a quote errors", async () => {
+    const { adapter, swapper } = setup();
+    // 2 bps up to 100k, 60 bps at 1M; limit = min(50 bps entry, 2 + 30 bps slippage) = 32 bps
+    swapper.costAtUsd = (usd) => (usd > 500_000 ? 60 : 2);
+    let pair = (await adapter.markets()).find((p) => p.pairId === "USDe/USDT0")!;
+    const expected = 100_000 + 900_000 * ((0.0032 - 0.0002) / (0.006 - 0.0002));
+    assert.ok(Math.abs(pair.swapDepthUsd - expected) < 50, `depth ${pair.swapDepthUsd} vs ${expected}`);
+    assert.equal(pair.swapCostFrac, 0.0002);
+
+    const b = setup();
+    b.swapper.throwQuote = (_from, usd) => usd > 500_000;
+    pair = (await b.adapter.markets()).find((p) => p.pairId === "USDe/USDT0")!;
+    assert.ok(Number.isNaN(pair.swapDepthUsd));
+    assert.equal(pair.swapCostFrac, 0.0002);
+    assert.match(b.adapter.diagnostics("USDe/USDT0")!.swap!.error!, /quote at \$1000000 failed/);
+
+    const c = setup();
+    c.swapper.costAtUsd = () => 70; // even the smallest probe is over the 50 bps entry budget
+    pair = (await c.adapter.markets()).find((p) => p.pairId === "USDe/USDT0")!;
+    assert.equal(pair.swapDepthUsd, 0);
   });
 });

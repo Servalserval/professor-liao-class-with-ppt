@@ -61,6 +61,30 @@ export interface TxRecord {
   description: string;
   gasUsd?: number;
   simulated: boolean;
+  /** Executed / accepted but final confirmation was not observed in time. Track it by `id`. */
+  unconfirmed?: boolean;
+  /** EVM: the nonce the tx was signed with (a tx can never land once the account nonce has passed it). */
+  nonce?: number;
+}
+
+/**
+ * Thrown after a transaction was SIGNED and handed to the network but its
+ * fate is unknown (RPC timeout / 5xx on submit, receipt wait timeout). The
+ * id (hash / digest) is known BEFORE submission, so callers can track it.
+ * Never treat this as "nothing happened": re-read state, or report the id.
+ */
+export class BroadcastUnconfirmedError extends Error {
+  constructor(
+    readonly chain: string,
+    readonly id: string,
+    readonly description: string,
+    cause: string,
+    /** EVM: nonce of the signed tx (see TxRecord.nonce). */
+    readonly nonce?: number
+  ) {
+    super(`${chain}: "${description}" submitted as ${id} but not confirmed: ${cause}`);
+    this.name = "BroadcastUnconfirmedError";
+  }
 }
 
 export interface LiveResult {

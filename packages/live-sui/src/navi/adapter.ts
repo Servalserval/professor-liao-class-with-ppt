@@ -221,6 +221,8 @@ export class NaviAdapter implements LendingAdapter {
   private readonly flashFeeMargin: number;
   private readonly coinMeta = new Map<string, { symbol: string; decimals: number } | null>();
   private readonly info = new Map<string, NaviPairInfo>();
+  /** Last successfully probed swap cost per pair (fallback when a probe fails). */
+  private readonly lastSwapCost = new Map<string, number>();
 
   constructor(opts: NaviAdapterOptions) {
     this.env = opts.env;
@@ -492,11 +494,24 @@ export class NaviAdapter implements LendingAdapter {
     };
   }
 
+  /**
+   * Quote the probe ladder (smallest first, stop once over budget). Throws only when
+   * the smallest probe fails (depth unknown). If a larger probe fails after smaller
+   * ones succeeded, the depth measured so far is returned as a lower bound.
+   */
   private async probeSwap(ps: PairState): Promise<{ costFrac: number; depthUsd: number }> {
     const results: { usd: number; costBps: number }[] = [];
     for (const usd of this.probeUsd) {
       const amountIn = toUnits(usd / ps.debtPrice, ps.cfg.debt.decimals);
-      const q = await this.swapper!.quote(ps.debtType, ps.collType, amountIn);
+      let q: PtbSwapQuote;
+      try {
+        q = await this.swapper!.quote(ps.debtType, ps.collType, amountIn);
+        if (!Number.isFinite(q.costBps)) throw new Error(`non-finite costBps ${q.costBps}`);
+      } catch (e) {
+        if (!results.length) throw e;
+        this.log("warn", `navi: swap probe $${usd} failed for ${ps.cfg.pairId}; depth reported as lower bound`, { error: errMsg(e) });
+        break;
+      }
       results.push({ usd, costBps: Math.max(0, q.costBps) });
       if (q.costBps > this.depthBudgetBps) break;
     }
@@ -542,11 +557,14 @@ export class NaviAdapter implements LendingAdapter {
       try {
         const s = await this.probeSwap(ps);
         swapCostFrac = s.costFrac;
-        swapDepthUsd = s.depthUsd;
+        swapDepthUsd = s.depthUsd; // 0 only when probes succeeded and none fit the budget
+        this.lastSwapCost.set(pairId, s.costFrac);
       } catch (e) {
-        this.log("warn", `navi: swap probe failed for ${pairId}`, { error: errMsg(e) });
-        swapCostFrac = 1;
-        swapDepthUsd = 0;
+        // Unknown, not zero: NaN tells the core to use its last known depth / treat as missing
+        // data (0 would read as "no exit capacity" and force an urgent exit).
+        swapDepthUsd = NaN;
+        swapCostFrac = this.lastSwapCost.get(pairId) ?? this.depthBudgetBps / 1e4;
+        this.log("warn", `navi: swap probe failed for ${pairId}; swapDepthUsd=NaN, swapCostFrac=${swapCostFrac}`, { error: errMsg(e) });
       }
     }
 

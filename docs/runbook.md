@@ -144,7 +144,7 @@ npm run live -- run --config config/live.yaml
 - 模擬失敗：告警，該動作視為失敗。
 
 要確認的事：
-- journal（`state/live/journal.jsonl`）裡沒有反覆失敗的模擬。
+- journal（`state/shadow/journal.jsonl`）裡沒有反覆失敗的模擬。
 - Telegram 能收到告警，`/status` 有回應。
 - 獎勵讀數和網頁一致。特別要確認 Suilend 穩定幣對 obligation 的獎勵資格，以及 Merkl 活動類型。
 - 跨鏈規劃的成本估計合理，沒有出現「搬運成本 > 一天收益」卻被執行的情況（程式會擋，這裡是再確認一次）。
@@ -153,8 +153,12 @@ npm run live -- run --config config/live.yaml
 
 ```yaml
 mode: live
+state_dir: state/live      # 一定要換新的目錄：shadow 的 paper 部位和轉帳不能混進實盤帳本
 canary: { max_position_usd: 2000, max_total_deployed_usd: 10000 }
 ```
+
+同一個 `state_dir` 只能用一種模式（目錄裡的 `mode.json` 會記錄），混用時 runner 會拒絕啟動。
+**錢包必須是 bot 專用的**：live 模式每 10 輪會比對鏈上部位，設定裡的市場若有 router 不知道的部位，會自動接手管理並發 critical 告警。
 
 ```bash
 npm run live -- verify --config config/live.yaml
@@ -205,6 +209,16 @@ LIVE_CONFIRM=yes npm run live -- run --config config/live.yaml
 
 Ethena Liquid Leverage 發的 aUSDe 本身就是抵押品，不會被賣掉。要立刻跑一次：`npm run live -- rewards`。
 
+### live gate 關閉時
+
+stamp 過期時，bot 會自動切到「只出不進」：
+- 停止新進場和新的跨鏈搬運。
+- 出場、去槓桿、脫鉤出場、熔斷照常運作。
+- 每一輪都重新檢查 gate，`/resume` 繞不過去。
+- 重新 `verify`（設定不變）後自動恢復。
+
+設定改了、verify 有問題、或沒設 `LIVE_CONFIRM=yes`，runner 都會拒絕以 live 啟動。
+
 ### 例行檢查（每天）
 
 1. `/status`。
@@ -221,7 +235,7 @@ Ethena Liquid Leverage 發的 aUSDe 本身就是抵押品，不會被賣掉。�
 | 協議被駭、暫停、凍結 | `/exitall`。若協議已暫停，出場會一直重試；同時到協議 Discord 或治理論壇確認狀況 |
 | USDe 或其他穩定幣脫鉤 | bot 在 0.3% 告警、1% 自動出場；換匯滑價大時分段出場，必要時 `/pause` 後人工判斷 |
 | 鏈停擺（例如 Sui 2026-05 的 6.7 小時） | bot 會因為資料過期而不進場；恢復後檢查健康度 |
-| 跨鏈轉帳卡住 | bot 不會自動重送。拿 `status` 裡的 tx hash 到區塊瀏覽器查。CCTP 可查 Iris `/v2/messages/{domain}?transactionHash=`，必要時用 `/v2/reattest/{nonce}`；LayerZero 用 layerzeroscan |
+| 跨鏈轉帳卡住 | bot 不會自動重送。確認結果後用 `/transfer <id> arrived|failed|refunded [usd]` 結案。拿 `status` 裡的 tx hash 到區塊瀏覽器查。CCTP 可查 Iris `/v2/messages/{domain}?transactionHash=`，必要時用 `/v2/reattest/{nonce}`；LayerZero 用 layerzeroscan |
 | 價格 API（DefiLlama）失聯 | 價格過期即拒絕進場；部位改用協議價格，並告警 |
 | 金鑰疑似外洩 | 立刻 `/exitall` → 把錢轉到新錢包 → 換金鑰 → 重新 verify |
 

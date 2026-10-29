@@ -19,7 +19,7 @@ import {
 } from "../src/cctp/index.js";
 import { bytes32ToEvmAddress, evmAddressToBytes32, suiAddressToBytes32 } from "../src/common.js";
 import { staticBridgeChecks } from "../src/glue/index.js";
-import { mockCtx, mockEvm, mockFetch, mockSui } from "./mocks.js";
+import { mockCtx, mockEvm, mockFetch, mockHash, mockSui } from "./mocks.js";
 
 const ME: Hex = "0x1111111111111111111111111111111111111111";
 const SUI_ME = "0x" + "ab".repeat(32);
@@ -171,7 +171,7 @@ describe("CctpV2Adapter", () => {
     const d = decodeFunctionData({ abi: tokenMessengerV2Abi, data: dep.data });
     assert.equal(d.functionName, "depositForBurn");
     assert.deepEqual(d.args, [1_000_000_000n, 6, evmAddressToBytes32(ME), getAddress(USDC_ARB.address), zeroHash, 168_000n, 1000]);
-    assert.match(res.handle!, /^cctp_v2_fast:arbitrum:base:0x[0-9a-f]{64}:1000000000$/);
+    assert.match(res.handle!, /^cctp_v2_fast:arbitrum:base:0x[0-9a-f]{64}:1000000000:\d+$/);
   });
 
   it("send(): standard uses threshold 2000 and maxFee 0", async () => {
@@ -289,12 +289,12 @@ describe("CCTP on Sui", () => {
   });
 
   it("sui -> arbitrum send (standard) executes the burn PTB and queries Iris by base58 digest", async () => {
-    const { adapter, sui, f } = setup("standard");
+    const { adapter, sui, f, clock } = setup("standard");
     sui.balance = 10_000_000n;
     const res = await adapter.send(USDC_SUI, USDC_ARB, 5_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
     assert.equal(sui.executed.length, 1);
-    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}:5000000`);
+    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}:5000000:${clock.t}`);
     assert.ok(f.urls.some((u) => u.endsWith("/v2/burn/USDC/fees/8/3")));
     await adapter.status(res.handle!, mockCtx());
     assert.ok(f.urls.some((u) => u.includes(`/v2/messages/8?transactionHash=${sui.digest}`)));
@@ -379,8 +379,9 @@ describe("CCTP send/status robustness", () => {
     const res = await adapter.send(USDC_ARB, USDC_BASE, 5_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
     assert.equal(arb.sent.length, 1);
-    assert.match(res.handle!, /^cctp_v2_standard:arbitrum:base:0x0{63}1:5000000$/);
+    assert.equal(res.handle, `cctp_v2_standard:arbitrum:base:${mockHash(1)}:5000000:${Date.UTC(2026, 9, 29)}`);
     assert.match(res.detail!, /confirmation pending/);
+    assert.equal(res.txs.at(-1)!.unconfirmed, true);
   });
 
   it("burn reverted on-chain -> ok:false (nothing left the wallet)", async () => {
@@ -449,5 +450,76 @@ describe("CCTP send/status robustness", () => {
     sui.nonceUsed = false;
     assert.deepEqual(await adapter.status("cctp_v2_standard:arbitrum:sui:0x" + "cd".repeat(32), mockCtx()), { state: "pending" });
     assert.ok(f.requests.some((r) => r.startsWith("POST") && r.includes("/v2/reattest/")));
+  });
+});
+
+describe("CCTP unconfirmed broadcasts (BroadcastUnconfirmedError)", () => {
+  it("definitive submit rejection -> ok:false; the pre-submit 'signed' log is not taken as a broadcast", async () => {
+    const { adapter, arb } = setup("standard");
+    arb.setRead("allowance", () => 10n ** 12n);
+    arb.submitError = "nonce too low";
+    const res = await adapter.send(USDC_ARB, USDC_BASE, 5_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, false);
+    assert.match(res.detail!, /submit rejected/);
+  });
+
+  it("ambiguous submit error -> ok:true; tx unknown to the node for > 15 min -> failed with full refund", async () => {
+    const { adapter, arb, clock } = setup("standard");
+    arb.setRead("allowance", () => 10n ** 12n);
+    arb.submitError = "fetch failed: 502 Bad Gateway";
+    const res = await adapter.send(USDC_ARB, USDC_BASE, 5_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, true, res.detail);
+    assert.equal(res.handle, `cctp_v2_standard:arbitrum:base:${mockHash(1)}:5000000:${clock.t}`);
+    const early = await adapter.status(res.handle!, mockCtx());
+    assert.equal(early.state, "pending");
+    assert.match((early as { unconfirmed?: string }).unconfirmed!, /not found/);
+    clock.t += 16 * 60_000;
+    const late = await adapter.status(res.handle!, mockCtx());
+    assert.equal(late.state, "failed");
+    assert.equal((late as { refunded?: bigint }).refunded, 5_000_000n);
+    assert.match((late as { detail: string }).detail, /never landed/);
+  });
+
+  it("ambiguous submit error but the tx is in the mempool -> tracked, never refunded", async () => {
+    const { adapter, arb, clock } = setup("standard");
+    arb.setRead("allowance", () => 10n ** 12n);
+    arb.submitError = "request timed out";
+    arb.submitAccepted = true;
+    arb.receiptWait = "timeout";
+    const res = await adapter.send(USDC_ARB, USDC_BASE, 5_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, true, res.detail);
+    clock.t += 60 * 60_000;
+    const st = await adapter.status(res.handle!, mockCtx());
+    assert.equal(st.state, "pending");
+    assert.match((st as { unconfirmed?: string }).unconfirmed!, /not mined yet/);
+  });
+
+  it("Sui: execute transport error -> ok:true; digest unknown for > 15 min -> refunded; failed effects -> ok:false", async () => {
+    const { adapter, sui, clock } = setup("standard");
+    sui.balance = 10_000_000n;
+    sui.executeError = "socket hang up";
+    const res = await adapter.send(USDC_SUI, USDC_ARB, 5_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, true, res.detail);
+    assert.equal(res.handle, `cctp_v2_standard:sui:arbitrum:${sui.digest}:5000000:${clock.t}`);
+    clock.t += 16 * 60_000;
+    const st = await adapter.status(res.handle!, mockCtx());
+    assert.equal(st.state, "failed");
+    assert.equal((st as { refunded?: bigint }).refunded, 5_000_000n);
+
+    const b = setup("standard");
+    b.sui.balance = 10_000_000n;
+    b.sui.executeFailed = true;
+    assert.equal((await b.adapter.send(USDC_SUI, USDC_ARB, 5_000_000n, ME, mockCtx(false))).ok, false);
+  });
+
+  it("Sui: checkpoint wait timeout -> record unconfirmed, ok:true with a handle", async () => {
+    const { adapter, sui } = setup("standard");
+    sui.balance = 10_000_000n;
+    sui.waitTimeout = true;
+    const res = await adapter.send(USDC_SUI, USDC_ARB, 5_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, true, res.detail);
+    assert.ok(res.handle);
+    assert.equal(res.txs.at(-1)!.unconfirmed, true);
+    assert.match(res.detail!, /confirmation pending/);
   });
 });

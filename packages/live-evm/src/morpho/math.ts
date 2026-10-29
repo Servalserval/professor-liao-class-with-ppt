@@ -200,6 +200,8 @@ export interface PlanParams {
   borrowLiquidity?: bigint;
   /** Oversell on a full repay so the swap output covers debt + slippage + accrual, bps. */
   sellBufferBps?: number;
+  /** planLoopSteps: stop once LTV >= target - this (borrows never exceed the target, so it is approached geometrically). */
+  ltvTolerance?: number;
 }
 
 export interface LoopPlan {
@@ -230,9 +232,12 @@ const minB = (...xs: bigint[]) => xs.reduce((a, b) => (b < a ? b : a));
  * supplyCollateral until LTV reaches `targetLtv` (or `maxIterations`).
  *
  * Final debt Dt solving Dt / (V + (Dt - D)(1-c)) = t:   Dt = (tV - t(1-c)D) / (1 - t(1-c)).
- * Each iteration borrows min(Dt - D, stepCap*V - D, liquidity). The cap
- * shrinks by s(1-c) per step but never below (s - t)V_final, so with t < s the
- * target is reached in finitely many iterations (about 7 for t=0.80, s=0.87).
+ * Each iteration borrows min(Dt - D, min(t, stepCap)*V - D, liquidity), so the
+ * LTV right after ANY borrow (before the swap output is re-supplied) never
+ * exceeds the target: a failed swap leaves the position at <= targetLtv.
+ * The price is slower convergence: the remaining debt shrinks by t(1-c) per
+ * iteration (t=0.80: ~12 iterations to get within 1pp, ~16 within 0.5pp),
+ * hence `ltvTolerance` and the maxIterations cap.
  */
 export function planLoopSteps(state: LoopState, addCollateral: bigint, targetLtv: number, p: PlanParams): LoopPlan {
   const { s, c } = checkParams(p);
@@ -252,12 +257,14 @@ export function planLoopSteps(state: LoopState, addCollateral: bigint, targetLtv
   let liquidity = p.borrowLiquidity ?? MathLib.MAX_UINT_256;
 
   let it = 0;
-  // A remainder below `dust` counts as reached only once there is some debt
-  // (a position that could not borrow at all has not reached its target).
-  const done = () => D >= target || (D > 0n && target - D <= dust);
+  // A remainder below `dust` (or within ltvTolerance) counts as reached only
+  // once there is some debt (a position that could not borrow has not).
+  const tol = p.ltvTolerance ?? 0;
+  const done = () => D >= target || (D > 0n && (target - D <= dust || oracleLtv(C, D, p.price) >= targetLtv - tol));
   let reached = done();
+  const capW = t < s ? t : s;
   while (!reached && it < p.maxIterations) {
-    const capDebt = MathLib.wMulDown(s, collateralValue(C, p.price));
+    const capDebt = MathLib.wMulDown(capW, collateralValue(C, p.price));
     if (capDebt <= D) break;
     const b = minB(target - D, capDebt - D, liquidity);
     if (b === 0n || b <= dust) break;

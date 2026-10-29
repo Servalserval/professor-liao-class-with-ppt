@@ -45,7 +45,7 @@ import {
   type SuiEnv,
 } from "@incentive-router/live-sui";
 import { AaveV4Adapter } from "@incentive-router/live-aave-v4";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
 import { BucketReader } from "./balances.js";
@@ -57,6 +57,7 @@ import { PairRegistry, type PairWiring } from "./pairs.js";
 import { PriceFeed } from "./prices.js";
 import { RewardKeeper } from "./rewardKeeper.js";
 import { ShadowBridgeExecutor } from "./shadowBridge.js";
+import { ModalPtbSwapper, ModalSwapAdapter, SwapModeSwitch } from "./swapMode.js";
 import { SwapRouteAdapter } from "./swapRoute.js";
 
 export interface Runtime {
@@ -86,6 +87,8 @@ export interface Runtime {
 export interface BuildOptions {
   /** Positions currently in the router store (for the canary guard). */
   positions: () => { oppId: string; equityUsd: number }[];
+  /** Live gate: entries and bridge sends are refused while this returns a reason (exits always run). */
+  entriesAllowed?: () => string | null;
   log?: Logger;
   now?: () => number;
   env?: NodeJS.ProcessEnv;
@@ -134,9 +137,32 @@ export function routerConfigFor(cfg: LiveConfig): RouterConfig {
   return applyCanaryToRouterConfig(loadConfig(cfg.router_config), cfg.canary);
 }
 
-export function liveConfigHash(raw: unknown, cfg: LiveConfig): string {
+/** Commit the code runs from (reads .git directly; "unknown" outside a checkout). */
+export function codeVersion(start = process.cwd()): string {
+  try {
+    let dir = start;
+    for (let i = 0; i < 6 && !existsSync(join(dir, ".git")); i++) dir = join(dir, "..");
+    const head = readFileSync(join(dir, ".git", "HEAD"), "utf8").trim();
+    if (!head.startsWith("ref:")) return head;
+    const ref = head.slice(4).trim();
+    const loose = join(dir, ".git", ref);
+    if (existsSync(loose)) return readFileSync(loose, "utf8").trim();
+    const packed = readFileSync(join(dir, ".git", "packed-refs"), "utf8").split("\n").find((l) => l.endsWith(` ${ref}`));
+    return packed?.split(" ")[0] ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * What the live gate pins: the raw live config (pre env expansion, so RPC key
+ * rotation does not force a re-verify), the router config, the EXPANDED wallet
+ * addresses, every resolved asset address, and the code commit. Changing any
+ * of these requires a new `verify`.
+ */
+export function liveConfigHash(raw: unknown, cfg: LiveConfig, assets?: Record<string, Record<string, AssetRef>>): string {
   const routerRaw = parse(readFileSync(cfg.router_config, "utf8")) as unknown;
-  return configHash({ live: raw, router: routerRaw });
+  return configHash({ live: raw, router: routerRaw, wallets: cfg.wallets, assets: assets ?? null, mode: cfg.mode, code: codeVersion() });
 }
 
 export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOptions): Promise<Runtime> {
@@ -144,13 +170,13 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
   const env = o.env ?? process.env;
   const now = o.now ?? (() => Date.now());
   const routerCfg = routerConfigFor(cfg);
-  const hash = liveConfigHash(raw, cfg);
   const verifiers: Verifier[] = [];
 
   // --- assets -----------------------------------------------------------------
   const assets: Record<string, Record<string, AssetRef>> = {};
   for (const [chain, m] of Object.entries(cfg.assets ?? {}))
     for (const [symbol, a] of Object.entries(m)) (assets[chain] ??= {})[symbol] = resolveAsset(chain, symbol, a);
+  const hash = liveConfigHash(raw, cfg, assets);
   const asset = (chain: string, symbol: string): AssetRef => {
     const a = assets[chain]?.[symbol];
     if (!a) throw new Error(`asset ${chain}:${symbol} is not in config assets`);
@@ -173,8 +199,9 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
   };
 
   // --- chain envs -----------------------------------------------------------------
-  const evmKey = loadSecret("EVM_PRIVATE_KEY", env);
-  const suiKey = loadSecret("SUI_PRIVATE_KEY", env);
+  // Shadow mode never loads keys: nothing can be signed, whatever an adapter does.
+  const evmKey = cfg.mode === "live" ? loadSecret("EVM_PRIVATE_KEY", env) : undefined;
+  const suiKey = cfg.mode === "live" ? loadSecret("SUI_PRIVATE_KEY", env) : undefined;
   const evm: Record<string, EvmEnv> = {};
   let sui: SuiEnv | undefined;
   for (const [chain, c] of Object.entries(cfg.chains ?? {})) {
@@ -224,31 +251,43 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
   }
 
   // --- swappers -------------------------------------------------------------------
+  // `swappers` (strict max_cost_bps): reward sales + funding swap hops.
+  // `lendingSwappers` / `suiPtbSwapper`: modal entry(strict) / exit(loose) for
+  // loop legs, so an exit stays possible when a depeg makes swaps expensive.
+  const swapMode = new SwapModeSwitch();
   const swappers: Record<string, SwapAdapter> = {};
+  const lendingSwappers: Record<string, SwapAdapter> = {};
   let suiPtbSwapper: PtbSwapper | undefined;
   for (const [chain, s] of Object.entries(cfg.swaps ?? {})) {
     const opt = (s.options ?? {}) as Record<string, unknown>;
     const maxCostBps = Number(opt.max_cost_bps ?? opt.maxCostBps ?? 15);
+    const exitCostBps = Number(opt.exit_max_cost_bps ?? 200);
     if (s.type === "aggregator") {
-      const sw = new AggregatorSwapAdapter(evmEnv(chain), { chain, maxCostBps, ...(opt.aggregator_options as object) });
-      swappers[chain] = sw;
-      verifiers.push({ id: `swap:${chain}`, run: async () => issuesOf(await sw.verifyConfig()) });
+      const mk = (bps: number, id?: string) => new AggregatorSwapAdapter(evmEnv(chain), { chain, maxCostBps: bps, id, ...(opt.aggregator_options as object) });
+      const strict = mk(maxCostBps);
+      swappers[chain] = strict;
+      lendingSwappers[chain] = new ModalSwapAdapter(swapMode, strict, mk(exitCostBps, `aggregator:${chain}:exit`));
+      verifiers.push({ id: `swap:${chain}`, run: async () => issuesOf(await strict.verifyConfig()) });
     } else if (s.type === "cetus") {
       const e = suiEnv();
       const decimals = coinDecimalsFromChain(e);
       const suiAssets = Object.values(assets.sui ?? {});
-      const ptb = new CetusPtbSwapper({
-        aggregator: createCetusAggregatorClient(e, { apiKey: env.CETUS_API_KEY }),
-        refPriceUsd: async (coinType) => {
-          const a = suiAssets.find((x) => x.address === coinType);
-          return prices.priceUsd(a ?? { chain: "sui", symbol: coinType, address: coinType, decimals: await decimals(coinType) });
-        },
-        decimals,
-        maxCostBps,
-        maxHops: opt.max_hops !== undefined ? Number(opt.max_hops) : undefined,
-      });
-      suiPtbSwapper = ptb;
-      swappers[chain] = new CetusSwapAdapter({ env: e, swapper: ptb });
+      const aggregator = createCetusAggregatorClient(e, { apiKey: env.CETUS_API_KEY });
+      const mk = (bps: number) =>
+        new CetusPtbSwapper({
+          aggregator,
+          refPriceUsd: async (coinType) => {
+            const a = suiAssets.find((x) => x.address === coinType);
+            return prices.priceUsd(a ?? { chain: "sui", symbol: coinType, address: coinType, decimals: await decimals(coinType) });
+          },
+          decimals,
+          maxCostBps: bps,
+          maxHops: opt.max_hops !== undefined ? Number(opt.max_hops) : undefined,
+        });
+      const strict = mk(maxCostBps);
+      suiPtbSwapper = new ModalPtbSwapper(swapMode, strict, mk(exitCostBps));
+      swappers[chain] = new CetusSwapAdapter({ env: e, swapper: strict });
+      lendingSwappers[chain] = swappers[chain]!;
     } else throw new Error(`swaps.${chain}: unknown type ${s.type}`);
   }
 
@@ -285,7 +324,7 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
     const adapter = makeLendingAdapter(l, wiring, opt, {
       evmEnv,
       suiEnv,
-      swappers,
+      swappers: lendingSwappers,
       suiPtbSwapper,
       extraRewards,
       priceUsd: (a) => prices.priceUsd(a),
@@ -306,8 +345,8 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
   const sellCfg = ((cfg.rewards as { sell?: Record<string, string[]> } | undefined)?.sell ?? {}) as Record<string, string[]>;
   const rewardAssets: Record<string, Record<string, AssetRef>> = {};
   for (const [chain, syms] of Object.entries(sellCfg)) for (const s of syms) (rewardAssets[chain] ??= {})[s] = asset(chain, s);
-  const loop = new LoopExecutor({ mode, ctx, bind: (id) => registry.bind(id), swappers, rewardAssets, proceedsAsset: cash });
-  const executor = new CanaryExecutor(loop, cfg.canary, () => o.positions() as never);
+  const loop = new LoopExecutor({ mode, ctx, bind: (id) => registry.bind(id), swappers, rewardAssets, proceedsAsset: cash, swapMode });
+  const executor = new CanaryExecutor(loop, cfg.canary, () => o.positions() as never, o.entriesAllowed);
   const executors = Object.fromEntries(sources.map((s) => [s.id, executor as Executor]));
 
   // --- bridges -----------------------------------------------------------------------
@@ -342,7 +381,16 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
   }
   const recipients = recipientsFromEnvs(evm, sui);
   const live = new LiveBridgeExecutor({ adapters: bridgeAdapters, registry: assets, recipients, ctx: { ...ctx, dryRun: mode !== "live" }, balance, now });
-  const bexec: BridgeExecutor = mode === "live" ? live : new ShadowBridgeExecutor(live, now);
+  const inner: BridgeExecutor = mode === "live" ? live : new ShadowBridgeExecutor(live, now);
+  // Starting a new hop is an "entry-like" broadcast: refused while the live gate is closed.
+  const bexec: BridgeExecutor = {
+    send: async (t) => {
+      const why = o.entriesAllowed?.();
+      if (why) return { ok: false, detail: `bridge send refused: ${why}` };
+      return inner.send(t);
+    },
+    poll: (t) => inner.poll(t),
+  };
   const bridges: Record<string, BridgeExecutor> = {};
   for (const a of bridgeAdapters) bridges[a.kind] = bexec;
   if (bridgeAdapters.length)
@@ -381,7 +429,7 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
   for (const [chain, m] of Object.entries(rewardAssets)) sellables[chain] = Object.values(m);
   const keeper = new RewardKeeper({
     mode,
-    ctx,
+    ctx: { ...ctx, dryRun: mode !== "live" },
     claimers,
     lending: lendingForKeeper,
     owner: (chain) => (chainInfo(chain).family === "sui" ? sui?.address : evm[chain]?.account),

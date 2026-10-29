@@ -108,8 +108,15 @@ export function expandEnv(v: unknown, env: NodeJS.ProcessEnv, missing: Set<strin
   return v;
 }
 
+/** Router scope is stablecoins only (same-asset + stable pairs). Extend deliberately. */
+export const STABLE_SYMBOLS = new Set([
+  "USDC", "USDT", "USDT0", "USDt", "USDe", "sUSDe", "GHO", "USDS", "sUSDS", "DAI", "sDAI", "USDsui", "AUSD", "USDC.e", "USDbC",
+  "PYUSD", "RLUSD", "USDG", "frxUSD", "FDUSD", "USD1", "USDtb", "mUSD", "suiUSDT", "wUSDC", "wUSDT", "USDB", "LUSD", "crvUSD",
+]);
+
 export function validateLiveConfig(c: LiveConfig): string[] {
   const e: string[] = [];
+  const allowNonStable = (c as { allow_non_stable?: boolean }).allow_non_stable === true;
   if (c.mode !== "shadow" && c.mode !== "live") e.push(`mode must be shadow|live, got ${String(c.mode)}`);
   for (const [chain, m] of Object.entries(c.assets ?? {}))
     for (const [sym, a] of Object.entries(m ?? {}))
@@ -118,8 +125,11 @@ export function validateLiveConfig(c: LiveConfig): string[] {
   for (const l of c.lending ?? []) {
     if (!c.chains?.[l.chain]) e.push(`lending ${l.type}: chain ${l.chain} has no entry in chains`);
     for (const p of l.pairs ?? []) {
-      for (const sym of [p.collateral, p.debt])
+      for (const sym of [p.collateral, p.debt]) {
         if (!c.assets?.[l.chain]?.[sym]) e.push(`lending ${l.type}@${l.chain} pair ${p.pairId}: asset ${sym} not in assets.${l.chain}`);
+        if (!allowNonStable && !STABLE_SYMBOLS.has(sym))
+          e.push(`lending ${l.type}@${l.chain} pair ${p.pairId}: ${sym} is not a stablecoin (scope is stablecoin loops; set allow_non_stable: true to override)`);
+      }
       if (l.type === "morpho" && !p.marketId) e.push(`morpho pair ${p.pairId}: marketId required`);
     }
   }

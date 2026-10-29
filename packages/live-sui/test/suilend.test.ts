@@ -24,6 +24,7 @@ import {
   rewardsEligible,
   sideRewardRates,
   irmFromConfig,
+  pairSwapDepthUsd,
   borrowCapRemainingUsd,
   depositCapRemainingUsd,
   type LoopPlanInput,
@@ -507,6 +508,30 @@ test("buildLoopPair: rewards emptied when ineligible unless assumeEligible; same
   assert.equal(same.swapCostFrac, 0);
 });
 
+test("pairSwapDepthUsd: unknown depth stays NaN (not 0), known depth is capped by the outflow limit", () => {
+  assert.ok(Number.isNaN(pairSwapDepthUsd(NaN, 4e6)));
+  assert.equal(pairSwapDepthUsd(0, 4e6), 0);
+  assert.equal(pairSwapDepthUsd(1e7, 4e6), 4e6);
+  assert.equal(pairSwapDepthUsd(1e6, 4e6), 1e6);
+  assert.equal(pairSwapDepthUsd(Infinity, 4e6), 4e6);
+  const coll = snap({ raw: USDC_RAW, index: 0, dec: 6, price: 1, available: 50, borrowed: 40, openLtvPct: 77, closeLtvPct: 80 });
+  const debt = snap({ raw: USDSUI_RAW, index: 1, dec: 6, price: 1, available: 50, borrowed: 40, openLtvPct: 70, closeLtvPct: 75 });
+  const p = buildLoopPair({
+    pair: { pairId: "USDC/USDsui", collateral: A_USDC, debt: A_USDSUI },
+    coll,
+    debt,
+    rewards: { collSupply: [], collBorrow: [], debtSupply: [], debtBorrow: [] },
+    ineligibleReason: null,
+    assumeEligible: false,
+    swapCostFrac: 0.01,
+    swapDepthUsd: NaN,
+    rateLimiterRemainingUsd: 4e6,
+    dataAsOfMs: NOW,
+  });
+  assert.ok(Number.isNaN(p.swapDepthUsd));
+  assert.ok(p.debt.borrowCapRemainingUsd! <= 4e6, "outflow limit still reaches the core via borrowCapRemainingUsd");
+});
+
 test("probeSwap / ctokensFor", async () => {
   const swapper = {
     quote: async (_f: string, _t: string, amountIn: bigint) => {
@@ -518,6 +543,10 @@ test("probeSwap / ctokensFor", async () => {
   const pr = await probeSwap(swapper, A_USDC, A_USDSUI, 1, { probeUsd: 10_000, maxUsd: 2_560_000, budgetBps: 20 });
   assert.ok(Math.abs(pr.costBpsAtProbe - 1.2) < 1e-9);
   assert.equal(pr.depthUsd, 640_000); // 640k -> 13.8 bps ok, 2.56M -> 52 bps > 20
+  // probe size above maxUsd still quotes once
+  const one = await probeSwap(swapper, A_USDC, A_USDSUI, 1, { probeUsd: 10_000, maxUsd: 1_000, budgetBps: 20 });
+  assert.ok(Number.isFinite(one.costBpsAtProbe));
+  assert.equal(one.depthUsd, 10_000);
   assert.equal(ctokensFor(1_000_000n, 1.02), BigInt(Math.ceil(1_000_000 / 1.02)) + 1n);
   assert.equal(ctokensFor(1_000_000n, 1.02, 5n), 5n);
 });
@@ -610,7 +639,15 @@ function fakeEnv(simOk = true): SuiEnv {
   };
 }
 
-function makeAdapter(opts: { obligation?: RawObligation | null; assume?: boolean; pairs?: "stable" | "sui"; meta?: Record<string, { decimals: number; symbol: string }> } = {}) {
+function makeAdapter(
+  opts: {
+    obligation?: RawObligation | null;
+    assume?: boolean;
+    pairs?: "stable" | "sui";
+    meta?: Record<string, { decimals: number; symbol: string }>;
+    swapper?: (rec: Rec) => PtbSwapper | undefined;
+  } = {}
+) {
   const rec: Rec = { calls: [], swaps: [] };
   const obligation = opts.obligation === undefined ? obligationFixture() : opts.obligation;
   const pairs =
@@ -622,7 +659,7 @@ function makeAdapter(opts: { obligation?: RawObligation | null; assume?: boolean
     lendingMarket: MARKET,
     lendingMarketType: MARKET_TYPE,
     pairs,
-    swapper: fakeSwapper(rec),
+    swapper: opts.swapper ? opts.swapper(rec) : fakeSwapper(rec),
     assumeRewardsEligible: opts.assume,
     stablecoinCoinTypes: [...STABLES],
     rewardPriceUsd: async (t) => (t === PTS ? 0.5 : undefined),
@@ -673,6 +710,35 @@ test("adapter.markets: stable pair => rewards dropped by default, kept with assu
   assert.ok(k!.collateral.supplyRewards[0]!.apr > 0.4 && k!.collateral.supplyRewards[0]!.apr < 0.5);
   assert.equal(k!.collateral.supplyRewards[0]!.endsAtMs, NOW + 20 * DAY);
   assert.equal(k!.debt.borrowRewards[0]!.token, "PTS");
+});
+
+test("adapter.markets: failed swap probe => swapDepthUsd NaN (unknown); probes over budget => 0 (known)", async () => {
+  const failing = makeAdapter({
+    swapper: (rec) => ({
+      ...fakeSwapper(rec),
+      quote: async () => {
+        throw new Error("aggregator down");
+      },
+    }),
+  });
+  const [p] = await failing.adapter.markets();
+  assert.ok(Number.isNaN(p!.swapDepthUsd));
+  assert.equal(p!.swapCostFrac, 0.01, "fallbackSwapCostBps");
+  const [d] = await failing.adapter.marketDiagnostics();
+  assert.match((d!.swap as { error: string }).error, /aggregator down/);
+
+  const noSwapper = makeAdapter({ swapper: () => undefined });
+  assert.ok(Number.isNaN((await noSwapper.adapter.markets())[0]!.swapDepthUsd));
+
+  const thin = makeAdapter({
+    swapper: (rec) => ({
+      ...fakeSwapper(rec),
+      quote: async (_f, _t, amountIn) => ({ amountIn, amountOut: amountIn / 2n, costBps: 5_000, routeData: null }),
+    }),
+  });
+  const [t] = await thin.adapter.markets();
+  assert.equal(t!.swapDepthUsd, 0, "probes succeeded and showed no depth within budget");
+  assert.equal(t!.swapCostFrac, 0.5);
 });
 
 test("adapter.markets: USDC collateral / SUI debt keeps rewards (no obligation)", async () => {

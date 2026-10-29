@@ -8,7 +8,9 @@
 # Market choice and initial caps: docs/lending-landscape.md §5.
 
 mode: shadow                  # shadow = simulate every tx on-chain, never broadcast | live
-state_dir: state/live
+# One state dir per mode (the runner refuses to mix paper and real books):
+# keep state/shadow for shadow runs and switch to state/live together with mode: live.
+state_dir: state/shadow
 router_config: config/live-router.yaml
 verify_max_age_days: 7
 
@@ -105,14 +107,16 @@ lending:
   #   chain: base
   #   pairs: [{pairId: usde-usdc-915, marketId: "0x...", collateral: USDe, debt: USDC}]
 
-# Same-chain swaps (loop legs, funding hops, reward sales).
+# Same-chain swaps. max_cost_bps: entries, funding hops and reward sales (strict).
+# exit_max_cost_bps: unwinding loops — must stay possible during a depeg, when
+# swaps get expensive (the adapters' own exit checks apply on top).
 swaps:
-  ethereum: {type: aggregator, options: {max_cost_bps: 10}}
-  arbitrum: {type: aggregator, options: {max_cost_bps: 10}}
-  base: {type: aggregator, options: {max_cost_bps: 10}}
-  plasma: {type: aggregator, options: {max_cost_bps: 15}}
-  mantle: {type: aggregator, options: {max_cost_bps: 15}}
-  sui: {type: cetus, options: {max_cost_bps: 15}}
+  ethereum: {type: aggregator, options: {max_cost_bps: 10, exit_max_cost_bps: 200}}
+  arbitrum: {type: aggregator, options: {max_cost_bps: 10, exit_max_cost_bps: 200}}
+  base: {type: aggregator, options: {max_cost_bps: 10, exit_max_cost_bps: 200}}
+  plasma: {type: aggregator, options: {max_cost_bps: 15, exit_max_cost_bps: 200}}
+  mantle: {type: aggregator, options: {max_cost_bps: 15, exit_max_cost_bps: 200}}
+  sui: {type: cetus, options: {max_cost_bps: 15, exit_max_cost_bps: 200}}
 
 # Bridge kinds the router may use (routes themselves are in config/live-router.yaml).
 bridges:

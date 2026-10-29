@@ -300,6 +300,20 @@ describe("scallop mapping", () => {
     const tight = mk(2_050_000); // cash 50k: flash-loan cash binds
     assert.equal(tight.swapDepthUsd, 50_000);
     assert.equal(mk(2_000_000).swapDepthUsd, 0);
+    const unknown = (supplyCoin: number) =>
+      buildScallopLoopPair({
+        pairId: "SUI/USDC",
+        collateral: SUI,
+        debt: USDC,
+        collateralMarket: collMarket(),
+        debtPool: pool({ supplyCoin }),
+        swap: { costFrac: NaN, depthUsd: NaN },
+        boost: 1,
+        extra: { collateral: [], borrow: [] },
+        nowMs: NOW,
+      }).swapDepthUsd;
+    assert.ok(Number.isNaN(unknown(5_000_000)), "failed probe stays NaN through the cash cap");
+    assert.equal(unknown(2_000_000), 0); // ...unless the cash limit is a known 0
     const o = loopPairOpportunity(tight, { cfg: DEFAULT_CONFIG, nowMs: NOW, myEquityByOpp: {} }, "test")!;
     const L = o.meta!.leverage as number;
     const ll = DEFAULT_CONFIG.sources.lending_loop;
@@ -343,7 +357,12 @@ describe("scallop mapping", () => {
 
   it("swap probe summary", () => {
     assert.deepEqual(summarizeSwapProbe([{ sizeUsd: 1e4, costBps: 12 }, { sizeUsd: 1e3, costBps: 5 }, { sizeUsd: 1e5, costBps: 80 }], 30), { costFrac: 0.0005, depthUsd: 1e4 });
-    assert.deepEqual(summarizeSwapProbe([{ sizeUsd: 1e3, costBps: null }], 30), { costFrac: 1, depthUsd: 0 });
+    const failed = summarizeSwapProbe([{ sizeUsd: 1e3, costBps: null }, { sizeUsd: 1e4, costBps: null }], 30);
+    assert.ok(Number.isNaN(failed.costFrac) && Number.isNaN(failed.depthUsd), "all probes failed -> unknown (NaN)");
+    // a failed size is skipped, not treated as zero depth
+    assert.deepEqual(summarizeSwapProbe([{ sizeUsd: 1e3, costBps: null }, { sizeUsd: 1e4, costBps: 12 }, { sizeUsd: 1e5, costBps: 80 }], 30), { costFrac: 0.0012, depthUsd: 1e4 });
+    // probes succeeded but nothing within budget -> a KNOWN 0
+    assert.deepEqual(summarizeSwapProbe([{ sizeUsd: 1e3, costBps: 50 }], 30), { costFrac: 0.005, depthUsd: 0 });
   });
 });
 
@@ -543,6 +562,16 @@ describe("ScallopAdapter", () => {
     assert.match(warnings[0]!, /^warn:.*USDC\/SUI.*no collateral risk model/);
     (w.sdk.query as { getMarketPools: unknown }).getMarketPools = async () => ({ pools: { usdc: pool(), sui: pool() }, collaterals: {} });
     await assert.rejects(a.markets(), /failed for every pair/);
+  });
+
+  it("markets(): quote API down -> swapDepthUsd NaN (unknown), not 0", async () => {
+    const w = fakeWorld();
+    const down: PtbSwapper = { ...w.swapper, quote: async () => Promise.reject(new Error("aggregator 503")) };
+    const [p] = await new ScallopAdapter({ env: w.env, sdk: w.sdk, swapper: down, pairs: [PAIR], now: () => NOW }).markets();
+    assert.ok(Number.isNaN(p!.swapDepthUsd));
+    assert.ok(Number.isNaN(p!.swapCostFrac));
+    const [none] = await new ScallopAdapter({ env: w.env, sdk: w.sdk, pairs: [PAIR], now: () => NOW }).markets();
+    assert.equal(none!.swapDepthUsd, 0); // no swapper configured: known inability, not unknown
   });
 
   it("markets(): veSCA boost only when the obligation is bound", async () => {

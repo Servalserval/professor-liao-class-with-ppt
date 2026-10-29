@@ -14,7 +14,9 @@ import {
   removeDust,
   verifyUsdt0,
 } from "../src/usdt0/index.js";
-import { mockCtx, mockEvm, mockFetch } from "./mocks.js";
+import { mockCtx, mockEvm, mockFetch, mockHash } from "./mocks.js";
+
+const NOW = Date.UTC(2026, 9, 29, 12);
 
 const ME: Hex = "0x1111111111111111111111111111111111111111";
 const D = USDT0_DEPLOYMENTS;
@@ -25,7 +27,7 @@ const USDT0_PLASMA: AssetRef = { chain: "plasma", symbol: "USDT0", address: D.pl
 
 const NATIVE_FEE = 100_000_000_000_000n; // 0.0001 ETH
 
-function setup() {
+function setup(extra: { logChunkBlocks?: bigint; maxLogChunks?: number } = {}) {
   const eth = mockEvm("ethereum", ME);
   const arb = mockEvm("arbitrum", ME);
   const plasma = mockEvm("plasma", ME);
@@ -48,6 +50,8 @@ function setup() {
     envs: { ethereum: eth.env, arbitrum: arb.env, plasma: plasma.env },
     tokens: { ethereum: USDT_ETH },
     fetch: f.fetch,
+    now: () => NOW,
+    ...extra,
   });
   return { eth, arb, plasma, f, adapter };
 }
@@ -131,7 +135,7 @@ describe("Usdt0OftAdapter", () => {
     const { adapter, eth, arb } = setup();
     eth.setRead("allowance", () => 5n); // non-zero -> USDT needs reset to 0 first
     const guid = pad("0xbeef");
-    const sendTxHash = "0x" + "3".padStart(64, "0"); // third tx from the mock wallet
+    const sendTxHash = mockHash(3); // third tx from the mock wallet
     eth.receipts[sendTxHash] = {
       logs: [
         {
@@ -167,7 +171,7 @@ describe("Usdt0OftAdapter", () => {
     assert.equal(p.extraOptions, "0x");
     assert.equal(fee.nativeFee, s.value);
     assert.equal(refund, getAddress(ME));
-    assert.equal(res.handle, `usdt0_oft:ethereum:arbitrum:${sendTxHash}:${guid}:777:2000000:2000000`);
+    assert.equal(res.handle, `usdt0_oft:ethereum:arbitrum:${sendTxHash}:${guid}:777:2000000:2000000:${NOW}`);
   });
 
   it("send(): dry-run with a missing approval simulates the approve only", async () => {
@@ -198,7 +202,8 @@ describe("Usdt0OftAdapter", () => {
     const guid = pad("0xbeef");
     arb.logs = [{ args: { guid, srcEid: 30101, toAddress: ME, amountReceivedLD: 1_999_999n }, transactionHash: pad("0xd5") }];
     const st = await adapter.status(`usdt0_oft:ethereum:arbitrum:${pad("0x01")}:${guid}:777:2000000`, mockCtx());
-    assert.deepEqual(st, { state: "completed", dstTx: pad("0xd5"), received: 1_999_999n });
+    assert.equal(st.state, "completed");
+    assert.deepEqual({ ...st, handle: undefined }, { state: "completed", dstTx: pad("0xd5"), received: 1_999_999n, handle: undefined });
   });
 
   it("status(): falls back to LayerZero Scan for delivered / failed / recoverable / unknown", async () => {
@@ -213,9 +218,11 @@ describe("Usdt0OftAdapter", () => {
     const scanWith = (name: string) =>
       f.route("/messages/tx/", () => ({ status: 200, body: { data: [{ guid, status: { name }, destination: { tx: { txHash: pad("0xee") } } }] } }));
     scanWith("INFLIGHT");
-    assert.deepEqual(await adapter.status(h, ctx), { state: "pending" });
-    scanWith("DELIVERED");
-    assert.deepEqual(await adapter.status(h, ctx), { state: "completed", dstTx: pad("0xee"), received: 2_000_000n });
+    assert.deepEqual({ ...(await adapter.status(h, ctx)), handle: undefined }, { state: "pending", handle: undefined });
+    scanWith("DELIVERED"); // Scan alone is not proof: no OFTReceived found on-chain -> unconfirmed pending
+    const dl = await adapter.status(h, ctx);
+    assert.equal(dl.state, "pending");
+    assert.match((dl as { unconfirmed?: string }).unconfirmed!, /says delivered .* not found on-chain/);
     scanWith("FAILED");
     assert.equal((await adapter.status(h, ctx)).state, "failed");
     scanWith("PAYLOAD_STORED");
@@ -287,14 +294,15 @@ describe("Usdt0OftAdapter send/status robustness", () => {
     arb.receiptWait = "timeout";
     const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
-    assert.equal(res.handle, `usdt0_oft:arbitrum:plasma:0x${"1".padStart(64, "0")}:-:1000:1000000:1000000`);
+    assert.equal(res.handle, `usdt0_oft:arbitrum:plasma:${mockHash(1)}:-:1000:1000000:1000000:${NOW}`);
+    assert.equal(res.txs.at(-1)!.unconfirmed, true);
   });
 
   it("OFTSent lookup failing after a confirmed send still returns ok:true", async () => {
     const { adapter, arb } = setup(); // no receipt registered -> getTransactionReceipt throws
     const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
     assert.equal(res.ok, true, res.detail);
-    assert.match(res.handle!, /:-:1000:1000000:1000000$/);
+    assert.match(res.handle!, new RegExp(`:-:1000:1000000:1000000:${NOW}$`));
     assert.equal(arb.sent.length, 1);
   });
 
@@ -312,7 +320,8 @@ describe("Usdt0OftAdapter send/status robustness", () => {
     arb.receipts[tx] = { logs: [sentLog(D.arbitrum!.oft, guid, 1_000_000n, tx)] };
     plasma.logs = [{ args: { guid, srcEid: 30110, toAddress: ME, amountReceivedLD: 1_000_000n }, transactionHash: pad("0xd6") }];
     const st = await adapter.status(`usdt0_oft:arbitrum:plasma:${tx}:-:1000:1000000:1000000`, mockCtx());
-    assert.deepEqual(st, { state: "completed", dstTx: pad("0xd6"), received: 1_000_000n });
+    assert.deepEqual({ ...st, handle: undefined }, { state: "completed", dstTx: pad("0xd6"), received: 1_000_000n, handle: undefined });
+    assert.equal(st.handle, `usdt0_oft:arbitrum:plasma:${tx}:${guid}:1000:1000000:1000000`); // guid persisted
   });
 
   it("status() with guid '-': reverted source -> failed + refunded; missing receipt -> unconfirmed", async () => {
@@ -326,5 +335,107 @@ describe("Usdt0OftAdapter send/status robustness", () => {
     const st = await adapter.status(h, mockCtx());
     assert.equal(st.state, "failed");
     assert.equal((st as { refunded?: bigint }).refunded, 1_000_000n);
+  });
+});
+
+describe("Usdt0OftAdapter on-chain completion", () => {
+  const guid = pad("0xbeef");
+  const scanDelivered = (f: ReturnType<typeof mockFetch>, dstTx: Hex) =>
+    f.route("/messages/tx/", () => ({ status: 200, body: { data: [{ guid, status: { name: "DELIVERED" }, destination: { tx: { txHash: dstTx } } }] } }));
+
+  it("Scan 'delivered' completes only when the destination receipt holds our OFTReceived", async () => {
+    const { adapter, arb, f } = setup();
+    const dstTx = pad("0xee");
+    scanDelivered(f, dstTx);
+    arb.receipts[dstTx] = {
+      logs: [
+        {
+          address: D.arbitrum!.oft,
+          topics: encodeEventTopics({ abi: oftAbi, eventName: "OFTReceived", args: { guid, toAddress: ME } }),
+          data: encodeAbiParameters([{ type: "uint32" }, { type: "uint256" }], [30101, 1_999_000n]),
+          blockNumber: 1n,
+          transactionHash: dstTx,
+          logIndex: 0,
+          blockHash: pad("0x01"),
+          transactionIndex: 0,
+          removed: false,
+        },
+      ],
+    };
+    const st = await adapter.status(`usdt0_oft:ethereum:arbitrum:${pad("0x01")}:${guid}:777:2000000:2000000`, mockCtx());
+    assert.equal(st.state, "completed");
+    assert.equal((st as { received?: bigint }).received, 1_999_000n);
+
+    // a destination tx for a different guid is not accepted
+    const { adapter: a2, arb: arb2, f: f2 } = setup();
+    scanDelivered(f2, dstTx);
+    arb2.receipts[dstTx] = { logs: [{ ...arb.receipts[dstTx]!.logs[0] as object, topics: encodeEventTopics({ abi: oftAbi, eventName: "OFTReceived", args: { guid: pad("0x01"), toAddress: ME } }) }] };
+    assert.equal((await a2.status(`usdt0_oft:ethereum:arbitrum:${pad("0x01")}:${guid}:777:2000000:2000000`, mockCtx())).state, "pending");
+  });
+
+  it("the log-scan cursor advances in the returned handle and the next poll continues from it", async () => {
+    const { adapter, arb } = setup({ logChunkBlocks: 100n, maxLogChunks: 3 });
+    arb.blockNumber = 10_000n;
+    const h0 = `usdt0_oft:ethereum:arbitrum:${pad("0x01")}:${guid}:1000:2000000:2000000`;
+    const s1 = await adapter.status(h0, mockCtx());
+    assert.deepEqual(arb.logQueries.map((q) => [q.fromBlock, q.toBlock]), [[1000n, 1099n], [1100n, 1199n], [1200n, 1299n]]);
+    assert.equal(s1.handle, `usdt0_oft:ethereum:arbitrum:${pad("0x01")}:${guid}:1300:2000000:2000000`);
+
+    arb.logQueries.length = 0;
+    // even if the router replays the OLD handle, the in-memory cursor keeps us moving forward
+    await adapter.status(h0, mockCtx());
+    assert.equal(arb.logQueries[0]!.fromBlock, 1300n);
+
+    // a fresh adapter (restart) continues from the persisted handle
+    const { adapter: fresh, arb: arb3 } = setup({ logChunkBlocks: 100n, maxLogChunks: 1 });
+    arb3.blockNumber = 10_000n;
+    await fresh.status(s1.handle!, mockCtx());
+    assert.equal(arb3.logQueries[0]!.fromBlock, 1300n);
+  });
+
+  it("a log-scan error never completes from Scan alone", async () => {
+    const { adapter, arb, f } = setup();
+    scanDelivered(f, pad("0xee"));
+    (arb.env.publicClient as unknown as { getLogs: () => Promise<never> }).getLogs = async () => {
+      throw new Error("query returned more than 10000 results");
+    };
+    const st = await adapter.status(`usdt0_oft:ethereum:arbitrum:${pad("0x01")}:${guid}:777:2000000:2000000`, mockCtx());
+    assert.equal(st.state, "pending");
+    assert.match((st as { unconfirmed?: string }).unconfirmed!, /10000 results/);
+  });
+});
+
+describe("Usdt0OftAdapter unconfirmed broadcasts", () => {
+  it("ambiguous submit error -> ok:true; missing for > 15 min -> failed with amountSent refunded", async () => {
+    let now = NOW;
+    const eth = mockEvm("ethereum", ME);
+    const arb = mockEvm("arbitrum", ME);
+    const plasma = mockEvm("plasma", ME);
+    for (const [m, tok] of [
+      [arb, USDT0_ARB.address],
+      [plasma, USDT0_PLASMA.address],
+    ] as const) {
+      m.setRead("balanceOf", () => 10n ** 12n);
+      m.setRead("token", () => getAddress(tok));
+      m.setRead("quoteOFT", (args) => [{ minAmountLD: 1n, maxAmountLD: 10n ** 15n }, [], { amountSentLD: (args[0] as { amountLD: bigint }).amountLD, amountReceivedLD: (args[0] as { amountLD: bigint }).amountLD }]);
+      m.setRead("quoteSend", () => ({ nativeFee: NATIVE_FEE, lzTokenFee: 0n }));
+    }
+    const adapter = new Usdt0OftAdapter({ envs: { ethereum: eth.env, arbitrum: arb.env, plasma: plasma.env }, fetch: mockFetch().fetch, now: () => now });
+    arb.submitError = "HTTP 503";
+    const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, true, res.detail);
+    assert.equal(res.handle, `usdt0_oft:arbitrum:plasma:${mockHash(1)}:-:1000:1000000:1000000:${NOW}`);
+    assert.equal((await adapter.status(res.handle!, mockCtx())).state, "pending");
+    now += 16 * 60_000;
+    const st = await adapter.status(res.handle!, mockCtx());
+    assert.equal(st.state, "failed");
+    assert.equal((st as { refunded?: bigint }).refunded, 1_000_000n);
+  });
+
+  it("definitive submit rejection -> ok:false", async () => {
+    const { adapter, arb } = setup();
+    arb.submitError = "insufficient funds for gas * price + value";
+    const res = await adapter.send(USDT0_ARB, USDT0_PLASMA, 1_000_000n, ME, mockCtx(false));
+    assert.equal(res.ok, false);
   });
 });

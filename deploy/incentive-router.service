@@ -13,6 +13,9 @@ EnvironmentFile=/etc/incentive-router/env
 ExecStart=/usr/bin/node --import tsx packages/live-runner/src/cli.ts run --config config/live.yaml
 Restart=on-failure
 RestartSec=30
+# A 40-tx EVM loop entry can take minutes: let the current cycle finish on stop.
+TimeoutStopSec=900
+KillSignal=SIGTERM
 # A crash loop must not hammer RPCs or re-send anything: the router persists
 # state after every action and never re-sends an in-flight transfer.
 StartLimitIntervalSec=900

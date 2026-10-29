@@ -43,6 +43,10 @@ export interface LoopExecutorDeps {
   rewardAssets: Record<string, Record<string, AssetRef>>;
   /** chain -> stablecoin that reward sales go into (normally the collateral asset). */
   proceedsAsset: Record<string, AssetRef>;
+  /** Entry vs exit swap budgets for the adapters' swappers (see swapMode.ts). */
+  swapMode?: { run<T>(mode: "entry" | "exit", fn: () => Promise<T>): Promise<T> };
+  /** A position read returning null this many times in a row is accepted as "gone" (default 3). */
+  nullMarksBeforeZero?: number;
 }
 
 function summarize(r: LiveResult): string {
@@ -53,13 +57,38 @@ function summarize(r: LiveResult): string {
 export class LoopExecutor implements Executor {
   readonly markToMarket?: (pos: Position, opp?: Opportunity) => Promise<number>;
 
+  private readonly nullMarks = new Map<string, number>();
+
   constructor(private readonly d: LoopExecutorDeps) {
     if (d.mode === "live") {
       this.markToMarket = async (pos: Position) => {
         const b = this.binding(pos.oppId);
         const v = await b.adapter.position(b.pairId);
-        return v ? v.equityUsd : 0;
+        if (v) {
+          this.nullMarks.delete(pos.oppId);
+          return v.equityUsd;
+        }
+        // A lagging indexer / obligation lookup can return "no position" for a
+        // position that exists: a single null must not mark it to $0 (fake
+        // drawdown -> kill switch). Throwing keeps the router's book value.
+        const n = (this.nullMarks.get(pos.oppId) ?? 0) + 1;
+        this.nullMarks.set(pos.oppId, n);
+        if (n < (this.d.nullMarksBeforeZero ?? 3)) throw new Error(`${pos.oppId}: adapter reports no position (${n}x); keeping book value`);
+        return 0;
       };
+    }
+  }
+
+  private entryMode<T>(fn: () => Promise<T>): Promise<T> {
+    return this.d.swapMode ? this.d.swapMode.run("entry", fn) : fn();
+  }
+
+  /** Position read that never throws (used right after broadcasts). */
+  private async safePosition(b: LoopBinding) {
+    try {
+      return { ok: true as const, v: await b.adapter.position(b.pairId) };
+    } catch (e) {
+      return { ok: false as const, err: (e as Error).message };
     }
   }
 
@@ -76,44 +105,56 @@ export class LoopExecutor implements Executor {
   async enter(opp: Opportunity, deltaUsd: number): Promise<ExecResult> {
     const b = this.binding(opp.id);
     const price = await this.d.ctx.priceUsd(b.collateral);
-    const units = usdToUnits(deltaUsd, price, b.collateral.decimals);
+    let units = usdToUnits(deltaUsd, price, b.collateral.decimals);
     const have = await b.adapter.walletBalance(b.collateral);
+    // USD -> units rounding (18-decimal tokens) can ask for a hair more than a
+    // bucket that was itself measured in USD: clamp a <0.1% shortfall.
+    if (have < units && have * 1000n >= units * 999n) units = have;
     if (have < units)
       return { ok: false, detail: `wallet has ${unitsToUsd(have, price, b.collateral.decimals).toFixed(2)} USD of ${b.collateral.symbol} on ${b.collateral.chain}, need ${deltaUsd.toFixed(2)}` };
     const ltv = Number((opp.meta as { ltv?: number } | undefined)?.ltv);
     if (!(ltv > 0 && ltv < 1)) return { ok: false, detail: `opportunity ${opp.id} has no target ltv in meta` };
 
     const before = this.d.mode === "live" ? await b.adapter.position(b.pairId) : null;
+    const spentUsd = unitsToUsd(units, price, b.collateral.decimals);
+    // Book what is on-chain after a broadcast; if the read itself fails, book
+    // the request minus modelled costs (the router's markToMarket corrects it
+    // next cycle) — never "nothing happened" once something was sent.
+    const bookAfter = async (why: string): Promise<ExecResult | null> => {
+      const a = await this.safePosition(b);
+      if (!a.ok) {
+        const est = spentUsd - (spentUsd * opp.costs.entryFrac + opp.costs.fixedEntryUsd);
+        return { ok: true, amountUsd: Math.max(0, est), spentUsd, detail: `${why}; position read failed (${a.err}) — booked estimate $${est.toFixed(2)}, verify on-chain` };
+      }
+      const deployed = (a.v?.equityUsd ?? 0) - (before?.equityUsd ?? 0);
+      if (deployed > Math.max(1, spentUsd * 0.01)) return { ok: true, amountUsd: deployed, spentUsd, detail: `${why}; position grew $${deployed.toFixed(2)}` };
+      return null;
+    };
     let r: LiveResult;
     try {
-      r = await b.adapter.open(b.pairId, units, ltv, this.wctx());
+      r = await this.entryMode(() => b.adapter.open(b.pairId, units, ltv, this.wctx()));
     } catch (e) {
       // A throw can happen AFTER something was broadcast (receipt timeout,
       // a later step failing). Never report "nothing happened" without
       // looking: an untracked on-chain position is worse than a failed entry.
       if (this.d.mode === "shadow") return { ok: false, detail: `shadow: ${(e as Error).message}` };
-      const after = await b.adapter.position(b.pairId).catch(() => null);
-      const deployed = (after?.equityUsd ?? 0) - (before?.equityUsd ?? 0);
-      if (deployed > Math.max(1, deltaUsd * 0.01))
-        return { ok: true, amountUsd: deployed, spentUsd: deltaUsd, detail: `PARTIAL after error (${(e as Error).message}); position grew $${deployed.toFixed(2)} — check LTV` };
-      return { ok: false, detail: `open failed: ${(e as Error).message}` };
+      const booked = await bookAfter(`PARTIAL after error (${(e as Error).message}) — check LTV`);
+      return booked ?? { ok: false, detail: `open failed: ${(e as Error).message}` };
     }
     if (!r.ok) {
       if (this.d.mode === "live" && r.txs.some((t) => !t.simulated && t.id)) {
         // Some steps were broadcast before a later one failed: book what is there.
-        const after = await b.adapter.position(b.pairId).catch(() => null);
-        const deployed = (after?.equityUsd ?? 0) - (before?.equityUsd ?? 0);
-        if (deployed > 0) return { ok: true, amountUsd: deployed, spentUsd: deltaUsd, detail: `PARTIAL: ${summarize(r)}` };
+        const booked = await bookAfter(`PARTIAL: ${summarize(r)}`);
+        if (booked) return booked;
       }
       return { ok: false, detail: summarize(r) };
     }
     if (this.d.mode === "shadow") {
-      const cost = deltaUsd * opp.costs.entryFrac + opp.costs.fixedEntryUsd;
-      return { ok: true, amountUsd: deltaUsd - cost, spentUsd: deltaUsd, detail: `shadow: simulated OK | ${summarize(r)}` };
+      const cost = spentUsd * opp.costs.entryFrac + opp.costs.fixedEntryUsd;
+      return { ok: true, amountUsd: spentUsd - cost, spentUsd, detail: `shadow: simulated OK | ${summarize(r)}` };
     }
-    const after = await b.adapter.position(b.pairId);
-    const deployed = (after?.equityUsd ?? 0) - (before?.equityUsd ?? 0);
-    return { ok: true, amountUsd: Math.max(0, deployed), spentUsd: deltaUsd, detail: summarize(r) };
+    const booked = await bookAfter(summarize(r));
+    return booked ?? { ok: true, amountUsd: 0, spentUsd, detail: `${summarize(r)} | WARNING: no equity increase measured` };
   }
 
   async exit(pos: Position, fraction: number, opp?: Opportunity): Promise<ExecResult> {
@@ -154,6 +195,8 @@ export class LoopExecutor implements Executor {
     // In shadow mode there is no on-chain position to unwind; probing the
     // close of a non-existent position would always fail. Treat as healthy.
     if (this.d.mode === "shadow") return true;
+    // Adapter errors (RPC down) propagate as exceptions — the router counts
+    // those as "unknown", only a `false` (the unwind would revert) as a failure.
     return b.adapter.simulateClose(b.pairId, { ...this.d.ctx, dryRun: true });
   }
 

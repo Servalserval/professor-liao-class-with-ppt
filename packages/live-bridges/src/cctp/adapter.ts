@@ -9,8 +9,14 @@
  * executePtb), always simulated first; dry-run never broadcasts.
  *
  * send() contract (core BridgeExecutor): ok:false only when nothing left the
- * wallet. Once the burn is broadcast we always return ok:true + handle, even if
- * the receipt wait fails (status() then finds the tx via Iris / the receipt).
+ * wallet. Once the burn may have been broadcast (BroadcastUnconfirmedError from
+ * sendTx / executePtb, or an unconfirmed record) we return ok:true + handle and
+ * status() sorts it out: a burn tx that has no receipt and is unknown to the node
+ * for > 15 min is reported failed with the full amount refunded (it never left).
+ * Handle: <kind>:<src>:<dst>:<txHash|digest>:<amount>:<sentAtMs>:<guard>
+ *   guard (see common.ts TxGuard): EVM nonce / Sui gas-coin version. A missing source tx is
+ *   refunded only when the guard proves it can never land; without a guard it stays
+ *   unconfirmed (glue -> stuck for the operator).
  * Expired attestations (expirationBlock, ~24h) are re-attested once via Iris;
  * if that does not help the status turns "recoverable:" (core: stuck).
  */
@@ -20,14 +26,20 @@ import { encodeFunctionData, isAddress, zeroHash, type Address, type Hex } from 
 import { ensureAllowance, erc20Balance, sendTx, type EvmEnv } from "@incentive-router/live-evm-base";
 import { coinBalance, executePtb, normalizeStructTag, normalizeSuiAddress, type SuiEnv } from "@incentive-router/live-sui";
 import {
+  broadcastIdOnError,
   captureBroadcasts,
   decodeHandle,
   encodeHandle,
   errMsg,
   evmAddressToBytes32,
   gasToUsd,
-  isOnChainFailure,
+  isNotFoundError,
+  decodeGuard,
+  encodeGuard,
+  evmNoncePassed,
+  MISSING_TX_REFUND_MS,
   RECOVERABLE,
+  type TxGuard,
   sameEvmAddress,
   suiAddressToBytes32,
   type FetchLike,
@@ -46,7 +58,7 @@ import {
   type CctpEvmContracts,
 } from "./constants.js";
 import { cctpMaxFee, decodeCctpMessage, IrisClient, isAttested, pickFee, receivedFromMessage, type IrisMessage } from "./iris.js";
-import { buildSuiBurnPtb, buildSuiReceivePtb, SUI_CCTP_V2_MAINNET, suiNonceUsed, type SuiCctpConfig } from "./sui.js";
+import { buildSuiBurnPtb, buildSuiReceivePtb, SUI_CCTP_V2_MAINNET, suiNonceUsed, suiObjectAdvanced, suiOwnedRef, type SuiCctpConfig } from "./sui.js";
 
 export type CctpMode = "fast" | "standard";
 
@@ -97,6 +109,10 @@ interface Handle {
   tx: string;
   /** Burned amount (absent in handles from before this field existed). */
   amount?: bigint;
+  /** When send() returned (absent in old handles -> no missing-tx refund). */
+  sentAtMs?: number;
+  /** Replay guard (absent -> never auto-refund). */
+  guard?: TxGuard;
 }
 
 /** Message + causes, so revert reasons nested in viem errors are visible. */
@@ -279,13 +295,14 @@ export class CctpV2Adapter implements BridgeAdapter {
         try {
           rec = await executePtb(sui.env, cap.ctx, tx, desc);
         } catch (e) {
-          const sent = this.afterBroadcastFailure(e, cap.ids, "sui", desc, from.chain, to.chain, amount, txs, ctx);
+          const sent = this.afterBroadcastFailure(e, cap.ids, "sui", desc, from.chain, to.chain, amount, txs, ctx, suiOwnedRef(tx));
           if (sent) return sent;
           throw e;
         }
         txs.push(rec);
         if (ctx.dryRun || !rec.id) return { ok: true, txs, detail: "dry-run: burn PTB simulated" };
-        return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id, amount]) };
+        const guard = encodeGuard(suiOwnedRef(tx));
+        return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id, amount, this.now(), guard]), detail: rec.unconfirmed ? "broadcast; confirmation pending" : undefined };
       }
 
       const env = this.o.envs[from.chain]!;
@@ -309,13 +326,15 @@ export class CctpV2Adapter implements BridgeAdapter {
       try {
         rec = await sendTx(env, cap.ctx, { to: spender, data, description: desc });
       } catch (e) {
-        const sent = this.afterBroadcastFailure(e, cap.ids, from.chain, desc, from.chain, to.chain, amount, txs, ctx);
+        const n = (e as { nonce?: unknown }).nonce;
+        const sent = this.afterBroadcastFailure(e, cap.ids, from.chain, desc, from.chain, to.chain, amount, txs, ctx, typeof n === "number" ? { nonce: n } : undefined);
         if (sent) return sent;
         throw e;
       }
       txs.push(rec);
       if (ctx.dryRun || !rec.id) return { ok: true, txs, detail: "dry-run: depositForBurn simulated" };
-      return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id, amount]) };
+      const guard = encodeGuard(rec.nonce !== undefined ? { nonce: rec.nonce } : undefined);
+      return { ok: true, txs, handle: encodeHandle(this.kind, [from.chain, to.chain, rec.id, amount, this.now(), guard]), detail: rec.unconfirmed ? "broadcast; confirmation pending" : undefined };
     } catch (e) {
       return { ok: false, txs, detail: `${this.kind}: ${errMsg(e)}` };
     }
@@ -334,13 +353,19 @@ export class CctpV2Adapter implements BridgeAdapter {
     dst: string,
     amount: bigint,
     txs: TxRecord[],
-    ctx: LiveContext
+    ctx: LiveContext,
+    guard: TxGuard | undefined
   ): (LiveResult & { handle: string }) | undefined {
-    const id = ids[ids.length - 1];
-    if (!id || isOnChainFailure(e)) return undefined;
-    ctx.log("warn", `${this.kind}: ${description} broadcast as ${id} but confirmation failed; tracking it`, { err: errMsg(e) });
-    txs.push({ chain, id, description, simulated: false });
-    return { ok: true, txs, handle: encodeHandle(this.kind, [src, dst, id, amount]), detail: `broadcast ${id}; confirmation pending (${errMsg(e)})` };
+    const id = broadcastIdOnError(e, ids);
+    if (!id) return undefined;
+    ctx.log("warn", `${this.kind}: ${description} submitted as ${id} but not confirmed; tracking it`, { err: errMsg(e) });
+    txs.push({ chain, id, description, simulated: false, unconfirmed: true, nonce: guard && "nonce" in guard ? guard.nonce : undefined });
+    return {
+      ok: true,
+      txs,
+      handle: encodeHandle(this.kind, [src, dst, id, amount, this.now(), encodeGuard(guard)]),
+      detail: `broadcast ${id}; confirmation pending (${errMsg(e)})`,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -352,8 +377,15 @@ export class CctpV2Adapter implements BridgeAdapter {
   }
 
   private parse(handle: string): Handle {
-    const [src, dst, tx, amount] = decodeHandle(this.kind, handle, 3, 4);
-    return { src: src!, dst: dst!, tx: tx!, amount: amount !== undefined ? BigInt(amount) : undefined };
+    const [src, dst, tx, amount, sentAt, guard] = decodeHandle(this.kind, handle, 3, 6);
+    return {
+      src: src!,
+      dst: dst!,
+      tx: tx!,
+      amount: amount !== undefined ? BigInt(amount) : undefined,
+      sentAtMs: sentAt !== undefined ? Number(sentAt) : undefined,
+      guard: decodeGuard(guard),
+    };
   }
 
   private async fetchMessage(h: Handle): Promise<IrisMessage | undefined> {
@@ -377,19 +409,49 @@ export class CctpV2Adapter implements BridgeAdapter {
     return used > 0n;
   }
 
-  /** "reverted" = the burn tx failed on-chain (nothing left the wallet). */
-  private async sourceTxState(h: Handle): Promise<"ok" | "reverted" | "unknown"> {
-    try {
-      if (h.src === "sui") {
+  /**
+   * "reverted" = failed on-chain, "missing" = no receipt and the node does not know the tx
+   * (both: nothing left the wallet); "pending" = known but not mined; "unknown" = could not tell.
+   */
+  private async sourceTxState(h: Handle): Promise<"ok" | "reverted" | "pending" | "missing" | "unknown"> {
+    if (h.src === "sui") {
+      try {
         const r = await this.o.sui!.env.grpc.core.getTransaction({ digest: h.tx, include: { effects: true } });
         return r.$kind === "FailedTransaction" ? "reverted" : "ok";
+      } catch (e) {
+        return isNotFoundError(e) ? "missing" : "unknown";
       }
-      const env = this.o.envs[h.src];
-      if (!env) return "unknown";
+    }
+    const env = this.o.envs[h.src];
+    if (!env) return "unknown";
+    try {
       const r = await env.publicClient.getTransactionReceipt({ hash: h.tx as Hex });
       return r.status === "reverted" ? "reverted" : "ok";
+    } catch (e) {
+      if (!isNotFoundError(e)) return "unknown";
+    }
+    try {
+      const t = await env.publicClient.getTransaction({ hash: h.tx as Hex });
+      return t ? "pending" : "missing";
+    } catch (e) {
+      return isNotFoundError(e) ? "missing" : "unknown";
+    }
+  }
+
+  /** Proof that a missing source tx can never land, or undefined (stay stuck). */
+  private async canNeverLand(h: Handle): Promise<string | undefined> {
+    const g = h.guard;
+    if (!g) return undefined;
+    try {
+      if ("nonce" in g) {
+        const env = this.o.envs[h.src];
+        if (!env || h.src === "sui") return undefined;
+        return (await evmNoncePassed(env.publicClient, env.account, g.nonce)) ? `account nonce passed ${g.nonce}` : undefined;
+      }
+      if (h.src !== "sui" || !this.o.sui) return undefined;
+      return (await suiObjectAdvanced(this.o.sui.env, g.objectId, g.version)) ? `input ${g.objectId} moved past version ${g.version}` : undefined;
     } catch {
-      return "unknown";
+      return undefined;
     }
   }
 
@@ -448,7 +510,22 @@ export class CctpV2Adapter implements BridgeAdapter {
     if (!m) {
       const src = await this.sourceTxState(h);
       if (src === "reverted") return { state: "failed", detail: `source tx ${h.tx} failed on-chain; nothing was burned`, refunded: h.amount };
-      return { state: "pending", unconfirmed: src === "unknown" ? `source tx ${h.tx} not found; Iris has no message` : `Iris has no message for mined burn ${h.tx}` };
+      if (src === "missing") {
+        const age = h.sentAtMs !== undefined ? this.now() - h.sentAtMs : undefined;
+        if (age !== undefined && age > MISSING_TX_REFUND_MS) {
+          const dead = await this.canNeverLand(h);
+          if (dead)
+            return {
+              state: "failed",
+              detail: `source tx ${h.tx} never landed and can no longer land (${dead}); nothing was burned`,
+              refunded: h.amount,
+            };
+          return { state: "pending", unconfirmed: `source tx ${h.tx} not found for ${Math.round(age / 60_000)} min but could still land (${h.guard ? "guard not passed" : "no replay guard in handle"}); check manually` };
+        }
+        return { state: "pending", unconfirmed: `source tx ${h.tx} not found (no receipt, not in the node's mempool)` };
+      }
+      if (src === "pending") return { state: "pending", unconfirmed: `source tx ${h.tx} not mined yet` };
+      return { state: "pending", unconfirmed: src === "unknown" ? `source tx ${h.tx}: state unknown; Iris has no message` : `Iris has no message for mined burn ${h.tx}` };
     }
     if (!isAttested(m)) return { state: "pending" };
     const d = decodeCctpMessage(m.message);

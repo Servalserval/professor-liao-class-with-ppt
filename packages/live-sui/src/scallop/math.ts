@@ -433,7 +433,8 @@ export interface BuildPairInput {
  *    route draws the pool twice), borrow
  *    rewards = borrow-incentive pools (+ extraRewards side "borrow").
  *  - maxLtv/liqLtv include the debt's borrow weight.
- *  - swapDepthUsd = min(swap depth, debt-pool free cash): every unwind
+ *  - swapDepthUsd = min(swap depth, debt-pool free cash) (NaN = probe failed,
+ *    unknown; still 0 when the pool has no cash): every unwind
  *    flash-borrows the debt from that pool's cash (collateral itself is
  *    segregated and always withdrawable), and the core derives pair exit
  *    capacity from swapDepthUsd/(L-1) — so the flash-loan cash limit binds
@@ -489,7 +490,8 @@ export function buildScallopLoopPair(a: BuildPairInput): LoopPair {
     maxLtv: cm.collateralFactor / bw,
     liqLtv: cm.liquidationFactor / bw,
     swapCostFrac: a.swap.costFrac,
-    swapDepthUsd: Math.min(a.swap.depthUsd, cash * dPrice),
+    // NaN (probe failed = unknown) must stay NaN unless the cash limit is a known 0.
+    swapDepthUsd: cash * dPrice <= 0 ? 0 : Number.isNaN(a.swap.depthUsd) ? NaN : Math.min(a.swap.depthUsd, cash * dPrice),
     dataAsOfMs: a.nowMs,
   };
   if (a.flashFeeFrac !== undefined && Number.isFinite(a.flashFeeFrac)) pair.flashloanFeeFrac = a.flashFeeFrac;
@@ -558,15 +560,23 @@ export function positionFromAccount(acct: ObligationAccountLike, pairId: string,
   return view;
 }
 
-/** Swap probe summary: cost at the smallest size, depth = largest size within maxCostBps (both directions). */
+/**
+ * Swap probe summary. Failed quotes (null) are unknowns, not "no depth":
+ *  - every probe failed -> { costFrac: NaN, depthUsd: NaN } (core convention:
+ *    NaN = unknown, the core keeps its last known value);
+ *  - otherwise cost = cost at the smallest successful size and depth = the
+ *    largest successful size within maxCostBps before the first successful
+ *    size over budget (failed sizes are skipped; cost is monotone in size).
+ */
 export function summarizeSwapProbe(results: { sizeUsd: number; costBps: number | null }[], maxCostBps: number): SwapProbe {
-  const sorted = [...results].sort((x, y) => x.sizeUsd - y.sizeUsd);
-  const first = sorted.find((r) => r.costBps !== null);
-  if (!first || first.costBps === null) return { costFrac: 1, depthUsd: 0 };
+  const ok = results
+    .filter((r): r is { sizeUsd: number; costBps: number } => r.costBps !== null && Number.isFinite(r.costBps))
+    .sort((x, y) => x.sizeUsd - y.sizeUsd);
+  if (!ok.length) return { costFrac: NaN, depthUsd: NaN };
   let depth = 0;
-  for (const r of sorted) {
-    if (r.costBps === null || r.costBps > maxCostBps) break;
+  for (const r of ok) {
+    if (r.costBps > maxCostBps) break;
     depth = r.sizeUsd;
   }
-  return { costFrac: Math.max(0, first.costBps) / 10_000, depthUsd: depth };
+  return { costFrac: Math.max(0, ok[0]!.costBps) / 10_000, depthUsd: depth };
 }

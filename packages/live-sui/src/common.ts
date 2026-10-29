@@ -13,7 +13,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { decodeSuiPrivateKey } from "@mysten/sui/cryptography";
 import { Transaction } from "@mysten/sui/transactions";
 import { normalizeStructTag, normalizeSuiAddress } from "@mysten/sui/utils";
-import type { LiveContext, TxRecord } from "@incentive-router/live-common";
+import { BroadcastUnconfirmedError, type LiveContext, type TxRecord } from "@incentive-router/live-common";
 
 export { Transaction, normalizeStructTag, normalizeSuiAddress };
 
@@ -107,21 +107,38 @@ export async function executePtb(env: SuiEnv, ctx: LiveContext, tx: Transaction,
       return { chain: "sui", description, gasUsd, simulated: true };
     }
     if (!env.keypair) throw new Error(`sui: no signer (read-only env) for "${description}"`);
-    const res = await env.grpc.core.signAndExecuteTransaction({ transaction: tx, signer: env.keypair, include: { effects: true } });
+    // Build + sign locally so the digest is known BEFORE submission: an
+    // execute call that times out may still have been executed.
+    const bytes = await tx.build({ client: env.grpc });
+    const digest = await tx.getDigest({ client: env.grpc });
+    const { signature } = await env.keypair.signTransaction(bytes);
+    ctx.log("info", `sui: signed ${description}`, { digest });
+    let res;
+    try {
+      res = await env.grpc.core.executeTransaction({ transaction: bytes, signatures: [signature], include: { effects: true } });
+    } catch (e) {
+      throw new BroadcastUnconfirmedError("sui", digest, description, `execute error: ${(e as Error).message.split("\n")[0]}`);
+    }
     if (res.$kind === "FailedTransaction") {
       throw new Error(`sui: tx ${res.FailedTransaction.digest} failed on-chain (${description}): ${JSON.stringify(res.FailedTransaction.status)}`);
     }
-    const digest = res.Transaction.digest;
     ctx.log("info", `sui: executed ${description}`, { digest });
-    await env.grpc.core.waitForTransaction({ digest, timeout: 60_000 });
     const realGas = res.Transaction.effects?.gasUsed;
-    return {
+    const rec: TxRecord = {
       chain: "sui",
       id: digest,
       description,
       gasUsd: realGas ? (Number(gasMist(realGas)) / Number(MIST_PER_SUI)) * suiPrice : gasUsd,
       simulated: false,
     };
+    try {
+      await env.grpc.core.waitForTransaction({ digest, timeout: 60_000 });
+    } catch (e) {
+      // Effects already say success; only the checkpoint wait timed out.
+      ctx.log("warn", `sui: ${description} executed (${digest}) but checkpoint wait failed: ${(e as Error).message.split("\n")[0]}`);
+      rec.unconfirmed = true;
+    }
+    return rec;
   });
 }
 
