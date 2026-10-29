@@ -219,7 +219,7 @@ net = raw − haircut − depeg − costs − move        （全部是年化，�
 npx tsx packages/core/src/cli.ts sim examples/scenarios/selection-2026-10-29-whatif-renewal.yaml --why
 ```
 
-- Aave V4 USDC 升到約 4.5–4.9%，Aave V3 Plasma GHO 升到 5.73%，但結果不變：
+- Aave V4 USDC 升到 4.86%，Aave V3 Plasma GHO 升到 5.74%，但結果不變：
   - Aave V4 USDC 還是低於 6.5%。
   - Plasma GHO 卡在 3 bps 換幣成本超過一天收益。
 - **意思是：** 今天單純放貸的超額收益，大部分只能靠「相信補貼會續」才撐得起來。
