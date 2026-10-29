@@ -7,9 +7,21 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 
+/**
+ * One token. Prefer a resolver over a hand-typed address:
+ *  - `aave_book: AaveV3Plasma` (+ `book_symbol` when the book's symbol differs,
+ *    e.g. Arbitrum native USDC is "USDCn") -> address + decimals from
+ *    @bgd-labs/aave-address-book;
+ *  - `usdt0: true` -> the USDT0 token from the live-bridges deployment table
+ *    (docs.usdt0.to, SOURCE comments there).
+ * `verify` reads every asset back on-chain (symbol / decimals) either way.
+ */
 export interface AssetSpec {
-  address: string;
-  decimals: number;
+  address?: string;
+  decimals?: number;
+  aave_book?: string;
+  book_symbol?: string;
+  usdt0?: boolean;
 }
 
 export interface PairSpec {
@@ -52,11 +64,18 @@ export interface LiveConfig {
   lending: LendingSpec[];
   swaps: Record<string, { type: string; options?: Record<string, unknown> }>;
   bridges: Record<string, { enabled: boolean; options?: Record<string, unknown> }>;
-  rewards: { merkl?: { enabled: boolean; options?: Record<string, unknown> } };
+  rewards: {
+    merkl?: { enabled: boolean; options?: Record<string, unknown> };
+    keeper?: { interval_hours?: number; min_claim_usd?: number; min_sell_usd?: number };
+    /** chain -> reward token symbols (from `assets`) to sell into cash_asset */
+    sell?: Record<string, string[]>;
+  };
+  /** Reward-token profiles for the router's realizable-value model (price comes from the feed). */
+  tokens?: Record<string, { chain?: string; vol?: number; depth2pctUsd?: number; trendApr?: number; perpAvailable?: boolean; hedgeCostApr?: number; priceUsd?: number }>;
   limits: { max_gas_usd: Record<string, number>; max_slippage_bps: number; max_loop_iterations: number };
   /** Hard caps on top of the core config while going live. */
   canary: { max_position_usd: number; max_total_deployed_usd: number };
-  prices: { overrides?: Record<string, number>; max_age_minutes?: number };
+  prices: { overrides?: Record<string, number>; max_age_minutes?: number; native_ids?: Record<string, string> };
   poll_seconds: number;
 }
 
@@ -92,6 +111,10 @@ export function expandEnv(v: unknown, env: NodeJS.ProcessEnv, missing: Set<strin
 export function validateLiveConfig(c: LiveConfig): string[] {
   const e: string[] = [];
   if (c.mode !== "shadow" && c.mode !== "live") e.push(`mode must be shadow|live, got ${String(c.mode)}`);
+  for (const [chain, m] of Object.entries(c.assets ?? {}))
+    for (const [sym, a] of Object.entries(m ?? {}))
+      if (!a || (!a.address && !a.aave_book && !a.usdt0)) e.push(`assets.${chain}.${sym}: needs address+decimals, aave_book or usdt0`);
+      else if (a.address && a.decimals === undefined) e.push(`assets.${chain}.${sym}: address without decimals`);
   for (const l of c.lending ?? []) {
     if (!c.chains?.[l.chain]) e.push(`lending ${l.type}: chain ${l.chain} has no entry in chains`);
     for (const p of l.pairs ?? []) {

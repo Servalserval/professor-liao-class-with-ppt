@@ -1,0 +1,91 @@
+# Router config for the LIVE runner (config/live.yaml -> router_config).
+# Only overrides are listed; everything else comes from DEFAULT_CONFIG
+# (packages/core/src/config.ts) — config/default.yaml documents every key.
+# Changing anything here changes the config hash: re-run `verify` before live.
+
+baseline_apr: 0.045            # idle alternative (T-bill / sUSDS)
+hold_horizon_days: 21
+poll_seconds: 60
+
+caps:
+  per_venue_frac_by_tier: {1: 0.40, 2: 0.15, 3: 0.05}
+  per_opportunity_frac: 0.40
+  max_concurrent_positions: 8
+  min_position_usd: 1000
+  max_position_usd: 120000      # the live runner also clamps this to canary.max_position_usd
+  min_idle_frac: 0.05
+
+# Venue ids = LoopPair.protocol reported by each adapter.
+venues:
+  aave-v3:          {enabled: true, tier: 1}
+  aave-v4:          {enabled: true, tier: 2}   # live since Mar 2026; small spoke caps
+  morpho:ethereum:  {enabled: true, tier: 1}
+  morpho:base:      {enabled: true, tier: 1}
+  navi:             {enabled: true, tier: 2, chain: sui}   # Volo vault (subsidiary) key compromise Apr 2026
+  suilend:          {enabled: true, tier: 1, chain: sui}
+  scallop:          {enabled: true, tier: 3, chain: sui}   # $9.5M TVL, Apr 2026 rewards-contract incident
+
+gas_usd: {default: 0.05, ethereum: 0.5, arbitrum: 0.05, base: 0.03, plasma: 0.02, monad: 0.02, mantle: 0.05, avalanche: 0.05, sui: 0.02}
+
+sources:
+  lending_loop:
+    target_ltv: 0.70             # 3.33x; HF = 0.93 / 0.70 = 1.33 on the USDe e-mode (Liquid Leverage needs HF <= 2)
+    max_ltv_frac_of_open: 0.85
+    deleverage_at_ltv: 0.78
+    critical_ltv_frac_of_close: 0.95
+    utilization_warn: 0.90
+    utilization_exit: 0.95
+    footprint: gross
+    # EVM loops are iterative (no custom flash-loan contract): ~5 txs per
+    # iteration x up to 10 iterations. Gas is folded into entry/exit costs.
+    txs_per_entry: 40
+    txs_per_exit: 40
+    depeg_warn: 0.003
+    depeg_exit: 0.01
+
+rewards:
+  tokens:
+    # Ethena Liquid Leverage pays aUSDe / USDe: already collateral, nothing to sell.
+    USDe: {policy: hold, max_hold_usd: 1000000, claim_interval_hours: 168, claim_min_usd: 20}
+
+xchain:
+  enabled: true
+  max_cost_days_of_yield: 1     # one move may cost at most ONE day of the yield it earns where it lands
+  book_daily_budget_days: 1     # all moves in any 24h <= one day of the whole book's yield
+  payback_days: 14
+  min_move_usd: 1000
+  max_in_flight_frac: 0.5
+  stuck_eta_multiple: 4
+  stuck_min_minutes: 60
+  idle_apr: 0
+  # Planning estimates (USD). Live quotes are checked again at send time:
+  # CCTP maxFee from Iris (+20%), USDT0 nativeFee from quoteSend (+10%), swaps
+  # must quote <= feeBps + bridges.swap.options.tolerance_bps.
+  routes:
+    # --- Circle CCTP V2 (USDC), standard = free, attestation ~15-19 min from Eth/L2, seconds from Sui/Plasma/Monad
+    - {id: cctp-std-arb-base, kind: cctp_v2_standard, from: {chain: arbitrum, asset: USDC}, to: {chain: base, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0.05, etaMinutes: 25, enabled: true}
+    - {id: cctp-std-base-arb, kind: cctp_v2_standard, from: {chain: base, asset: USDC}, to: {chain: arbitrum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0.05, etaMinutes: 25, enabled: true}
+    - {id: cctp-std-arb-sui, kind: cctp_v2_standard, from: {chain: arbitrum, asset: USDC}, to: {chain: sui, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0.02, etaMinutes: 25, enabled: true}
+    - {id: cctp-std-sui-arb, kind: cctp_v2_standard, from: {chain: sui, asset: USDC}, to: {chain: arbitrum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0.05, etaMinutes: 3, enabled: true}
+    - {id: cctp-std-eth-arb, kind: cctp_v2_standard, from: {chain: ethereum, asset: USDC}, to: {chain: arbitrum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 4, gasDstUsd: 0.05, etaMinutes: 25, enabled: true}
+    - {id: cctp-std-arb-eth, kind: cctp_v2_standard, from: {chain: arbitrum, asset: USDC}, to: {chain: ethereum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 5, etaMinutes: 25, enabled: true}
+    - {id: cctp-std-arb-avax, kind: cctp_v2_standard, from: {chain: arbitrum, asset: USDC}, to: {chain: avalanche, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0.05, etaMinutes: 25, enabled: false}
+    - {id: cctp-std-avax-arb, kind: cctp_v2_standard, from: {chain: avalanche, asset: USDC}, to: {chain: arbitrum, asset: USDC}, feeBps: 0, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0.05, etaMinutes: 3, enabled: false}
+    # --- USDT0 (LayerZero OFT): 0 bps protocol fee + LayerZero native fee
+    - {id: usdt0-arb-plasma, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: plasma, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 5, enabled: true}
+    - {id: usdt0-plasma-arb, kind: usdt0_oft, from: {chain: plasma, asset: USDT0}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 5, enabled: true}
+    - {id: usdt0-arb-mantle, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: mantle, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 5, enabled: true}
+    - {id: usdt0-mantle-arb, kind: usdt0_oft, from: {chain: mantle, asset: USDT0}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 5, enabled: true}
+    - {id: usdt0-eth-arb, kind: usdt0_oft, from: {chain: ethereum, asset: USDT}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 1.5, gasSrcUsd: 5, gasDstUsd: 0, etaMinutes: 10, enabled: true}
+    - {id: usdt0-arb-eth, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: ethereum, asset: USDT}, feeBps: 0, feeFixedUsd: 2, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 10, enabled: true}
+    - {id: usdt0-arb-monad, kind: usdt0_oft, from: {chain: arbitrum, asset: USDT0}, to: {chain: monad, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.1, gasDstUsd: 0, etaMinutes: 5, enabled: false}
+    - {id: usdt0-monad-arb, kind: usdt0_oft, from: {chain: monad, asset: USDT0}, to: {chain: arbitrum, asset: USDT0}, feeBps: 0, feeFixedUsd: 0.5, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 5, enabled: false}
+    # --- same-chain stable swaps (aggregator / Cetus). feeBps = planning estimate.
+    - {id: swap-arb-usdc-usdt0, kind: swap, from: {chain: arbitrum, asset: USDC}, to: {chain: arbitrum, asset: USDT0}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+    - {id: swap-arb-usdt0-usdc, kind: swap, from: {chain: arbitrum, asset: USDT0}, to: {chain: arbitrum, asset: USDC}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+    - {id: swap-plasma-usdt0-usde, kind: swap, from: {chain: plasma, asset: USDT0}, to: {chain: plasma, asset: USDe}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+    - {id: swap-plasma-usde-usdt0, kind: swap, from: {chain: plasma, asset: USDe}, to: {chain: plasma, asset: USDT0}, feeBps: 3, feeFixedUsd: 0, gasSrcUsd: 0.02, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+    - {id: swap-mantle-usdt0-usde, kind: swap, from: {chain: mantle, asset: USDT0}, to: {chain: mantle, asset: USDe}, feeBps: 4, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+    - {id: swap-mantle-usde-usdt0, kind: swap, from: {chain: mantle, asset: USDe}, to: {chain: mantle, asset: USDT0}, feeBps: 4, feeFixedUsd: 0, gasSrcUsd: 0.05, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+    - {id: swap-eth-usdc-usde, kind: swap, from: {chain: ethereum, asset: USDC}, to: {chain: ethereum, asset: USDe}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 1, gasDstUsd: 0, etaMinutes: 1, enabled: true}
+    - {id: swap-eth-usde-usdc, kind: swap, from: {chain: ethereum, asset: USDe}, to: {chain: ethereum, asset: USDC}, feeBps: 2, feeFixedUsd: 0, gasSrcUsd: 1, gasDstUsd: 0, etaMinutes: 1, enabled: true}

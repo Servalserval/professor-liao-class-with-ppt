@@ -1,0 +1,151 @@
+# Live runner config — copy to config/live.yaml and edit (docs/runbook.md).
+#
+# No secrets in this file. ${VARS} are expanded from the environment at load
+# time; keys come from EVM_PRIVATE_KEY_FILE / SUI_PRIVATE_KEY_FILE.
+# The live gate hashes this file BEFORE env expansion (rotating an RPC key does
+# not force a re-verify; changing an address, pair or cap does).
+#
+# Market choice and initial caps: docs/lending-landscape.md §5.
+
+mode: shadow                  # shadow = simulate every tx on-chain, never broadcast | live
+state_dir: state/live
+router_config: config/live-router.yaml
+verify_max_age_days: 7
+
+wallets:
+  # Read-only addresses: enough for shadow mode without keys. With keys loaded
+  # they must match (the runner refuses to start otherwise).
+  evm_address: "${EVM_ADDRESS}"
+  sui_address: "${SUI_ADDRESS}"
+
+chains:
+  ethereum: {rpc: "${RPC_ETHEREUM}"}
+  arbitrum: {rpc: "${RPC_ARBITRUM}"}
+  base: {rpc: "${RPC_BASE}"}
+  plasma: {rpc: "${RPC_PLASMA}"}
+  mantle: {rpc: "${RPC_MANTLE}"}
+  # monad: {rpc: "${RPC_MONAD}"}
+  # avalanche: {rpc: "${RPC_AVALANCHE}"}
+  sui: {grpc: "${SUI_GRPC}", jsonrpc: "${SUI_JSONRPC}"}
+
+# Tokens. Prefer resolvers over typed addresses:
+#   aave_book: <@bgd-labs/aave-address-book market>  (book_symbol if the book names it differently)
+#   usdt0: true                                       (USDT0 token from the live-bridges table)
+# `verify` reads symbol + decimals back on-chain for every entry.
+assets:
+  ethereum:
+    USDC: {aave_book: AaveV3Ethereum}
+    USDT: {aave_book: AaveV3Ethereum}
+    USDe: {aave_book: AaveV3Ethereum}
+  arbitrum:
+    USDC: {aave_book: AaveV3Arbitrum, book_symbol: USDCn}   # native USDC (CCTP), NOT bridged USDC.e
+    USDT0: {usdt0: true}
+  base:
+    USDC: {aave_book: AaveV3Base}
+  plasma:
+    USDT0: {aave_book: AaveV3Plasma}
+    USDe: {aave_book: AaveV3Plasma}
+  mantle:
+    USDT0: {aave_book: AaveV3Mantle}
+    USDe: {aave_book: AaveV3Mantle}
+  sui:
+    # SOURCE: Circle "USDC contract addresses" (Sui mainnet). Copy coin types from
+    # the official pages / protocol UIs; verify checks decimals on-chain.
+    USDC: {address: "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC", decimals: 6}
+    # USDsui: {address: "<coin type from Suilend / NAVI UI>", decimals: 6}
+
+# Where idle cash and reward proceeds are kept per chain.
+cash_asset:
+  ethereum: USDC
+  arbitrum: USDC
+  base: USDC
+  plasma: USDT0
+  mantle: USDT0
+  sui: USDC
+
+lending:
+  # Ethena Liquid Leverage: supply USDe, borrow a non-USDe stable, HF <= 2 (Merkl).
+  - type: aave-v3
+    chain: plasma
+    market: AaveV3Plasma
+    pairs:
+      - {pairId: USDe-USDT0, collateral: USDe, debt: USDT0}
+  - type: aave-v3
+    chain: ethereum
+    market: AaveV3Ethereum
+    pairs:
+      - {pairId: USDe-USDC, collateral: USDe, debt: USDC}
+  - type: aave-v3
+    chain: mantle
+    market: AaveV3Mantle
+    pairs:
+      - {pairId: USDe-USDT0, collateral: USDe, debt: USDT0}
+  # Markets missing from the address book (Monad, X Layer) take explicit
+  # addresses from Aave's official address dashboard; verify reads them back:
+  # - type: aave-v3
+  #   chain: monad
+  #   addresses: {pool: "0x...", poolAddressesProvider: "0x...", uiPoolDataProvider: "0x..."}
+  #   pairs: [{pairId: USDe-USDT0, collateral: USDe, debt: USDT0}]
+  #
+  # Sui (enable after adding USDsui above; check reward eligibility in shadow first):
+  # - type: suilend
+  #   chain: sui
+  #   market: main
+  #   pairs: [{pairId: USDsui-USDC, collateral: USDsui, debt: USDC}]
+  #   options: {assumeRewardsEligible: false}
+  # - type: navi
+  #   chain: sui
+  #   pairs: [{pairId: USDsui-USDsui, collateral: USDsui, debt: USDsui}]
+  # - type: scallop
+  #   chain: sui
+  #   pairs: [{pairId: USDC-USDsui, collateral: USDC, debt: USDsui}]
+  #
+  # Morpho Blue: one entry per market id (yield-bearing collateral: expected_price_ratio: oracle)
+  # - type: morpho
+  #   chain: base
+  #   pairs: [{pairId: usde-usdc-915, marketId: "0x...", collateral: USDe, debt: USDC}]
+
+# Same-chain swaps (loop legs, funding hops, reward sales).
+swaps:
+  ethereum: {type: aggregator, options: {max_cost_bps: 10}}
+  arbitrum: {type: aggregator, options: {max_cost_bps: 10}}
+  base: {type: aggregator, options: {max_cost_bps: 10}}
+  plasma: {type: aggregator, options: {max_cost_bps: 15}}
+  mantle: {type: aggregator, options: {max_cost_bps: 15}}
+  sui: {type: cetus, options: {max_cost_bps: 15}}
+
+# Bridge kinds the router may use (routes themselves are in config/live-router.yaml).
+bridges:
+  cctp_v2_standard: {enabled: true}
+  cctp_v2_fast: {enabled: false}          # 1-1.4 bps from Eth/L2; enable if speed matters
+  usdt0_oft: {enabled: true}
+  swap: {enabled: true, options: {tolerance_bps: 2}}   # live quote must be <= route feeBps + 2
+
+rewards:
+  merkl: {enabled: true}
+  keeper: {interval_hours: 4, min_claim_usd: 20, min_sell_usd: 20}
+  # Reward tokens to sell into cash_asset when they show up in the wallet:
+  sell: {}
+  #  monad: [WMON]
+  #  sui: [SUI]
+
+# Reward-token profiles for the router's realizable-value haircut.
+tokens:
+  USDe: {vol: 0.03, depth2pctUsd: 50000000}
+
+limits:
+  max_gas_usd: {default: 1, ethereum: 10}
+  max_slippage_bps: 10
+  max_loop_iterations: 10      # 0.7 target LTV: 10 iterations reach ~3.27x of 3.33x
+
+# Hard caps while going live (docs/runbook.md §8-9). Raise step by step; each change needs a new verify.
+canary:
+  max_position_usd: 2000
+  max_total_deployed_usd: 10000
+
+prices:
+  max_age_minutes: 10
+  # native_ids: {monad: "<coingecko id>"}
+  # overrides: {"plasma:0x...": 1.0}
+
+poll_seconds: 60

@@ -13,6 +13,7 @@ import {
   CctpV2Adapter,
   LiveBridgeExecutor,
   recipientsFromEnvs,
+  USDT0_DEPLOYMENTS,
   Usdt0OftAdapter,
   verifyBridges,
 } from "@incentive-router/live-bridges";
@@ -28,7 +29,7 @@ import {
   type RewardRateProvider,
   type SwapAdapter,
 } from "@incentive-router/live-common";
-import { AaveV3Adapter, aaveMarketFromAddressBook, MerklClaimer, merklRewardRateProvider, AggregatorSwapAdapter, MorphoBlueAdapter, type AaveMarketConfig } from "@incentive-router/live-evm";
+import { AaveV3Adapter, aaveAssetFromAddressBook, aaveMarketFromAddressBook, MerklClaimer, merklRewardRateProvider, AggregatorSwapAdapter, MorphoBlueAdapter, type AaveMarketConfig } from "@incentive-router/live-evm";
 import { assertChainId, erc20Balance, makeEvmEnv, verifyAsset, type Address, type EvmEnv, type Hex } from "@incentive-router/live-evm-base";
 import {
   CetusPtbSwapper,
@@ -43,13 +44,14 @@ import {
   type PtbSwapper,
   type SuiEnv,
 } from "@incentive-router/live-sui";
+import { AaveV4Adapter } from "@incentive-router/live-aave-v4";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
 import { BucketReader } from "./balances.js";
 import { configHash } from "./gate.js";
 import { applyCanaryToRouterConfig, CanaryExecutor } from "./guards.js";
-import type { LendingSpec, LiveConfig, PairSpec } from "./liveConfig.js";
+import type { AssetSpec, LendingSpec, LiveConfig, PairSpec } from "./liveConfig.js";
 import { LoopExecutor } from "./loopExecutor.js";
 import { PairRegistry, type PairWiring } from "./pairs.js";
 import { PriceFeed } from "./prices.js";
@@ -109,6 +111,25 @@ function issuesOf(r: unknown): string[] {
   return [];
 }
 
+/** Config asset -> AssetRef (explicit address, Aave address book, or the USDT0 table). */
+export function resolveAsset(chain: string, symbol: string, a: AssetSpec): AssetRef {
+  if (a.address) {
+    if (a.decimals === undefined) throw new Error(`assets.${chain}.${symbol}: decimals required with an address`);
+    return { chain, symbol, address: a.address, decimals: a.decimals };
+  }
+  if (a.aave_book) {
+    const r = aaveAssetFromAddressBook(a.aave_book, a.book_symbol ?? symbol, symbol);
+    if (r.chain !== chain) throw new Error(`assets.${chain}.${symbol}: address book ${a.aave_book} is on ${r.chain}`);
+    return r;
+  }
+  if (a.usdt0) {
+    const d = USDT0_DEPLOYMENTS[chain];
+    if (!d?.token) throw new Error(`assets.${chain}.${symbol}: no USDT0 token listed for ${chain} (give the address)`);
+    return { chain, symbol, address: d.token, decimals: 6 };
+  }
+  throw new Error(`assets.${chain}.${symbol}: needs address+decimals, aave_book or usdt0`);
+}
+
 export function routerConfigFor(cfg: LiveConfig): RouterConfig {
   return applyCanaryToRouterConfig(loadConfig(cfg.router_config), cfg.canary);
 }
@@ -129,7 +150,7 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
   // --- assets -----------------------------------------------------------------
   const assets: Record<string, Record<string, AssetRef>> = {};
   for (const [chain, m] of Object.entries(cfg.assets ?? {}))
-    for (const [symbol, a] of Object.entries(m)) (assets[chain] ??= {})[symbol] = { chain, symbol, address: a.address, decimals: a.decimals };
+    for (const [symbol, a] of Object.entries(m)) (assets[chain] ??= {})[symbol] = resolveAsset(chain, symbol, a);
   const asset = (chain: string, symbol: string): AssetRef => {
     const a = assets[chain]?.[symbol];
     if (!a) throw new Error(`asset ${chain}:${symbol} is not in config assets`);
@@ -408,6 +429,12 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
       } catch (e) {
         lines = [`verify threw: ${(e as Error).message}`];
       }
+      // viem / SDK errors are multi-line; keep the first line (and "Details:" if present).
+      lines = lines.map((l) => {
+        const parts = String(l).split("\n").map((x) => x.trim()).filter(Boolean);
+        const det = parts.find((x) => x.startsWith("Details:"));
+        return [parts[0] ?? "", det].filter(Boolean).join(" | ").slice(0, 300);
+      });
       issues[v.id] = lines.filter((l) => !/^WARN\b/i.test(l));
       const w = lines.filter((l) => /^WARN\b/i.test(l));
       if (w.length) warnings[v.id] = w;
@@ -494,6 +521,25 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
         })),
         swapper: d.swappers[l.chain],
         extraRewards: d.extraRewards,
+        log: d.log,
+        ...(opt as object),
+      });
+    }
+    case "aave-v4": {
+      // Spoke + hub addresses come from AaveKit / Aave's address dashboard (not in the
+      // address book yet); verifyConfig() checks code, ABI selectors and reserve hubs.
+      const a = l.addresses ?? {};
+      if (!a.spoke || !a.hub) throw new Error(`aave-v4@${l.chain}: addresses.spoke and addresses.hub are required`);
+      const spoke = { chain: l.chain, spokeName: l.market ?? "spoke", spoke: a.spoke, hub: a.hub };
+      // Merkl matches V4 campaigns by HUB address (merklRates "aave-v4-hub" matcher).
+      const rewards = d.extraRewards;
+      return new AaveV4Adapter({
+        env: d.evmEnv(l.chain),
+        spoke,
+        pairs: l.pairs.map((p, i) => ({ pairId: p.pairId, collateral: wiring[i]!.collateral, debt: wiring[i]!.debt })),
+        swapper: d.swappers[l.chain],
+        extraRewards: rewards ? (q) => rewards({ ...q, marketId: a.hub }) : undefined,
+        priceUsd: d.priceUsd,
         log: d.log,
         ...(opt as object),
       });
