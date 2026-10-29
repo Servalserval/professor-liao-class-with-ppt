@@ -1,27 +1,31 @@
 {
   "name": "incentive-router",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Generalized risk framework for incentive farming (lending loops, LP incentives, delta-neutral perp points) — generalized from the loop-farm core.",
+  "description": "Incentive farming router: generalized loop-farm risk framework, cross-chain funding, live adapters (Sui + EVM).",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.test.json",
-    "test": "node --import tsx --test test/*.test.ts",
-    "scan": "tsx src/cli.ts scan",
-    "plan": "tsx src/cli.ts plan",
-    "sim": "tsx src/cli.ts sim",
-    "run:paper": "tsx src/cli.ts run --paper"
+    "test": "node --import tsx --test packages/*/test/*.test.ts",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "scan": "tsx packages/core/src/cli.ts scan",
+    "plan": "tsx packages/core/src/cli.ts plan",
+    "sim": "tsx packages/core/src/cli.ts sim",
+    "run:paper": "tsx packages/core/src/cli.ts run --paper"
   },
-  "engines": { "node": ">=20" },
-  "dependencies": {
-    "yaml": "^2.5.0"
+  "engines": {
+    "node": ">=20"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
+  },
+  "overrides": {
+    "@cetusprotocol/aggregator-sdk": {
+      "@mysten/sui": "2.38.0"
+    }
   }
 }

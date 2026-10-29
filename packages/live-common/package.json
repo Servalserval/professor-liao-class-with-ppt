@@ -1,0 +1,11 @@
+{
+  "name": "@incentive-router/live-common",
+  "version": "0.2.0",
+  "private": true,
+  "description": "SDK-agnostic contracts for live adapters: chains, assets, lending/swap/bridge adapter interfaces, keys, logging.",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": { "@incentive-router/core": "*" }
+}

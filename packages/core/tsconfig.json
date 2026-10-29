@@ -6,12 +6,13 @@
     "strict": true,
     "noImplicitOverride": true,
     "noFallthroughCasesInSwitch": true,
-    "declaration": true,
-    "outDir": "dist",
     "rootDir": "src",
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "noEmit": true
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "src/**/*.ts"
+  ]
 }

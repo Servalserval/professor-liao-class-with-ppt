@@ -1,0 +1,24 @@
+{
+  "name": "@incentive-router/live-sui",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Sui live adapters (Navi, Suilend, Scallop, AlphaLend) + Cetus aggregator swaps, all on one @mysten/sui so PTBs compose.",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@incentive-router/core": "*",
+    "@incentive-router/live-common": "*",
+    "@mysten/sui": "2.38.0",
+    "@mysten/bcs": "^2.1.1",
+    "@naviprotocol/lending": "2.1.0",
+    "@suilend/sdk": "14.0.0",
+    "@suilend/sui-core": "^2.2.0",
+    "@scallop-io/sui-scallop-sdk": "5.4.3",
+    "@scallop-io/sui-kit": "~2.2.0",
+    "@tanstack/query-core": "^5.95.2",
+    "@alphafi/alphalend-sdk": "4.1.0",
+    "@cetusprotocol/aggregator-sdk": "1.7.5"
+  }
+}

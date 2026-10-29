@@ -1,0 +1,14 @@
+{
+  "name": "@incentive-router/core",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Chain-agnostic risk framework: valuation, gates, allocator, rewards, cross-chain funding, router.",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "cd ../.. && node --import tsx --test packages/core/test/*.test.ts"
+  },
+  "dependencies": { "yaml": "^2.5.0" }
+}

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
 import type { Kind, Tier } from "./types.js";
+import type { RouteSpec } from "./xchain/types.js";
 
 export type RewardPolicy = "sell_on_claim" | "hedge" | "hold";
 
@@ -155,12 +156,37 @@ export interface RouterConfig {
       rate_uncertainty_mult: number;
       txs_per_entry: number;
       txs_per_exit: number;
+      /** Stable-pair loops: |price(debt)/price(collateral) - 1| warn / exit levels. */
+      depeg_warn: number;
+      depeg_exit: number;
     };
     discovery: {
       min_tvl_usd: number;
       chains: string[];
       assumed_withdrawable_frac: number;
     };
+  };
+
+  /** Cross-chain funding (packages/core/src/xchain). */
+  xchain: {
+    enabled: boolean;
+    /** A single move may cost at most this many days of the moved money's net yield at the destination. */
+    max_cost_days_of_yield: number;
+    /** All cross-chain costs within any rolling 24h <= this many days of the whole book's expected yield. */
+    book_daily_budget_days: number;
+    /** The move must pay back its cost within this many days from the APR improvement over leaving it idle where it is. */
+    payback_days: number;
+    /** Never move less than this (fixed costs dominate). */
+    min_move_usd: number;
+    /** Max fraction of total equity in flight at once. */
+    max_in_flight_frac: number;
+    /** A hop not finished after eta x this factor (and >= stuck_min_minutes) is flagged stuck. */
+    stuck_eta_multiple: number;
+    stuck_min_minutes: number;
+    /** APR assumed for idle cash at the source while deciding (0 = idle earns nothing). */
+    idle_apr: number;
+    /** Known routes. Live adapters refresh fees; these are the planning defaults. */
+    routes: RouteSpec[];
   };
 
   telegram?: { bot_token_env: string; chat_id_env: string };
@@ -254,12 +280,26 @@ export const DEFAULT_CONFIG: RouterConfig = {
       rate_uncertainty_mult: 1.3,
       txs_per_entry: 1,
       txs_per_exit: 1,
+      depeg_warn: 0.003,
+      depeg_exit: 0.01,
     },
     discovery: {
       min_tvl_usd: 1_000_000,
       chains: [],
       assumed_withdrawable_frac: 0.3,
     },
+  },
+  xchain: {
+    enabled: false,
+    max_cost_days_of_yield: 1,
+    book_daily_budget_days: 1,
+    payback_days: 14,
+    min_move_usd: 1_000,
+    max_in_flight_frac: 0.5,
+    stuck_eta_multiple: 4,
+    stuck_min_minutes: 60,
+    idle_apr: 0,
+    routes: [],
   },
 };
 

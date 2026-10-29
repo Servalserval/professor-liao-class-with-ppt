@@ -1,0 +1,19 @@
+{
+  "name": "@incentive-router/live-evm",
+  "version": "0.2.0",
+  "private": true,
+  "description": "EVM lending adapters (Aave v3 family, Morpho Blue family, ...) and EVM swaps / Merkl claims.",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@incentive-router/core": "*",
+    "@incentive-router/live-common": "*",
+    "@incentive-router/live-evm-base": "*",
+    "viem": "2.57.13",
+    "@bgd-labs/aave-address-book": "4.44.22",
+    "@morpho-org/blue-sdk": "8.0.2",
+    "@morpho-org/blue-sdk-viem": "7.1.0"
+  }
+}

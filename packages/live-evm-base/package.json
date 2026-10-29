@@ -1,0 +1,14 @@
+{
+  "name": "@incentive-router/live-evm-base",
+  "version": "0.2.0",
+  "private": true,
+  "description": "viem clients, simulate-then-send transaction pipeline, ERC20 helpers shared by EVM lending and bridge adapters.",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@incentive-router/live-common": "*",
+    "viem": "2.57.13"
+  }
+}

@@ -131,6 +131,12 @@ export interface Opportunity {
   health?: HealthView;
   /** Hard size limit from the protocol side (supply cap headroom, max OI ...). */
   maxEquityUsd?: number;
+  /**
+   * What must be on hand to enter: the asset (symbol) on the chain where the
+   * position opens. The cross-chain funding planner uses it to decide whether
+   * idle cash elsewhere has to be moved first. Defaults to the first leg.
+   */
+  funding?: { chain: string; asset: string };
   /** Speculative = the edge is mostly points. Gets its own budget and rules. */
   speculative?: boolean;
   /** Discovery-only opportunities are reported but never allocated to. */

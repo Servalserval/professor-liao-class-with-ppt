@@ -1,0 +1,17 @@
+{
+  "name": "@incentive-router/live-bridges",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Cross-chain bridge adapters (CCTP, USDT0 OFT, ...) implementing live-common BridgeAdapter, plus the core BridgeExecutor glue.",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": {
+    "@incentive-router/core": "*",
+    "@incentive-router/live-common": "*",
+    "@incentive-router/live-evm-base": "*",
+    "viem": "2.57.13",
+    "@mysten/sui": "2.38.0"
+  }
+}
