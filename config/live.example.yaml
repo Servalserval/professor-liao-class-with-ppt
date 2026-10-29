@@ -82,6 +82,22 @@ lending:
     market: AaveV3Mantle
     pairs:
       - {pairId: USDe-USDT0, collateral: USDe, debt: USDT0}
+  # Plain deposits (supply-only, no borrow): the router compares them with the loops on one
+  # risk-adjusted scale (docs/selection.md). An asset used by a loop pair of the same Aave
+  # market cannot also be a plain deposit there (one account per wallet per market).
+  - type: aave-v3
+    chain: base
+    market: AaveV3Base
+    pairs: []
+    supply:
+      - {asset: USDC}
+  - type: aave-v3
+    chain: arbitrum
+    market: AaveV3Arbitrum
+    pairs: []
+    supply:
+      - {asset: USDC}
+      - {asset: USDT0}
   # Markets missing from the address book (Monad, X Layer) take explicit
   # addresses from Aave's official address dashboard; verify reads them back:
   # - type: aave-v3
@@ -102,10 +118,40 @@ lending:
   #   chain: sui
   #   pairs: [{pairId: USDC-USDsui, collateral: USDC, debt: USDsui}]
   #
+  # Sui plain deposits (each adapter keeps them apart from its loops: Navi wallet account,
+  # Suilend a dedicated borrow-free obligation, Scallop sCoin / spool):
+  # - type: navi
+  #   chain: sui
+  #   pairs: []
+  #   supply: [{asset: USDC, market: main}]
+  # - type: suilend
+  #   chain: sui
+  #   market: main
+  #   pairs: []
+  #   supply: [{asset: USDC}]
+  #   options: {supplyObligationId: "<set after the first deposit, or leave unset on a fresh wallet>"}
+  # - type: scallop
+  #   chain: sui
+  #   pairs: []
+  #   supply: [{asset: USDC, stakeInSpool: true}]
+  #
   # Morpho Blue: one entry per market id (yield-bearing collateral: expected_price_ratio: oracle)
   # - type: morpho
   #   chain: base
   #   pairs: [{pairId: usde-usdc-915, marketId: "0x...", collateral: USDe, debt: USDC}]
+
+# ERC-4626 vaults (plain deposits): Euler EVaults, MetaMorpho vaults, Fluid fTokens, generic.
+# Copy vault addresses from the protocol's own app / docs (never from memory); `verify`
+# checks code, asset(), decimals and deposit limits on-chain. Fluid and generic vaults
+# derive their APR from share-price history and need an archive RPC.
+# vaults:
+#   - chain: base
+#     vaults:
+#       - {address: "0x<MetaMorpho USDC vault from app.morpho.org>", asset: USDC, flavor: metamorpho, curator: "<curator>"}
+#       - {address: "0x<Euler USDC EVault from app.euler.finance>", asset: USDC, flavor: euler}
+#   - chain: arbitrum
+#     vaults:
+#       - {address: "0x<Fluid fUSDC from fluid.io>", asset: USDC, flavor: fluid}
 
 # Same-chain swaps. max_cost_bps: entries, funding hops and reward sales (strict).
 # exit_max_cost_bps: unwinding loops — must stay possible during a depeg, when
