@@ -1,0 +1,13 @@
+# WHAT-IF of selection-2026-10-29.yaml: identical markets, routes and caps;
+# ONLY the risk premia over baseline_apr are lowered (a policy choice, not a
+# market fact). The base run picks nothing under the live-router premia
+# (tier 1 +3%, tier 2 +6%); this shows what the selector would pick if you
+# accepted tier 1 +1.5% / tier 2 +3% (deposits keep their -1.5% kind adjustment:
+# tier 1 deposit 4.5%, tier 2 deposit 6.0%, tier 1 loop 6.0%, tier 2 loop 7.5%).
+#
+# Run: npx tsx packages/core/src/cli.ts sim examples/scenarios/selection-2026-10-29-whatif-premia.yaml --verbose
+extends: selection-2026-10-29.yaml
+name: Selection 2026-10-29 — WHAT-IF lower risk premia (example numbers)
+config:
+  thresholds:
+    entry_premium_by_tier: {1: 0.015, 2: 0.03, 3: 0.12}

@@ -146,7 +146,9 @@ describe("exit gates", () => {
       streams: [proRataStream({ label: "r", kind: "base", aprNow: 0.1, poolUsd: 100_000, grossPerEquity: 1, myEquityNowUsd: 60_000, aprMultiplier: 1 })],
       liquidity: { exitCapacityUsd: 1e9, footprintPerEquity: 1 },
     });
-    const { p, ctx } = ctxFor(diluted, 60_000, { pending: { oversized: 1 }, pendingSince: { oversized: NOW - 20 * 60_000 } });
+    const { p } = ctxFor(diluted, 60_000, { pending: { oversized: 1 }, pendingSince: { oversized: NOW - 20 * 60_000 } });
+    // loop-style thresholds (no deposit kind adjustment): this test is about dilution
+    const ctx = dctx({ positions: [p], cfg: cfgWith({ thresholds: { kind_premium_adjust: { deposit: { entry: 0, exit: 0 } } } }) });
     const e = exits(decideExit(p, diluted, [], ctx).actions);
     assert.equal(e.length, 1);
     assert.ok(e[0]!.fraction < 0.1);
@@ -196,7 +198,11 @@ describe("allocator", () => {
       liquidity: { exitCapacityUsd: 1e9, footprintPerEquity: 1 },
     });
     const steady = opp({ id: "steady", primaryVenue: "suilend", legs: [{ venue: "suilend", chain: "sui", token: "USDC", equityFrac: 1 }], streams: [constantStream("b", "base", 0.09)] });
-    const loose = { caps: { per_opportunity_frac: 1, max_position_usd: 1e9, per_venue_frac_by_tier: { 1: 1 }, per_chain_frac: { default: 1 }, per_kind_frac: { deposit: 1 } } };
+    const loose = {
+      caps: { per_opportunity_frac: 1, max_position_usd: 1e9, per_venue_frac_by_tier: { 1: 1 }, per_chain_frac: { default: 1 }, per_kind_frac: { deposit: 1 } },
+      // loop-style 7.5% entry threshold (no deposit kind adjustment): this test is about dilution
+      thresholds: { kind_premium_adjust: { deposit: { entry: 0, exit: 0 } } },
+    };
     // Alone: marginal of x*E/(P+x) is E*P/(P+x)^2 = 7.5% entry threshold at x ~= 158k
     const alone = planAllocation([farm], dctx({ equity: 1_000_000, cfg: cfgWith(loose) }));
     const a = alone.entries[0]!.deltaUsd;

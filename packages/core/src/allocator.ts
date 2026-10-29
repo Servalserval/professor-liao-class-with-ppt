@@ -109,7 +109,7 @@ export function planAllocation(opps: Opportunity[], ctx: DecisionContext): Alloc
       if (quote.costUsd > 0) {
         // the move is a one-off like an entry cost: amortize it over the hold horizon
         rankApr -= (quote.costUsd / step) * (365 / cfg.hold_horizon_days);
-        const th = entryThreshold(cfg, venueTier(cfg, o.primaryVenue));
+        const th = entryThreshold(cfg, venueTier(cfg, o.primaryVenue), o.kind);
         if (!o.speculative && rankApr < th)
           return { ok: false, reasons: [`funding: marginal APR ${pct(rankApr)} after move cost < entry ${pct(th)}`], sized: false, report: true };
       }

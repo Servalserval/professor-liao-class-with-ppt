@@ -1,4 +1,5 @@
 import { chainCap, type RouterConfig } from "./config.js";
+import { stableConfig } from "./stables.js";
 import { venueTier } from "./tiers.js";
 import type { Kind, Leg, Opportunity, Position } from "./types.js";
 
@@ -95,6 +96,9 @@ export function capViolations(cfg: RouterConfig, after: Exposure, opp: Opportuni
     if (fc > cc + 1e-9) r.push(`chain ${leg.chain} would be ${pct(fc)} > cap ${pct(cc)}`);
     const ft = (after.byToken[leg.token] ?? 0) / totalEquityUsd;
     if (ft > c.per_token_frac + 1e-9) r.push(`token ${leg.token} would be ${pct(ft)} > cap ${pct(c.per_token_frac)}`);
+    // per-stable cap (depeg concentration) across every position holding the asset
+    const sm = stableConfig(cfg, leg.token)?.max_frac;
+    if (sm !== undefined && ft > sm + 1e-9) r.push(`stable ${leg.token} would be ${pct(ft)} > stables.${leg.token}.max_frac ${pct(sm)}`);
   }
   const kindCap = c.per_kind_frac[opp.kind as Kind] ?? 1;
   const fk = (after.byKind[opp.kind] ?? 0) / totalEquityUsd;

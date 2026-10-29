@@ -1,5 +1,7 @@
 import type { Flag, Kind, Opportunity, StressSignal, YieldStream } from "../types.js";
 import { constantStream, proRataStream } from "../valuation.js";
+import { loopPairOpportunity, type LoopPair } from "./loopPair.js";
+import { supplyOpportunity, type SupplyMarket } from "./supply.js";
 import type { Source, SourceContext } from "./types.js";
 
 /**
@@ -41,6 +43,39 @@ export interface StaticOppSpec {
   flags?: Flag[];
   metrics?: Record<string, number>;
   health?: { metric: string; value: number; rebalance_at: number; critical_at: number; direction?: "above" | "below" };
+}
+
+/** A static entry priced by the real supply math (sources/supply.ts). Opportunity id: `${sourceId}:${protocol}:${marketId}`. */
+export interface StaticSupplySpec {
+  supply_market: SupplyMarket;
+  executable?: boolean;
+}
+
+/** A static entry priced by the real loop math (sources/loopPair.ts). Opportunity id: `${sourceId}:${protocol}:${pairId}`. */
+export interface StaticLoopSpec {
+  loop_pair: LoopPair;
+  executable?: boolean;
+}
+
+export type StaticEntry = StaticOppSpec | StaticSupplySpec | StaticLoopSpec;
+
+export const isSupplySpec = (e: StaticEntry): e is StaticSupplySpec => typeof (e as StaticSupplySpec).supply_market === "object";
+export const isLoopSpec = (e: StaticEntry): e is StaticLoopSpec => typeof (e as StaticLoopSpec).loop_pair === "object";
+export const isPlainSpec = (e: StaticEntry): e is StaticOppSpec => !isSupplySpec(e) && !isLoopSpec(e);
+
+/** Opportunity id a static entry produces. */
+export function staticEntryId(e: StaticEntry, sourceId: string): string {
+  if (isSupplySpec(e)) return `${sourceId}:${e.supply_market.protocol}:${e.supply_market.marketId}`;
+  if (isLoopSpec(e)) return `${sourceId}:${e.loop_pair.protocol}:${e.loop_pair.pairId}`;
+  return e.id;
+}
+
+/** Any static entry -> Opportunity (null when the real-math builders reject the input). */
+export function staticEntryToOpportunity(e: StaticEntry, ctx: SourceContext, sourceId: string, startMs: number): Opportunity | null {
+  if (isPlainSpec(e)) return staticToOpportunity(e, ctx, sourceId, startMs);
+  const o = isSupplySpec(e) ? supplyOpportunity(e.supply_market, ctx, sourceId) : loopPairOpportunity(e.loop_pair, ctx, sourceId);
+  if (o && e.executable === false) o.discoveryOnly = true;
+  return o;
 }
 
 export function staticToOpportunity(spec: StaticOppSpec, ctx: SourceContext, sourceId: string, startMs: number): Opportunity {
@@ -113,18 +148,35 @@ export function staticToOpportunity(spec: StaticOppSpec, ctx: SourceContext, sou
   };
 }
 
-export class StaticSource implements Source {
-  readonly specs: StaticOppSpec[];
+export class StaticSource<T extends StaticEntry = StaticEntry> implements Source {
+  readonly specs: T[];
   constructor(
-    specs: StaticOppSpec[],
+    specs: T[],
     readonly id = "static",
     private readonly startMs = Date.now()
   ) {
     this.specs = structuredClone(specs);
+    // ids must be unique within a source (real-math ids carry no chain: qualify marketId / pairId)
+    const seen = new Set<string>();
+    for (const s of this.specs) {
+      const id = staticEntryId(s, this.id);
+      if (seen.has(id)) throw new Error(`static source ${this.id}: duplicate opportunity id ${id} (make marketId / pairId unique, e.g. "<chain>:<market>")`);
+      seen.add(id);
+    }
   }
-  /** Removed opportunities simulate a source that stops reporting (or a delisted market). */
+  /** Removed opportunities simulate a source that stops reporting (or a delisted market). Keys: opportunity ids. */
   hidden = new Set<string>();
+  /** Entry by the opportunity id it produces. */
+  find(oppId: string): T | undefined {
+    return this.specs.find((s) => staticEntryId(s, this.id) === oppId);
+  }
   async fetch(ctx: SourceContext): Promise<Opportunity[]> {
-    return this.specs.filter((s) => !this.hidden.has(s.id)).map((s) => staticToOpportunity(s, ctx, this.id, this.startMs));
+    const out: Opportunity[] = [];
+    for (const s of this.specs) {
+      if (this.hidden.has(staticEntryId(s, this.id))) continue;
+      const o = staticEntryToOpportunity(s, ctx, this.id, this.startMs);
+      if (o) out.push(o);
+    }
+    return out;
   }
 }

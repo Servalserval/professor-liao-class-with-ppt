@@ -13,7 +13,8 @@ import { formatScenario, loadScenario, runScenario } from "./scenario.js";
 import { newHistory } from "./signals.js";
 import { checkMerklShape, MerklSource } from "./sources/merkl.js";
 import { DefiLlamaSource } from "./sources/defillama.js";
-import { StaticSource, type StaticOppSpec } from "./sources/static.js";
+import { formatSelection, explainSelection } from "./selection.js";
+import { StaticSource, type StaticEntry } from "./sources/static.js";
 import type { FetchLike, Source, SourceContext } from "./sources/types.js";
 import { FileStore } from "./store.js";
 import { venueTier } from "./tiers.js";
@@ -56,7 +57,7 @@ function buildSources(f: Flags): Source[] {
   const out: Source[] = [];
   const staticPath = s(f, "static");
   if (staticPath) {
-    const doc = parse(readFileSync(staticPath, "utf8")) as { opportunities: StaticOppSpec[] };
+    const doc = parse(readFileSync(staticPath, "utf8")) as { opportunities: StaticEntry[] };
     out.push(new StaticSource(doc.opportunities ?? []));
   }
   const merkl = s(f, "merkl-fixture");
@@ -170,7 +171,7 @@ async function cmdPlan(cfg: RouterConfig, f: Flags) {
   const opps = await fetchAll(buildSources(f), { cfg, nowMs: now, myEquityByOpp: my });
   if (f["paper"]) for (const o of opps) if (o.sourceId === "static") o.discoveryOnly = false;
   const total = st.idleUsd + st.positions.reduce((a, p) => a + p.equityUsd, 0);
-  const plan = planAllocation(opps, {
+  const ctx: DecisionContext = {
     cfg,
     nowMs: now,
     tokens: loadTokens(f),
@@ -182,11 +183,15 @@ async function cmdPlan(cfg: RouterConfig, f: Flags) {
     paused: st.paused,
     idleUsd: st.idleUsd,
     hedges: st.hedges,
-  });
+  };
+  const plan = planAllocation(opps, ctx);
   console.log(`deployable $${Math.round(plan.deployableUsd)} of $${Math.round(total)}`);
   for (const e of plan.entries)
     console.log(`ENTER ${e.oppId} +$${Math.round(e.deltaUsd)} net ${pct(e.netApr)} marginal ${pct(e.marginalApr)}`);
-  if (f["why"]) for (const [id, r] of Object.entries(plan.rejected)) console.log(`skip ${id}: ${r.slice(0, 3).join("; ")}`);
+  if (f["why"]) {
+    console.log("\nwhy (one scale: net = raw - haircut - depeg - costs - move, vs the tier/kind entry threshold):");
+    console.log(formatSelection(explainSelection(opps, ctx, plan), 3));
+  }
 }
 
 async function cmdRun(cfg: RouterConfig, f: Flags) {
@@ -244,7 +249,7 @@ const HELP = `incentive-router
   scan   [--static f.yaml] [--merkl-fixture f.json] [--llama-fixture f.json [--llama-lendborrow-fixture f.json]] [--live]
          [--tokens tokens.yaml] [--probe 10000] [--equity 100000] [--top 30] [--why] [--json]
   plan   (same source flags) [--state dir] [--paper] [--why]
-  sim    <scenario.yaml> [--verbose]
+  sim    <scenario.yaml> [--why] [--verbose]   (--why / --verbose: selection table on allocation steps)
   run    --paper (same source flags) [--state dir] [--cycles N] [--interval sec]
   cmd    "/status" | "/transfer <id> arrived|failed|refunded [usd]" | ... [--state dir]   (same commands as Telegram)
   verify-sources        check live Merkl / DefiLlama response shapes (needs internet)
@@ -268,7 +273,7 @@ async function main() {
     case "sim": {
       if (!pos[0]) throw new Error("usage: sim <scenario.yaml>");
       const r = await runScenario(loadScenario(pos[0]));
-      console.log(formatScenario(r, !!flags["verbose"]));
+      console.log(formatScenario(r, !!flags["verbose"], !!flags["why"] || !!flags["verbose"]));
       return;
     }
     default:

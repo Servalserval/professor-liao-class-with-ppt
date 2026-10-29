@@ -157,7 +157,7 @@ export function decideExit(
   }
 
   const tier = venueTier(cfg, opp.primaryVenue);
-  const threshold = opp.speculative ? -cfg.points.max_cost_apr : exitThreshold(cfg, tier);
+  const threshold = opp.speculative ? -cfg.points.max_cost_apr : exitThreshold(cfg, tier, opp.kind);
 
   // 6) reward ending: does the edge survive without the streams that end soon?
   const endingMs = cfg.rewards.ending_hours * HOUR;

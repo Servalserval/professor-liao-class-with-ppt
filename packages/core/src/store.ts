@@ -92,7 +92,9 @@ export function creditIdle(st: RouterState, key: string, usd: number): void {
     st.idleUsd += usd;
     return;
   }
-  st.idle[key] = (st.idle[key] ?? 0) + usd;
+  const v = (st.idle[key] ?? 0) + usd;
+  // float dust from debit/credit round trips (an exact spend leaves -1e-12): snap to 0
+  st.idle[key] = Math.abs(v) < 1e-6 ? 0 : v;
   st.idleUsd = sumIdle(st.idle);
 }
 

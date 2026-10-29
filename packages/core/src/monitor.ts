@@ -18,6 +18,7 @@ import {
 import type { Source } from "./sources/types.js";
 import { bucketMode, creditIdle, debitIdle, setIdleBuckets, type RouterState, type Store } from "./store.js";
 import type { Action, AlertLevel, Opportunity, Position, TokenProfile } from "./types.js";
+import { explainSelection, type SelectionRow } from "./selection.js";
 import { validateOpportunity } from "./validate.js";
 import { valueAt } from "./valuation.js";
 import {
@@ -97,6 +98,8 @@ export interface CycleReport {
   transfers: TransferEvent[];
   /** Why opportunities got no (more) money this cycle (allocation ran only). */
   allocationRejected?: Record<string, string[]>;
+  /** Every candidate on one risk-adjusted scale, with the plan's verdict (allocation ran only). */
+  selection?: SelectionRow[];
   killed: boolean;
 }
 
@@ -138,6 +141,7 @@ export class Router {
     const sourceErrors: string[] = [];
     const xfers: TransferEvent[] = [];
     let allocationRejected: Record<string, string[]> | undefined;
+    let selection: SelectionRow[] | undefined;
     let opps = new Map<string, Opportunity>();
 
     // Money on a bridge is still ours: it counts in equity, so a move never
@@ -348,8 +352,14 @@ export class Router {
             pausedRouteIds: pausedRoutes(st, now),
             deployedUsd: c.exposure.totalDeployedUsd,
           });
-        const plan = planAllocation([...opps.values()], c);
+        const candidates = [...opps.values()];
+        const plan = planAllocation(candidates, c);
         allocationRejected = plan.rejected;
+        try {
+          selection = explainSelection(candidates, c, plan);
+        } catch (e) {
+          alerts.push({ level: "warn", text: `selection report failed (${errMsg(e)})`, dedupeKey: "selection|report" });
+        }
         for (const e of plan.entries) {
           const opp = opps.get(e.oppId)!;
           const ex = this.d.executors[opp.sourceId];
@@ -396,6 +406,7 @@ export class Router {
       executed,
       transfers: xfers,
       allocationRejected,
+      selection,
       killed: st.killed,
     };
   }
@@ -796,6 +807,10 @@ export class Router {
         return;
       }
       for (const o of r.value) {
+        if (opps.has(o.id)) {
+          alerts.push({ level: "warn", text: `duplicate opportunity id ${o.id} from ${src.id}: kept the first`, dedupeKey: `dup|${o.id}` });
+          continue;
+        }
         if (!this.d.executors[o.sourceId]) o.discoveryOnly = true;
         const issues = validateOpportunity(o, cfg, now);
         if (issues.length) {

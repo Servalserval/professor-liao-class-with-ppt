@@ -4,6 +4,7 @@ import type { RouterConfig } from "../src/config.js";
 import { interpIrm, loopLeverage, loopMarketToPair, loopOpportunity, type IrmModel, type LoopMarket, type RewardRate } from "../src/sources/loopLending.js";
 import { isSameAsset, loopPairOpportunity, LoopPairSource, type LoopLeg, type LoopPair } from "../src/sources/loopPair.js";
 import type { Opportunity } from "../src/types.js";
+import { stableRisk } from "../src/stables.js";
 import { validateOpportunity } from "../src/validate.js";
 import { cfgWith, close, NOW, sctx } from "./helpers.js";
 
@@ -129,7 +130,8 @@ describe("loopPair: same-asset equivalence with loopOpportunity", () => {
           exitFrac: ll.footprint === "net" ? (ref.L - 1) * (c.m.flashloanFeeFrac ?? 0) : 0,
           fixedEntryUsd: 0.05 * ll.txs_per_entry,
           fixedExitUsd: 0.05 * ll.txs_per_exit,
-          ongoingApr: 0,
+          // expected depeg loss of the asset, 1x for a same-asset loop (src/stables.ts)
+          ongoingApr: stableRisk(cfg, c.m.symbol).lossApr,
         });
         assert.deepEqual(o.liquidity, { exitCapacityUsd: ref.available, footprintPerEquity: ll.footprint === "gross" ? ref.L : 1, estimated: undefined });
         assert.deepEqual(o.flags, c.m.paused ? [{ name: "market_paused", severity: "exit" }] : []);
@@ -191,7 +193,17 @@ describe("loopPair: two-asset math", () => {
     assert.equal(o.metrics.tvl_usd, 60e6);
     assert.deepEqual(o.legs, [{ venue: "navi", chain: "sui", token: "USDC", equityFrac: 1 }]);
     assert.deepEqual(o.funding, { chain: "sui", asset: "USDC" });
-    assert.deepEqual(o.meta, { leverage: L70, ltv: 0.7, pairId: "USDC/USDT", debtSymbol: "USDT" });
+    const risk = stableRisk(cfgWith(), "USDC");
+    assert.deepEqual(o.meta, {
+      leverage: L70,
+      ltv: 0.7,
+      pairId: "USDC/USDT",
+      debtSymbol: "USDT",
+      // a pair pays L x the collateral's expected depeg loss
+      depegLossApr: L70 * risk.lossApr,
+      stableRisk: { symbol: "USDC", tier: 1, lossApr: risk.lossApr, known: true },
+    });
+    assert.ok(close(o.costs.ongoingApr, L70 * risk.lossApr));
   });
 
   it("backs my own position out of both markets", () => {

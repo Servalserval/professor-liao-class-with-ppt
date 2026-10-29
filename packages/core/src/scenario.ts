@@ -1,10 +1,21 @@
 import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { parse } from "yaml";
 import { deepMerge, DEFAULT_CONFIG, validateConfig, type RouterConfig } from "./config.js";
+import type { LoopPair } from "./sources/loopPair.js";
+import type { SupplyMarket } from "./sources/supply.js";
 import { PaperExecutor } from "./executor.js";
 import { Router, type CycleReport } from "./monitor.js";
 import { CollectingNotifier } from "./notify.js";
-import { StaticSource, type StaticOppSpec, type StaticStreamSpec } from "./sources/static.js";
+import { formatSelection } from "./selection.js";
+import {
+  isPlainSpec,
+  StaticSource,
+  type StaticLoopSpec,
+  type StaticOppSpec,
+  type StaticStreamSpec,
+  type StaticSupplySpec,
+} from "./sources/static.js";
 import type { Source, SourceContext } from "./sources/types.js";
 import { MemoryStore, newState, sumIdle } from "./store.js";
 import type { Opportunity, TokenProfile } from "./types.js";
@@ -24,6 +35,9 @@ export interface ScenarioPatch {
   metrics?: Record<string, number>;
   hidden?: boolean;
   health_value?: number;
+  /** Real-math entries: fields deep-merged into the `supply_market:` / `loop_pair:` object (arrays replace). */
+  supply_market?: Partial<SupplyMarket> & Record<string, unknown>;
+  loop_pair?: Partial<LoopPair> & Record<string, unknown>;
 }
 
 export interface ScenarioEvent {
@@ -37,11 +51,21 @@ export interface ScenarioEvent {
   bridge?: Record<string, PaperBridgeBehavior>;
 }
 
-/** Static spec + the asset that must be on hand to enter (defaults to `token` on `chain`). */
-export type ScenarioOppSpec = StaticOppSpec & { funding_asset?: string };
+/**
+ * Hand-written static spec (+ the asset that must be on hand to enter,
+ * defaults to `token` on `chain`), or an entry priced by the real math:
+ * `supply_market: {...SupplyMarket}` / `loop_pair: {...LoopPair}` (opportunity
+ * id `static:<protocol>:<marketId | pairId>`; patch it by that id).
+ */
+export type ScenarioOppSpec = (StaticOppSpec & { funding_asset?: string }) | StaticSupplySpec | StaticLoopSpec;
 
 export interface Scenario {
   name: string;
+  /**
+   * Path (relative to this file) of a base scenario: this file is deep-merged
+   * onto it (objects merge, arrays replace) — for what-if variants.
+   */
+  extends?: string;
   /** Single idle bucket (legacy). Ignored when `idle` is given. */
   start_equity_usd?: number;
   /**
@@ -97,13 +121,28 @@ class FundingAssetSource implements Source {
   }
 }
 
-export function loadScenario(path: string): Scenario {
-  return parse(readFileSync(path, "utf8")) as Scenario;
+export function loadScenario(path: string, depth = 0): Scenario {
+  const doc = parse(readFileSync(path, "utf8")) as Scenario;
+  if (!doc.extends) return doc;
+  if (depth > 5) throw new Error(`scenario extends chain too deep at ${path}`);
+  const base = loadScenario(resolve(dirname(path), doc.extends), depth + 1);
+  const { extends: _e, ...over } = doc;
+  return deepMerge(base, over) as Scenario;
 }
 
-function applyPatch(src: StaticSource, oppId: string, p: ScenarioPatch) {
-  const spec = src.specs.find((s) => s.id === oppId);
-  if (!spec) throw new Error(`scenario patch: unknown opportunity ${oppId}`);
+function applyPatch(src: StaticSource<ScenarioOppSpec>, oppId: string, p: ScenarioPatch) {
+  const entry = src.find(oppId);
+  if (!entry) throw new Error(`scenario patch: unknown opportunity ${oppId}`);
+  if (p.hidden !== undefined) {
+    if (p.hidden) src.hidden.add(oppId);
+    else src.hidden.delete(oppId);
+  }
+  if (!isPlainSpec(entry)) {
+    if ("supply_market" in entry && p.supply_market) entry.supply_market = deepMerge(entry.supply_market, p.supply_market);
+    if ("loop_pair" in entry && p.loop_pair) entry.loop_pair = deepMerge(entry.loop_pair, p.loop_pair);
+    return;
+  }
+  const spec = entry;
   if (p.capacity_usd !== undefined) spec.capacity_usd = p.capacity_usd;
   for (const [label, sp] of Object.entries(p.streams ?? {})) {
     const s = spec.streams.find((x) => x.label === label);
@@ -118,10 +157,6 @@ function applyPatch(src: StaticSource, oppId: string, p: ScenarioPatch) {
   if (p.flags) spec.flags = p.flags;
   if (p.metrics) spec.metrics = { ...(spec.metrics ?? {}), ...p.metrics };
   if (p.health_value !== undefined && spec.health) spec.health.value = p.health_value;
-  if (p.hidden !== undefined) {
-    if (p.hidden) src.hidden.add(oppId);
-    else src.hidden.delete(oppId);
-  }
 }
 
 export async function runScenario(sc: Scenario): Promise<ScenarioResult> {
@@ -139,7 +174,8 @@ export async function runScenario(sc: Scenario): Promise<ScenarioResult> {
 
   const src = new StaticSource(sc.opportunities, "static", start);
   const fundingAsset: Record<string, { chain: string; asset: string }> = {};
-  for (const o of sc.opportunities) if (o.funding_asset) fundingAsset[o.id] = { chain: o.chain, asset: o.funding_asset };
+  for (const o of sc.opportunities)
+    if (isPlainSpec(o) && o.funding_asset) fundingAsset[o.id] = { chain: o.chain, asset: o.funding_asset };
   const failSim = new Set<string>();
   const failExit = new Set<string>();
   const exec = new PaperExecutor({ failExitSim: (p) => failSim.has(p.oppId), failExit: (p) => failExit.has(p.oppId) });
@@ -192,10 +228,15 @@ export async function runScenario(sc: Scenario): Promise<ScenarioResult> {
   };
 }
 
-const usd = (x: number) => `$${Math.round(x).toLocaleString("en-US")}`;
+const usd = (x: number) => `$${(Math.abs(x) < 0.5 ? 0 : Math.round(x)).toLocaleString("en-US")}`;
 const FUNDING_RULES = /\b(dest_apr|one_day_yield|payback|book_budget|min_move|in_flight|no enabled route|disabled|no idle bucket|after move cost)\b/g;
 
-export function formatScenario(r: ScenarioResult, verbose = false): string {
+/**
+ * `why`: print the selection table (explainSelection) on step 0 and on every
+ * step where money was allocated (an entry or a move), i.e. why each candidate
+ * was picked or not on the one risk-adjusted scale.
+ */
+export function formatScenario(r: ScenarioResult, verbose = false, why = false): string {
   const out = [`# ${r.name}`];
   // funding refusals are printed when they start or their rule changes, not every step
   const lastFunding: Record<string, string> = {};
@@ -211,7 +252,7 @@ export function formatScenario(r: ScenarioResult, verbose = false): string {
       refusals.push(`   ✗ NO MOVE for ${id}: ${f}`);
     }
     const xf = l.report.transfers ?? [];
-    if (!l.note && !acts.length && !xf.length && !refusals.length && !l.messages.some((m) => m.level !== "info")) continue;
+    if (!(why && l.step === 0) && !l.note && !acts.length && !xf.length && !refusals.length && !l.messages.some((m) => m.level !== "info")) continue;
     const buckets = Object.entries(l.report.idle ?? {});
     const idleTxt = buckets.length
       ? `  | idle ${buckets.map(([k, v]) => `${k} ${usd(v)}`).join(", ")}${l.report.inFlightUsd > 0 ? ` | in flight ${usd(l.report.inFlightUsd)}` : ""}`
@@ -251,6 +292,12 @@ export function formatScenario(r: ScenarioResult, verbose = false): string {
     out.push(...late.map(xfLine));
     out.push(...refusals);
     for (const m of l.messages.filter((m) => m.level !== "info")) out.push(`   [${m.level}] ${m.text}`);
+    const allocated = acts.some((a) => a.action.type === "enter") || late.length > 0 || l.step === 0;
+    if (why && allocated && l.report.selection?.length)
+      out.push(
+        "   why (one scale: net = raw - haircut - depeg - costs - move, vs the tier/kind entry threshold):",
+        ...formatSelection(l.report.selection).split("\n").map((x) => `     ${x}`)
+      );
   }
   const pnl = r.finalEquityUsd - r.startEquityUsd;
   out.push(`final equity $${Math.round(r.finalEquityUsd)} (${pnl >= 0 ? "+" : ""}${Math.round(pnl)})`);

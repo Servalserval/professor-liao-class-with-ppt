@@ -29,6 +29,22 @@ export interface VenueConfig {
   };
 }
 
+/**
+ * Depeg-risk profile of one stablecoin (provisional defaults below; replace
+ * with researched values). Used by supply deposits and loops.
+ */
+export interface StableConfig {
+  /** 1 = fiat-backed blue chip, 2 = established synthetic / smaller issuer, 3 = new / unverified. */
+  tier: Tier;
+  /** Expected yearly loss from depegs (probability x severity), APR fraction. Default: tiers_default_loss[tier]. */
+  expected_loss_apr?: number;
+  /** |price - 1| warn / exit levels for this asset (override sources.lending_loop.depeg_warn / depeg_exit). */
+  depeg_warn?: number;
+  depeg_exit?: number;
+  /** Max share of total equity held in this asset across ALL positions (legs by token). */
+  max_frac?: number;
+}
+
 export interface RouterConfig {
   /** What idle capital earns elsewhere (T-bill / sUSDS). Thresholds are premia over it. */
   baseline_apr: number;
@@ -45,6 +61,12 @@ export interface RouterConfig {
     /** Non-urgent exit reasons must persist this many cycles AND this many minutes. */
     confirm_cycles: number;
     confirm_minutes: number;
+    /**
+     * Per-kind adjustment added to the tier premia (entry is never below
+     * baseline_apr). Plain deposits carry no liquidation / swap risk, so they
+     * clear a lower bar than loops at the same venue tier.
+     */
+    kind_premium_adjust: Partial<Record<Kind, { entry: number; exit: number }>>;
   };
 
   liquidity: {
@@ -174,7 +196,21 @@ export interface RouterConfig {
       chains: string[];
       assumed_withdrawable_frac: number;
     };
+    /** Supply-only lending (sources/supply.ts). Utilization levels are shared with lending_loop. */
+    supply: {
+      /** Deposits into a stable whose depeg tier is above this are refused. */
+      max_risk_tier: Tier;
+      /** Tier assumed for a stablecoin that is not in `stables`. */
+      unknown_stable_tier: Tier;
+      txs_per_entry: number;
+      txs_per_exit: number;
+    };
   };
+
+  /** Depeg-risk table per stablecoin symbol (see StableConfig). */
+  stables: Record<string, StableConfig>;
+  /** Expected depeg loss APR used for a stable that has a tier but no expected_loss_apr. */
+  tiers_default_loss: Record<Tier, number>;
 
   /** Cross-chain funding (packages/core/src/xchain). */
   xchain: {
@@ -212,6 +248,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
     spread_reduce_step: 0.5,
     confirm_cycles: 2,
     confirm_minutes: 10,
+    kind_premium_adjust: { deposit: { entry: -0.015, exit: -0.01 } },
   },
   liquidity: {
     entry_max_frac_of_capacity: 0.1,
@@ -299,7 +336,28 @@ export const DEFAULT_CONFIG: RouterConfig = {
       chains: [],
       assumed_withdrawable_frac: 0.3,
     },
+    supply: { max_risk_tier: 2, unknown_stable_tier: 3, txs_per_entry: 2, txs_per_exit: 1 },
   },
+  // PROVISIONAL tiers (to be replaced by researched values); losses default to tiers_default_loss.
+  stables: {
+    USDC: { tier: 1 },
+    "USDC.e": { tier: 1 },
+    USDT: { tier: 1 },
+    USDT0: { tier: 1 },
+    USDt: { tier: 1 },
+    DAI: { tier: 1 },
+    USDS: { tier: 1 },
+    PYUSD: { tier: 2 },
+    GHO: { tier: 2 },
+    USDe: { tier: 2 },
+    sUSDe: { tier: 2 },
+    AUSD: { tier: 2 },
+    USDG: { tier: 2 },
+    frxUSD: { tier: 2 },
+    crvUSD: { tier: 2 },
+    USDsui: { tier: 2 },
+  },
+  tiers_default_loss: { 1: 0.0005, 2: 0.003, 3: 0.015 },
   xchain: {
     enabled: false,
     max_cost_days_of_yield: 1,
@@ -360,6 +418,25 @@ export function validateConfig(c: RouterConfig): string[] {
     e.push("portfolio.kill_confirm_cycles must be an integer >= 1");
   if (c.caps.max_total_deployed_usd !== undefined && !(c.caps.max_total_deployed_usd >= 0))
     e.push("caps.max_total_deployed_usd must be >= 0");
+  const tierOk = (t: unknown) => t === 1 || t === 2 || t === 3;
+  for (const [sym, sc] of Object.entries(c.stables ?? {})) {
+    if (!tierOk(sc.tier)) e.push(`stables.${sym}.tier must be 1, 2 or 3`);
+    if (sc.expected_loss_apr !== undefined && !(sc.expected_loss_apr >= 0 && sc.expected_loss_apr < 1)) e.push(`stables.${sym}.expected_loss_apr must be in [0,1)`);
+    if (sc.max_frac !== undefined) frac(`stables.${sym}.max_frac`, sc.max_frac);
+    if (sc.depeg_warn !== undefined && sc.depeg_exit !== undefined && !(sc.depeg_exit > sc.depeg_warn))
+      e.push(`stables.${sym}.depeg_exit must be > depeg_warn`);
+  }
+  for (const t of [1, 2, 3] as Tier[]) if (!(c.tiers_default_loss[t] >= 0)) e.push(`tiers_default_loss.${t} must be >= 0`);
+  if (!tierOk(c.sources.supply.max_risk_tier)) e.push("sources.supply.max_risk_tier must be 1, 2 or 3");
+  if (!tierOk(c.sources.supply.unknown_stable_tier)) e.push("sources.supply.unknown_stable_tier must be 1, 2 or 3");
+  for (const [kind, adj] of Object.entries(c.thresholds.kind_premium_adjust ?? {})) {
+    if (!adj) continue;
+    for (const t of [1, 2, 3] as Tier[]) {
+      const entry = Math.max(c.baseline_apr, c.baseline_apr + c.thresholds.entry_premium_by_tier[t] + adj.entry);
+      const exit = c.baseline_apr + c.thresholds.exit_premium_by_tier[t] + adj.exit;
+      if (exit >= entry) e.push(`thresholds.kind_premium_adjust.${kind}: exit must stay below entry for tier ${t} (hysteresis)`);
+    }
+  }
   if (c.portfolio.blind_exit_cycles < c.portfolio.blind_alert_cycles)
     e.push("portfolio.blind_exit_cycles must be >= blind_alert_cycles");
   return e;

@@ -44,6 +44,12 @@ export function entryBlockers(opp: Opportunity, ctx: DecisionContext): string[] 
       r.push(`health ${h.metric}=${h.value.toFixed(4)} past rebalance level`);
   }
 
+  // Supply deposits: the stable's depeg-risk tier must be acceptable (loops keep
+  // their own rules and only pay the expected-loss haircut).
+  const sr = opp.meta?.["stableRisk"] as { symbol: string; tier: number } | undefined;
+  if (opp.kind === "deposit" && sr && sr.tier > cfg.sources.supply.max_risk_tier)
+    r.push(`depeg risk tier ${sr.tier} > max ${cfg.sources.supply.max_risk_tier} (${sr.symbol})`);
+
   const cap = effectiveCapacity(cfg, opp);
   if (cap < cfg.liquidity.min_capacity_usd)
     r.push(`exit capacity $${Math.round(cap)} < min $${cfg.liquidity.min_capacity_usd}`);
@@ -91,7 +97,7 @@ export function checkSizedEntry(opp: Opportunity, fromUsd: number, toUsd: number
     if (v.netApr < -cfg.points.max_cost_apr) r.push(`points cost ${pct(-v.netApr)}/yr > max ${pct(cfg.points.max_cost_apr)}`);
     if (marginal < -cfg.points.max_cost_apr) r.push(`marginal points cost ${pct(-marginal)}/yr too high`);
   } else {
-    const th = entryThreshold(cfg, tier);
+    const th = entryThreshold(cfg, tier, opp.kind);
     if (v.netApr < th) r.push(`net APR ${pct(v.netApr)} < entry ${pct(th)} (tier ${tier})`);
     if (marginal < th) r.push(`marginal APR ${pct(marginal)} < entry ${pct(th)}`);
   }

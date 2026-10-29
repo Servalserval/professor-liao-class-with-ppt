@@ -16,6 +16,11 @@ thresholds:
   spread_reduce_step: 0.5      # trim size per confirmed spread breach
   confirm_cycles: 2            # non-urgent reasons must persist this many cycles...
   confirm_minutes: 10          # ...and at least this long (a 60s poll alone would be a 2-min debounce)
+  # Added to the tier premia per kind (entry never below baseline_apr). A plain
+  # deposit has no liquidation / swap / leverage risk, so it clears a lower bar:
+  # tier 1 deposit entry = 4.5% + 3% - 1.5% = 6%, exit = 4.5% + 0% - 1% = 3.5%.
+  kind_premium_adjust:
+    deposit: {entry: -0.015, exit: -0.01}
 
 # The generalized 1/10 -> 1/5 rule. "capacity" = what can get out (lending: available
 # liquidity; LP: depth for the volatile side; perp: min book depth of both venues).
@@ -123,6 +128,36 @@ sources:
     min_tvl_usd: 1000000
     chains: []
     assumed_withdrawable_frac: 0.3
+  supply:                         # supply-only lending (deposit, no borrow): sources/supply.ts
+    max_risk_tier: 2              # refuse deposits into stables whose depeg tier is above this
+    unknown_stable_tier: 3        # a stable missing from `stables` is treated as tier 3
+    txs_per_entry: 2              # approve + deposit
+    txs_per_exit: 1
+
+# Stablecoin depeg risk (deposits AND loops). PROVISIONAL tiers — replace with
+# researched values. The expected loss is charged as a running cost:
+#   deposit / same-asset loop: 1 x loss(asset); two-asset loop: L x loss(collateral).
+# Per stable: tier (1|2|3), expected_loss_apr (default tiers_default_loss[tier]),
+# depeg_warn / depeg_exit (|price-1| levels, override sources.lending_loop), and
+# max_frac (cap on that asset across ALL positions, share of total equity).
+stables:
+  USDC:   {tier: 1}
+  USDC.e: {tier: 1}
+  USDT:   {tier: 1}
+  USDT0:  {tier: 1}
+  USDt:   {tier: 1}
+  DAI:    {tier: 1}
+  USDS:   {tier: 1}
+  PYUSD:  {tier: 2}
+  GHO:    {tier: 2}
+  USDe:   {tier: 2}
+  sUSDe:  {tier: 2}
+  AUSD:   {tier: 2}
+  USDG:   {tier: 2}
+  frxUSD: {tier: 2}
+  crvUSD: {tier: 2}
+  USDsui: {tier: 2}
+tiers_default_loss: {1: 0.0005, 2: 0.003, 3: 0.015}   # expected depeg loss APR by tier (provisional)
 
 telegram:
   bot_token_env: TG_BOT_TOKEN

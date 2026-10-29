@@ -8,6 +8,7 @@
  */
 import { gasUsd } from "../config.js";
 import { median, recentMetricValues } from "../signals.js";
+import { depegLevels, stableRisk } from "../stables.js";
 import type { Flag, Opportunity, StressSignal, YieldStream } from "../types.js";
 import { proRataStream } from "../valuation.js";
 import { interpIrm, type IrmModel, type RewardRate } from "./loopLending.js";
@@ -286,13 +287,19 @@ export function loopPairOpportunity(
   });
   const expRatio = pair.expectedPriceRatio !== undefined && fin(pair.expectedPriceRatio) && pair.expectedPriceRatio > 0 ? pair.expectedPriceRatio : 1;
   const depeg = same ? 0 : Math.abs(D.priceUsd / C.priceUsd / expRatio - 1);
+  // per-stable depeg levels (strictest of the two legs) override the lending_loop defaults
+  const dl = depegLevels(ctx.cfg, [C.symbol, D.symbol]);
+  // Expected depeg loss as a running cost: a same-asset loop is exposed 1x
+  // (both legs move together); a pair conservatively L x on the collateral.
+  const risk = stableRisk(ctx.cfg, C.symbol);
+  const depegLossApr = (same ? 1 : L) * risk.lossApr;
   const signalsAt = (uc: number, ud: number): StressSignal[] =>
     same
       ? [sig("utilization", uc, ll.utilization_warn, ll.utilization_exit)]
       : [
           sig("utilization:collateral", uc, ll.utilization_warn, ll.utilization_exit),
           sig("utilization:debt", ud, ll.utilization_warn, ll.utilization_exit),
-          sig("depeg", depeg, ll.depeg_warn, ll.depeg_exit),
+          sig("depeg", depeg, dl.warn, dl.exit),
         ];
 
   // Two assets: unwinding withdraws L*E collateral from the collateral market
@@ -341,7 +348,7 @@ export function loopPairOpportunity(
       exitFrac: (L - 1) * swapCostFrac + (ll.footprint === "net" ? (L - 1) * (pair.flashloanFeeFrac ?? 0) : 0),
       fixedEntryUsd: gas * ll.txs_per_entry,
       fixedExitUsd: gas * ll.txs_per_exit,
-      ongoingApr: 0,
+      ongoingApr: depegLossApr,
     },
     liquidity: {
       exitCapacityUsd,
@@ -372,7 +379,14 @@ export function loopPairOpportunity(
     funding: { chain: pair.chain, asset: C.symbol },
     myEquityUsd: myE,
     observedAtMs: ctx.nowMs,
-    meta: { leverage: L, ltv, pairId: pair.pairId, debtSymbol: D.symbol },
+    meta: {
+      leverage: L,
+      ltv,
+      pairId: pair.pairId,
+      debtSymbol: D.symbol,
+      depegLossApr,
+      stableRisk: { symbol: C.symbol, tier: risk.tier, lossApr: risk.lossApr, known: risk.known },
+    },
   };
   if (pair.dataAsOfMs !== undefined) o.dataAsOfMs = pair.dataAsOfMs;
   if (Object.keys(rewardNotes).length) o.meta = { ...o.meta, rewardNotes };

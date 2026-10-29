@@ -8,6 +8,8 @@ export * from "./gates/common.js";
 export * from "./gates/entry.js";
 export * from "./gates/exit.js";
 export * from "./allocator.js";
+export * from "./selection.js";
+export * from "./stables.js";
 export * from "./rewards.js";
 export * from "./store.js";
 export * from "./notify.js";

@@ -1,5 +1,5 @@
 import type { RouterConfig, VenueConfig } from "./config.js";
-import type { Tier } from "./types.js";
+import type { Kind, Tier } from "./types.js";
 
 /**
  * Protocol tiering. The loop-farm config had a hand-set tier per protocol;
@@ -47,11 +47,17 @@ export function venueEnabled(cfg: RouterConfig, venue: string): boolean {
   return cfg.venues[venue]?.enabled ?? true;
 }
 
-/** Entry threshold = baseline + tier premium; exit threshold is lower (hysteresis). */
-export function entryThreshold(cfg: RouterConfig, tier: Tier): number {
-  return cfg.baseline_apr + cfg.thresholds.entry_premium_by_tier[tier];
+/**
+ * Entry threshold = baseline + tier premium + kind adjustment (never below
+ * baseline_apr); the exit threshold is lower (hysteresis). Plain deposits get
+ * a negative adjustment by default: no liquidation, no swap, no leverage.
+ */
+export function entryThreshold(cfg: RouterConfig, tier: Tier, kind?: Kind): number {
+  const adj = kind ? cfg.thresholds.kind_premium_adjust?.[kind]?.entry ?? 0 : 0;
+  return Math.max(cfg.baseline_apr, cfg.baseline_apr + cfg.thresholds.entry_premium_by_tier[tier] + adj);
 }
 
-export function exitThreshold(cfg: RouterConfig, tier: Tier): number {
-  return cfg.baseline_apr + cfg.thresholds.exit_premium_by_tier[tier];
+export function exitThreshold(cfg: RouterConfig, tier: Tier, kind?: Kind): number {
+  const adj = kind ? cfg.thresholds.kind_premium_adjust?.[kind]?.exit ?? 0 : 0;
+  return cfg.baseline_apr + cfg.thresholds.exit_premium_by_tier[tier] + adj;
 }
