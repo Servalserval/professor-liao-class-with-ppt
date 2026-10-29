@@ -18,6 +18,7 @@ export * from "./validate.js";
 export * from "./sources/types.js";
 export * from "./sources/loopLending.js";
 export * from "./sources/loopPair.js";
+export * from "./sources/supply.js";
 export * from "./xchain/index.js";
 export * from "./sources/perpHedge.js";
 export * from "./sources/lpIncentive.js";

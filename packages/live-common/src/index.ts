@@ -8,7 +8,7 @@
  *  - USD values are numbers. APRs are yearly fractions.
  *  - Every write method honours `ctx.dryRun`: build + simulate, never broadcast.
  */
-import type { LoopPair } from "@incentive-router/core";
+import type { LoopPair, SupplyMarket } from "@incentive-router/core";
 
 export * from "./chains.js";
 export * from "./keys.js";
@@ -142,6 +142,46 @@ export interface LendingAdapter {
   /** Claim all claimable rewards for the wallet (optionally one pair). */
   claimRewards(ctx: LiveContext, pairId?: string): Promise<LiveResult & { claimed: { token: string; amount: bigint; decimals: number }[] }>;
   /** Wallet balance of an asset on this chain (base units). */
+  walletBalance(asset: AssetRef): Promise<bigint>;
+}
+
+// ---------------------------------------------------------------------------
+// Supply-only lending (plain deposits: no borrow, no leverage)
+// ---------------------------------------------------------------------------
+
+export interface SupplyPositionView {
+  marketId: string;
+  /** Value of my deposit now, USD (market price of the asset). */
+  depositUsd: number;
+  /** My deposit in base units of the underlying asset. */
+  units: bigint;
+  rewardsUnclaimed: { token: string; amount: bigint; decimals: number; usd: number }[];
+  asOfMs: number;
+}
+
+/**
+ * A venue that takes plain deposits (an Aave reserve, a Navi pool, an ERC-4626
+ * vault such as an Euler EVault / Fluid fToken / MetaMorpho vault / sUSDS).
+ * A lending adapter may implement both LendingAdapter and SupplyAdapter (the
+ * shared `claimRewards` / `walletBalance` have the same signatures).
+ * Every write honours ctx.dryRun (build + simulate only) like LendingAdapter.
+ */
+export interface SupplyAdapter {
+  readonly id: string;
+  readonly chain: string;
+  /** Every configured supply market (core SupplyMarket). */
+  supplyMarkets(): Promise<SupplyMarket[]>;
+  supplyPosition(marketId: string): Promise<SupplyPositionView | null>;
+  /** Deposit `amount` base units of the market's asset (already in the wallet on this chain). */
+  deposit(marketId: string, amount: bigint, ctx: LiveContext): Promise<LiveResult>;
+  /** Withdraw `fraction` (0..1] of my deposit to the wallet; 1 = everything (max semantics, no dust). */
+  withdraw(marketId: string, fraction: number, ctx: LiveContext): Promise<LiveResult>;
+  /**
+   * Simulate a full withdraw now. true = it would succeed; false = it would
+   * revert / not enough liquidity; THROW on read errors (unknown, not a failure).
+   */
+  simulateWithdraw(marketId: string, ctx: LiveContext): Promise<boolean>;
+  claimRewards(ctx: LiveContext, marketId?: string): Promise<LiveResult & { claimed: { token: string; amount: bigint; decimals: number }[] }>;
   walletBalance(asset: AssetRef): Promise<bigint>;
 }
 

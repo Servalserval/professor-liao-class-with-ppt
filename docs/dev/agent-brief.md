@@ -37,3 +37,12 @@ Core types to know: `LoopPair`, `LoopLeg` (packages/core/src/sources/loopPair.ts
 - What is verified (typecheck, tests) vs what must be verified live (exact checks).
 - Open risks / TODOs, ranked.
 Keep it under ~600 words.
+
+## Supply-only lending (round 2)
+
+Contracts (orchestrator-owned, do not edit): `SupplyMarket` / `SupplySource` / `supplyOpportunity` in
+`packages/core/src/sources/supply.ts` (the core agent implements the function bodies) and
+`SupplyAdapter` / `SupplyPositionView` in `packages/live-common/src/index.ts`. A lending adapter may
+implement both `LendingAdapter` and `SupplyAdapter`; `claimRewards` / `walletBalance` are shared.
+Sends go through `sendTx` / `executePtb`, which now sign locally and throw `BroadcastUnconfirmedError`
+(live-common) when a broadcast's fate is unknown: never treat that as "nothing happened" — re-read state.
