@@ -1,5 +1,5 @@
 /** Aave v3 family (official markets + forks) live adapter. */
-export { AaveV3Adapter, type AaveV3AdapterOptions, type AavePairDiagnostics } from "./adapter.js";
+export { AaveV3Adapter, isRevertError, type AaveV3AdapterOptions, type AavePairDiagnostics } from "./adapter.js";
 export {
   aaveAdapterId,
   aaveAssetFromAddressBook,

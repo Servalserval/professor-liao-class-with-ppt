@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  ExecutionRevertedError,
   decodeFunctionData,
   encodeFunctionData,
   encodeFunctionResult,
@@ -539,6 +540,8 @@ class MockAave {
           if (r.paused) throw new Error("RESERVE_PAUSED");
           const aB = this.bal(this.aBal, r.asset);
           const amt = (a[1] as bigint) === MAX_UINT256 ? aB : (a[1] as bigint);
+          const liquid = r.otherSupply + aB - r.otherDebt - this.bal(this.vBal, r.asset);
+          if (amt > liquid) throw new Error("NOT_ENOUGH_AVAILABLE_USER_BALANCE (liquidity)");
           this.add(this.aBal, r.asset, -amt);
           this.add(this.wallet, r.asset, amt);
           const acct = this.account();
@@ -778,14 +781,19 @@ function makeMarket(): MockAave {
 const signed = new Map<string, { to: Address; data: Hex }>();
 let signCounter = 0;
 
-function makeClient(state: { m: MockAave }, opts: { simulateCalls: boolean }) {
+type MockState = { m: MockAave; rpcDown?: boolean; raw?: "ok" | "lost" | "landed-but-error" };
+
+function makeClient(state: MockState, opts: { simulateCalls: boolean }) {
   const client: Record<string, unknown> = {
     sendRawTransaction: async (a: { serializedTransaction: Hex }) => {
       const tx = signed.get(a.serializedTransaction);
       if (!tx) throw new Error("unknown raw tx");
+      if (state.raw === "lost") throw new Error("request timed out");
       state.m.apply(tx.to, tx.data);
+      if (state.raw === "landed-but-error") throw new Error("502 bad gateway");
       return "0xabc";
     },
+    getBlock: async () => ({ timestamp: 1_800_000_000n }),
     getTransaction: async () => null,
     readContract: async (a: { address: Address; functionName: string; args?: readonly unknown[] }) => state.m.read(a.address, a.functionName, a.args),
     multicall: async (a: { contracts: { address: Address; functionName: string; args?: readonly unknown[] }[] }) =>
@@ -798,7 +806,12 @@ function makeClient(state: { m: MockAave }, opts: { simulateCalls: boolean }) {
       }),
     call: async (a: { to: Address; data: Hex }) => {
       if (lc(a.to) === lc(UI)) return { data: state.m.uiData() };
-      state.m.clone().apply(a.to, a.data);
+      if (state.rpcDown) throw new Error("HTTP request failed: fetch failed");
+      try {
+        state.m.clone().apply(a.to, a.data);
+      } catch (e) {
+        throw new ExecutionRevertedError({ message: `execution reverted: ${(e as Error).message}` });
+      }
       return { data: "0x" };
     },
     estimateGas: async () => 200_000n,
@@ -874,7 +887,7 @@ const ctx = (dryRun: boolean): LiveContext => ({
 });
 
 function setup(opts: { simulateCalls?: boolean; extra?: boolean; layout?: UiLayout } = {}) {
-  const state = { m: makeMarket() };
+  const state: MockState = { m: makeMarket() };
   if (opts.layout) state.m.layout = opts.layout;
   const publicClient = makeClient(state, { simulateCalls: opts.simulateCalls ?? true });
   const walletClient = {
@@ -1345,5 +1358,192 @@ describe("AaveV3Adapter review fixes: rollbacks, stuck unwinds, swap depth", () 
     c.swapper.costAtUsd = () => 70; // even the smallest probe is over the 50 bps entry budget
     pair = (await c.adapter.markets()).find((p) => p.pairId === "USDe/USDT0")!;
     assert.equal(pair.swapDepthUsd, 0);
+  });
+});
+
+describe("AaveV3Adapter as SupplyAdapter (plain deposits)", () => {
+  function setupSupply() {
+    const state: MockState = { m: makeMarket() };
+    const publicClient = makeClient(state, { simulateCalls: true });
+    const walletClient = {
+      account: { address: ME },
+      prepareTransactionRequest: async (a: { to: Address; data: Hex }) => ({ ...a, nonce: 7 }),
+      signTransaction: async (a: { to: Address; data: Hex }) => {
+        const raw = `0x${(++signCounter).toString(16).padStart(64, "0")}` as Hex;
+        signed.set(raw, { to: a.to, data: a.data });
+        return raw;
+      },
+    } as unknown as WalletClient;
+    const env: EvmEnv = { chain: "plasma", viemChain: viemChainFor("plasma", "http://127.0.0.1:1"), publicClient, walletClient, account: ME, lock: new Mutex() };
+    const queries: RewardRateQuery[] = [];
+    const merkl: RewardRate = { token: "USDC-merkl", apr: 0.03 };
+    const adapter = new AaveV3Adapter({
+      env,
+      market,
+      pairs: [],
+      supply: [{ asset: usdc }, { asset: usde, marketId: "aUSDe" }],
+      extraRewards: async (q) => {
+        queries.push(q);
+        return lc(q.marketId ?? "") === lc(state.m.res(USDC).aToken) ? [merkl] : [];
+      },
+    });
+    return { state, adapter, queries, env };
+  }
+  const USDC_UNIT = 10n ** 6n;
+
+  it("refuses a supply asset that is also a loop-pair asset in the same market", () => {
+    const { env } = setupSupply();
+    assert.throws(
+      () => new AaveV3Adapter({ env, market, pairs: [pairs[0]!], supply: [{ asset: usdc }] }),
+      /also an asset of loop pair USDC\/USDC.*separate wallet/
+    );
+    assert.throws(() => new AaveV3Adapter({ env, market, pairs: [], supply: [{ asset: usdc }, { asset: usdc, marketId: "x" }] }), /configured twice/);
+  });
+
+  it("supplyMarkets(): mapping from the data provider read; extraRewards carries the aToken", async () => {
+    const { state, adapter, queries } = setupSupply();
+    assert.deepEqual(await adapter.markets(), []);
+    const ms = await adapter.supplyMarkets();
+    assert.equal(ms.length, 2);
+    const m = ms.find((x) => x.marketId === "USDC")!;
+    assert.equal(m.protocol, "aave-v3");
+    assert.equal(m.chain, "plasma");
+    assert.deepEqual(m.asset, { symbol: "USDC", assetId: lc(USDC), priceUsd: 1 });
+    assert.equal(m.supplyAprBase, 0.04);
+    assert.deepEqual(m.irm!.points, [
+      [0, 0],
+      [0.9, 0.04],
+      [1, 0.64],
+    ]);
+    assert.equal(m.irm!.reserveFactor, 0.1);
+    assert.equal(m.totalSupplyUsd, 50_000_000);
+    assert.equal(m.totalBorrowUsd, 30_000_000);
+    assert.equal(m.withdrawableUsd, 20_000_000);
+    assert.equal(m.supplyCapRemainingUsd, 50_000_000);
+    assert.equal(m.paused, false);
+    assert.equal(m.myDepositUsd, 0);
+    assert.equal(m.dataAsOfMs, 1_800_000_000_000);
+    assert.deepEqual(m.rewards, [{ token: "USDC-merkl", apr: 0.03 }]);
+    const q = queries.find((x) => x.asset.symbol === "USDC")!;
+    assert.deepEqual(q, { protocol: "aave-v3", chain: "plasma", asset: usdc, side: "supply", marketId: state.m.res(USDC).aToken });
+    assert.ok(queries.every((x) => x.side === "supply"));
+    // native RewardsController stream on the USDe reserve
+    assert.ok(ms.find((x) => x.marketId === "aUSDe")!.rewards.some((r) => r.token === "XPL"));
+
+    state.m.reserves[2]!.frozen = true;
+    const frozen = (await adapter.supplyMarkets()).find((x) => x.marketId === "USDC")!;
+    assert.equal(frozen.paused, true);
+    assert.match(frozen.note!, /withdrawals still allowed/);
+  });
+
+  it("deposit: exact approve + supply, leftover allowance reset, no collateral toggle; withdraw half then max", async () => {
+    const { state, adapter } = setupSupply();
+    const dry = await adapter.deposit("USDC", 1_000n * USDC_UNIT, ctx(true));
+    assert.equal(dry.ok, true, dry.detail);
+    assert.equal(dry.txs.length, 2);
+    assert.equal(state.m.bal(state.m.aBal, USDC), 0n);
+
+    state.m.allowance.set(lc(USDC), 5_000n * USDC_UNIT); // stale bigger allowance: no approve needed, leftover must be reset
+    const r = await adapter.deposit("USDC", 1_000n * USDC_UNIT, ctx(false));
+    assert.equal(r.ok, true, r.detail);
+    assert.equal(state.m.bal(state.m.aBal, USDC), 1_000n * USDC_UNIT);
+    assert.equal(state.m.bal(state.m.allowance, USDC), 0n);
+    assert.ok(!r.txs.some((t) => /collateral/i.test(t.description)));
+    assert.equal(r.amountUsd, 1000);
+    const pos = (await adapter.supplyPosition("USDC"))!;
+    assert.equal(pos.units, 1_000n * USDC_UNIT);
+    assert.equal(pos.depositUsd, 1000);
+    assert.equal((await adapter.supplyMarkets()).find((x) => x.marketId === "USDC")!.myDepositUsd, 1000);
+    assert.equal(await adapter.simulateWithdraw("USDC", ctx(true)), true);
+
+    const half = await adapter.withdraw("USDC", 0.5, ctx(false));
+    assert.equal(half.ok, true, half.detail);
+    assert.equal(state.m.bal(state.m.aBal, USDC), 500n * USDC_UNIT);
+    const all = await adapter.withdraw("USDC", 1, ctx(false));
+    assert.equal(all.ok, true, all.detail);
+    assert.match(all.txs[0]!.description, /withdraw max/);
+    assert.equal(state.m.bal(state.m.aBal, USDC), 0n);
+    assert.equal(state.m.bal(state.m.wallet, USDC), 100_000n * USDC_UNIT);
+    assert.equal(await adapter.supplyPosition("USDC"), null);
+    assert.equal((await adapter.withdraw("USDC", 1, ctx(false))).detail, "no deposit");
+  });
+
+  it("refusals: supply cap, frozen deposit, utilization-locked withdraw; frozen still withdraws; paused does not", async () => {
+    const { state, adapter } = setupSupply();
+    const usdcRes = state.m.reserves[2]!;
+    usdcRes.otherSupply = 100_000_000n * USDC_UNIT - 10n * USDC_UNIT; // 10 USDC under the 100M cap
+    const cap = await adapter.deposit("USDC", 1_000n * USDC_UNIT, ctx(false));
+    assert.equal(cap.ok, false);
+    assert.match(cap.detail!, /supply cap/);
+    usdcRes.otherSupply = 50_000_000n * USDC_UNIT;
+
+    assert.equal((await adapter.deposit("USDC", 1_000n * USDC_UNIT, ctx(false))).ok, true);
+    // borrowers take almost everything: only 100 USDC withdrawable
+    usdcRes.otherDebt = usdcRes.otherSupply + 900n * USDC_UNIT;
+    const locked = await adapter.withdraw("USDC", 1, ctx(false));
+    assert.equal(locked.ok, false);
+    assert.match(locked.detail!, /not enough USDC liquidity: 100000000 withdrawable < 1000000000 .*failed exit and retries/);
+    assert.equal(await adapter.simulateWithdraw("USDC", ctx(true)), false);
+    assert.equal((await adapter.withdraw("USDC", 0.05, ctx(false))).ok, true); // 50 USDC fits
+    usdcRes.otherDebt = 30_000_000n * USDC_UNIT;
+
+    usdcRes.frozen = true;
+    const fz = await adapter.deposit("USDC", 1n * USDC_UNIT, ctx(false));
+    assert.equal(fz.ok, false);
+    assert.match(fz.detail!, /frozen: deposits disabled/);
+    assert.equal(await adapter.simulateWithdraw("USDC", ctx(true)), true);
+    assert.equal((await adapter.withdraw("USDC", 0.5, ctx(false))).ok, true);
+    usdcRes.frozen = false;
+
+    usdcRes.paused = true;
+    assert.equal((await adapter.withdraw("USDC", 1, ctx(false))).ok, false);
+    assert.equal(await adapter.simulateWithdraw("USDC", ctx(true)), false);
+  });
+
+  it("simulateWithdraw throws on RPC errors (unknown, not a failure)", async () => {
+    const { state, adapter } = setupSupply();
+    assert.equal((await adapter.deposit("USDC", 10n * USDC_UNIT, ctx(false))).ok, true);
+    state.rpcDown = true;
+    await assert.rejects(adapter.simulateWithdraw("USDC", ctx(true)), /fetch failed/);
+  });
+
+  it("unconfirmed broadcast: re-reads balances; landed -> ok, lost -> UNCONFIRMED not-ok", async () => {
+    const { state, adapter } = setupSupply();
+    state.raw = "landed-but-error";
+    const landed = await adapter.deposit("USDC", 100n * USDC_UNIT, ctx(false));
+    assert.equal(landed.ok, true, landed.detail);
+    assert.match(landed.detail!, /unconfirmed but the aToken balance shows it landed/);
+    assert.ok(landed.txs.some((t) => t.unconfirmed && t.nonce === 7));
+
+    assert.equal(state.m.bal(state.m.allowance, USDC), 0n, "allowance reset after the re-read");
+
+    state.raw = "lost";
+    const lostApprove = await adapter.deposit("USDC", 100n * USDC_UNIT, ctx(false));
+    assert.equal(lostApprove.ok, false);
+    assert.match(lostApprove.detail!, /UNCONFIRMED: approve 0x[0-9a-f]+ \(nonce 7\) may still land; allowance 0/);
+    state.m.allowance.set(lc(USDC), 100n * USDC_UNIT); // approval already in place: the supply itself is lost
+    const lost = await adapter.deposit("USDC", 100n * USDC_UNIT, ctx(false));
+    assert.equal(lost.ok, false);
+    assert.match(lost.detail!, /UNCONFIRMED: supply 0x[0-9a-f]+ \(nonce 7\) may still land/);
+    assert.equal(state.m.bal(state.m.aBal, USDC), 100n * USDC_UNIT);
+
+    const w = await adapter.withdraw("USDC", 1, ctx(false));
+    assert.equal(w.ok, false);
+    assert.match(w.detail!, /UNCONFIRMED: withdraw/);
+    state.raw = "landed-but-error";
+    const w2 = await adapter.withdraw("USDC", 1, ctx(false));
+    assert.equal(w2.ok, true, w2.detail);
+    assert.equal(state.m.bal(state.m.aBal, USDC), 0n);
+  });
+
+  it("claimRewards by supply marketId", async () => {
+    const { state, adapter } = setupSupply();
+    assert.equal((await adapter.deposit("aUSDe", 1_000n * 10n ** 18n, ctx(false))).ok, true);
+    state.m.pendingReward = 2n * 10n ** 18n;
+    assert.deepEqual((await adapter.supplyPosition("aUSDe"))!.rewardsUnclaimed, [{ token: "XPL", amount: 2n * 10n ** 18n, decimals: 18, usd: 1 }]);
+    const r = await adapter.claimRewards(ctx(false), "aUSDe");
+    assert.equal(r.ok, true, r.detail);
+    assert.deepEqual(r.claimed, [{ token: "XPL", amount: 2n * 10n ** 18n, decimals: 18 }]);
+    await assert.rejects(adapter.claimRewards(ctx(false), "nope"), /unknown pair \/ supply market/);
   });
 });
