@@ -1,0 +1,21 @@
+{
+  "name": "@incentive-router/live-aave-v4",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Aave V4 (hub & spoke) lending adapter via AaveKit (@aave/client) + viem.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@aave/client": "7.1.0",
+    "@incentive-router/core": "*",
+    "@incentive-router/live-common": "*",
+    "@incentive-router/live-evm-base": "*",
+    "viem": "2.57.13"
+  }
+}

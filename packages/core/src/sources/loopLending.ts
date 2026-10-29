@@ -1,6 +1,7 @@
-import { gasUsd } from "../config.js";
-import type { Opportunity, StressSignal, YieldStream } from "../types.js";
-import { proRataStream } from "../valuation.js";
+import type { Opportunity } from "../types.js";
+// Circular with loopPair.ts (it imports interpIrm). Safe: only hoisted function
+// declarations cross the cycle and nothing is called at module-evaluation time.
+import { loopPairOpportunity, type LoopLeg, type LoopPair } from "./loopPair.js";
 import type { Source, SourceContext } from "./types.js";
 
 /** Piecewise-linear IRM: borrow APR as a function of utilization. */
@@ -16,6 +17,24 @@ export interface RewardRate {
   /** APR on the pool side it is paid on (supply or borrow), yearly fraction. */
   apr: number;
   endsAtMs?: number | null;
+  /**
+   * The campaign pays on a NET basis (e.g. Aave / Merkl AAVE_NET_LENDING,
+   * AAVE_NET_BORROWING), which is how most stablecoin campaigns deliberately
+   * kill loops:
+   *  - supply reward: basis = my supply - my borrows of these symbols
+   *  - borrow reward: basis = my borrow - my supply of these symbols
+   * "*" = any stablecoin; inside a loop it is treated as matching the other
+   * leg (a loop pair is same-asset or a stable pair; erring toward "net" only
+   * ever lowers the reward).
+   */
+  netOf?: string[];
+  /** Reward accrues only on the first X USD of the (net or gross) basis per user. */
+  perUserCapUsd?: number;
+  /**
+   * Reward requires the position's health factor <= this (Ethena "Liquid
+   * Leverage": HF <= 2, i.e. you must loop). For a loop HF = liqLtv / ltv.
+   */
+  maxHealthFactor?: number;
 }
 
 /** Protocol-agnostic view of ONE same-asset lending market. */
@@ -73,6 +92,10 @@ export function loopLeverage(ltv: number): number {
  * ramped up to `rate_uncertainty_mult` as my added footprint approaches the
  * 10% liquidity limit (loop-farm used a flat multiplier for the same purpose).
  * Rewards are pro-rata: emission / (pool + my gross contribution).
+ *
+ * Implemented by `loopPairOpportunity` (loopPair.ts) on the same-asset pair
+ * from `loopMarketToPair`; the numbers are identical to the original
+ * single-market implementation (see test/loopPair.test.ts).
  */
 export function loopOpportunity(
   m: LoopMarket,
@@ -80,124 +103,42 @@ export function loopOpportunity(
   sourceId: string,
   opts: { estimated?: boolean } = {}
 ): Opportunity | null {
-  const ll = ctx.cfg.sources.lending_loop;
-  const ltv = Math.min(ll.target_ltv, m.openLtv * ll.max_ltv_frac_of_open);
-  if (!(ltv > 0) || !(m.totalSupplyUsd > 0) || !(m.totalBorrowUsd >= 0)) return null;
-  const L = loopLeverage(ltv);
-  const id = `${sourceId}:${m.protocol}:${m.symbol}`;
-  const myE = ctx.myEquityByOpp[id] ?? 0;
+  return loopPairOpportunity(loopMarketToPair(m), ctx, sourceId, opts);
+}
 
-  const S = m.totalSupplyUsd;
-  const B = m.totalBorrowUsd;
-  const exS = Math.max(0, S - L * myE);
-  const exB = Math.max(0, B - (L - 1) * myE);
-  const uAt = (E: number) => {
-    const d = exS + L * Math.max(0, E);
-    return d > 0 ? (exB + (L - 1) * Math.max(0, E)) / d : 0;
+/**
+ * The same-asset `LoopPair` equivalent of a `LoopMarket` (collateral and debt
+ * are the same leg object, pairId = symbol so opportunity ids stay
+ * `${sourceId}:${protocol}:${symbol}`).
+ */
+export function loopMarketToPair(m: LoopMarket): LoopPair {
+  const leg: LoopLeg = {
+    symbol: m.symbol,
+    priceUsd: 1,
+    totalSupplyUsd: m.totalSupplyUsd,
+    totalBorrowUsd: m.totalBorrowUsd,
+    supplyAprBase: m.supplyAprBase,
+    borrowAprBase: m.borrowAprBase,
+    supplyRewards: m.supplyRewards,
+    borrowRewards: m.borrowRewards,
+    irm: m.irm,
+    supplyCapRemainingUsd: m.supplyCapRemainingUsd,
+    borrowCapRemainingUsd: m.borrowCapRemainingUsd,
+    borrowFeeFrac: m.borrowFeeFrac,
   };
-  const uNow = S > 0 ? B / S : 0;
-  const available = Math.max(0, S - B);
-
-  const borrowAt = (E: number): number => {
-    if (m.irm) return interpIrm(m.irm, uAt(E));
-    const added = Math.max(0, E - myE) * L;
-    const denom = Math.max(1, available * ctx.cfg.liquidity.entry_max_frac_of_capacity);
-    const k = 1 + (ll.rate_uncertainty_mult - 1) * Math.min(1, added / denom);
-    return m.borrowAprBase * k;
-  };
-  const supplyAt = (E: number): number => {
-    if (!m.irm) return m.supplyAprBase;
-    const u = uAt(E);
-    return interpIrm(m.irm, u) * u * (1 - m.irm.reserveFactor);
-  };
-
-  const streams: YieldStream[] = [
-    { label: "supply_base", kind: "base", aprAt: (E) => L * supplyAt(E) },
-    { label: "borrow_base", kind: "borrow_cost", aprAt: (E) => -(L - 1) * borrowAt(E) },
-  ];
-  for (const r of m.supplyRewards) {
-    streams.push(
-      proRataStream({
-        label: `supply_reward:${r.token}`,
-        kind: "reward",
-        aprNow: r.apr,
-        poolUsd: S,
-        grossPerEquity: L,
-        myEquityNowUsd: myE,
-        aprMultiplier: L,
-        rewardToken: r.token,
-        endsAtMs: r.endsAtMs ?? null,
-      })
-    );
-  }
-  for (const r of m.borrowRewards) {
-    streams.push(
-      proRataStream({
-        label: `borrow_reward:${r.token}`,
-        kind: "reward",
-        aprNow: r.apr,
-        poolUsd: B,
-        grossPerEquity: L - 1,
-        myEquityNowUsd: myE,
-        aprMultiplier: L - 1,
-        rewardToken: r.token,
-        endsAtMs: r.endsAtMs ?? null,
-      })
-    );
-  }
-
-  const gas = gasUsd(ctx.cfg, m.chain);
-  const utilSignal = (u: number): StressSignal => ({
-    name: "utilization",
-    value: u,
-    warnAt: ll.utilization_warn,
-    exitAt: ll.utilization_exit,
-    direction: "above",
-  });
-
-  const caps: number[] = [];
-  if (m.supplyCapRemainingUsd !== undefined && m.supplyCapRemainingUsd !== null) caps.push(myE + m.supplyCapRemainingUsd / L);
-  if (m.borrowCapRemainingUsd !== undefined && m.borrowCapRemainingUsd !== null) caps.push(myE + m.borrowCapRemainingUsd / (L - 1));
-
   return {
-    id,
-    sourceId,
-    kind: "lending_loop",
-    name: `${m.protocol} ${m.symbol} loop @${(ltv * 100).toFixed(0)}% LTV`,
-    primaryVenue: m.protocol,
+    protocol: m.protocol,
     chain: m.chain,
-    legs: [{ venue: m.protocol, chain: m.chain, token: m.symbol, equityFrac: 1 }],
-    streams,
-    costs: {
-      entryFrac: (L - 1) * (m.borrowFeeFrac ?? 0),
-      exitFrac: ll.footprint === "net" ? (L - 1) * (m.flashloanFeeFrac ?? 0) : 0,
-      fixedEntryUsd: gas * ll.txs_per_entry,
-      fixedExitUsd: gas * ll.txs_per_exit,
-      ongoingApr: 0,
-    },
-    liquidity: {
-      exitCapacityUsd: available,
-      footprintPerEquity: ll.footprint === "gross" ? L : 1,
-      estimated: opts.estimated,
-    },
-    signals: [utilSignal(uNow)],
-    projectedSignals: (E) => [utilSignal(uAt(E))],
-    flags: m.paused ? [{ name: "market_paused", severity: "exit" }] : [],
-    metrics: { borrow_apr: m.borrowAprBase, supply_apr: m.supplyAprBase, utilization: uNow, tvl_usd: S },
-    health:
-      myE > 0 && m.myLtv !== undefined
-        ? {
-            metric: "ltv",
-            value: m.myLtv,
-            rebalanceAt: ll.deleverage_at_ltv,
-            criticalAt: m.closeLtv * ll.critical_ltv_frac_of_close,
-            direction: "above",
-          }
-        : undefined,
-    maxEquityUsd: caps.length ? Math.min(...caps) : undefined,
-    myEquityUsd: myE,
-    observedAtMs: ctx.nowMs,
-    meta: { leverage: L, ltv },
+    pairId: m.symbol,
+    collateral: leg,
+    debt: leg,
+    maxLtv: m.openLtv,
+    liqLtv: m.closeLtv,
+    swapCostFrac: 0,
+    swapDepthUsd: Infinity,
+    flashloanFeeFrac: m.flashloanFeeFrac,
+    paused: m.paused,
+    myLtv: m.myLtv,
   };
 }
 

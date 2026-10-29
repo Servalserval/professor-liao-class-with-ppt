@@ -31,6 +31,9 @@ export const CHAINS: Record<string, ChainInfo> = {
   gnosis: { id: "gnosis", family: "evm", evmChainId: 100, nativeSymbol: "xDAI", blockSeconds: 5, explorerTx: "https://gnosisscan.io/tx/" },
   mantle: { id: "mantle", family: "evm", evmChainId: 5000, nativeSymbol: "MNT", blockSeconds: 2, explorerTx: "https://mantlescan.xyz/tx/" },
   unichain: { id: "unichain", family: "evm", evmChainId: 130, nativeSymbol: "ETH", blockSeconds: 1, explorerTx: "https://uniscan.xyz/tx/" },
+  // chain ids below are checked by assertChainId() against the RPC before any write
+  monad: { id: "monad", family: "evm", evmChainId: 143, nativeSymbol: "MON", blockSeconds: 0.4, explorerTx: "https://monadscan.com/tx/" },
+  xlayer: { id: "xlayer", family: "evm", evmChainId: 196, nativeSymbol: "OKB", blockSeconds: 1, explorerTx: "https://www.oklink.com/xlayer/tx/" },
 };
 
 export function chainInfo(id: string): ChainInfo {
