@@ -84,8 +84,29 @@ export class LoopExecutor implements Executor {
     if (!(ltv > 0 && ltv < 1)) return { ok: false, detail: `opportunity ${opp.id} has no target ltv in meta` };
 
     const before = this.d.mode === "live" ? await b.adapter.position(b.pairId) : null;
-    const r = await b.adapter.open(b.pairId, units, ltv, this.wctx());
-    if (!r.ok) return { ok: false, detail: summarize(r) };
+    let r: LiveResult;
+    try {
+      r = await b.adapter.open(b.pairId, units, ltv, this.wctx());
+    } catch (e) {
+      // A throw can happen AFTER something was broadcast (receipt timeout,
+      // a later step failing). Never report "nothing happened" without
+      // looking: an untracked on-chain position is worse than a failed entry.
+      if (this.d.mode === "shadow") return { ok: false, detail: `shadow: ${(e as Error).message}` };
+      const after = await b.adapter.position(b.pairId).catch(() => null);
+      const deployed = (after?.equityUsd ?? 0) - (before?.equityUsd ?? 0);
+      if (deployed > Math.max(1, deltaUsd * 0.01))
+        return { ok: true, amountUsd: deployed, spentUsd: deltaUsd, detail: `PARTIAL after error (${(e as Error).message}); position grew $${deployed.toFixed(2)} — check LTV` };
+      return { ok: false, detail: `open failed: ${(e as Error).message}` };
+    }
+    if (!r.ok) {
+      if (this.d.mode === "live" && r.txs.some((t) => !t.simulated && t.id)) {
+        // Some steps were broadcast before a later one failed: book what is there.
+        const after = await b.adapter.position(b.pairId).catch(() => null);
+        const deployed = (after?.equityUsd ?? 0) - (before?.equityUsd ?? 0);
+        if (deployed > 0) return { ok: true, amountUsd: deployed, spentUsd: deltaUsd, detail: `PARTIAL: ${summarize(r)}` };
+      }
+      return { ok: false, detail: summarize(r) };
+    }
     if (this.d.mode === "shadow") {
       const cost = deltaUsd * opp.costs.entryFrac + opp.costs.fixedEntryUsd;
       return { ok: true, amountUsd: deltaUsd - cost, spentUsd: deltaUsd, detail: `shadow: simulated OK | ${summarize(r)}` };
@@ -99,7 +120,17 @@ export class LoopExecutor implements Executor {
     const b = this.binding(pos.oppId);
     const price = await this.d.ctx.priceUsd(b.collateral);
     const balBefore = await b.adapter.walletBalance(b.collateral);
-    const r = await b.adapter.close(b.pairId, Math.min(1, fraction), this.wctx());
+    let r: LiveResult;
+    try {
+      r = await b.adapter.close(b.pairId, Math.min(1, fraction), this.wctx());
+    } catch (e) {
+      if (this.d.mode === "shadow") return { ok: false, detail: `shadow: ${(e as Error).message}` };
+      // Report money that came back even if a later step threw; the router
+      // keeps the position and retries the rest next cycle.
+      const balAfter = await b.adapter.walletBalance(b.collateral).catch(() => balBefore);
+      const back = unitsToUsd(balAfter - balBefore, price, b.collateral.decimals);
+      return { ok: false, amountUsd: back > 0 ? back : undefined, detail: `close failed: ${(e as Error).message}${back > 0 ? ` (after $${back.toFixed(2)} returned)` : ""}` };
+    }
     if (!r.ok) return { ok: false, detail: summarize(r) };
     if (this.d.mode === "shadow") {
       const gross = pos.equityUsd * Math.min(1, fraction);

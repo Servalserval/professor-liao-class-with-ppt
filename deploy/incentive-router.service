@@ -1,0 +1,36 @@
+# systemd unit for the live runner. See docs/runbook.md §12.
+[Unit]
+Description=incentive-router live runner
+Wants=network-online.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=incentive
+Group=incentive
+WorkingDirectory=/opt/incentive-router/app
+EnvironmentFile=/etc/incentive-router/env
+ExecStart=/usr/bin/node --import tsx packages/live-runner/src/cli.ts run --config config/live.yaml
+Restart=on-failure
+RestartSec=30
+# A crash loop must not hammer RPCs or re-send anything: the router persists
+# state after every action and never re-sends an in-flight transfer.
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/incentive-router/app/state
+ReadOnlyPaths=/etc/incentive-router
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

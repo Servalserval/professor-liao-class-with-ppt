@@ -169,3 +169,27 @@ describe("PriceFeed", () => {
     await assert.rejects(feed.priceUsd(USDC), /stale/);
   });
 });
+
+describe("LoopExecutor error paths", () => {
+  it("books a partial entry when open() throws after broadcasting", async () => {
+    const a = new FakeAdapter();
+    a.open = async (_p: string, equity: bigint) => {
+      a.wallet -= equity;
+      a.equity += Number(equity) / 1e6 / 2; // half went in, then a receipt timeout
+      throw new Error("timeout waiting for receipt");
+    };
+    const r = await exec("live", a).enter(opp, 10_000);
+    assert.equal(r.ok, true);
+    assert.ok(Math.abs(r.amountUsd! - 5_000) < 1e-6);
+    assert.match(r.detail!, /PARTIAL/);
+  });
+  it("reports a clean failure when nothing changed", async () => {
+    const a = new FakeAdapter();
+    a.open = async () => {
+      throw new Error("simulation reverted");
+    };
+    const r = await exec("live", a).enter(opp, 10_000);
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /simulation reverted/);
+  });
+});

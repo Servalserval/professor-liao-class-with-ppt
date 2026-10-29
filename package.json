@@ -13,7 +13,8 @@
     "scan": "tsx packages/core/src/cli.ts scan",
     "plan": "tsx packages/core/src/cli.ts plan",
     "sim": "tsx packages/core/src/cli.ts sim",
-    "run:paper": "tsx packages/core/src/cli.ts run --paper"
+    "run:paper": "tsx packages/core/src/cli.ts run --paper",
+    "live": "tsx packages/live-runner/src/cli.ts"
   },
   "engines": {
     "node": ">=20"
