@@ -6,7 +6,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { interpIrm } from "@incentive-router/core";
-import type { AssetRef, LiveContext } from "@incentive-router/live-common";
+import { BroadcastUnconfirmedError, type AssetRef, type LiveContext } from "@incentive-router/live-common";
 import { Mutex, Transaction, normalizeStructTag, normalizeSuiAddress, type PtbSwapper, type SuiEnv } from "../src/common.js";
 import {
   NaviAdapter,
@@ -308,13 +308,16 @@ interface Call {
   args: unknown[];
 }
 
-function mkHarness(opts: { caps?: { marketId: number; emodeId: number; accountCap: string }[]; state?: Record<string, { coll: number; debt: number }>; flashCoins?: string[] } = {}) {
+function mkHarness(
+  opts: { caps?: { marketId: number; emodeId: number; accountCap: string }[]; state?: Record<string, { coll: number; debt: number }>; flashCoins?: string[]; pools?: typeof POOLS } = {}
+) {
+  const pools = opts.pools ?? POOLS;
   const calls: Call[] = [];
   const rec = (fn: string, ...args: unknown[]) => calls.push({ fn, args });
   const fake = (tx: Transaction, name: string) => tx.moveCall({ target: `0x1::mock::${name}` });
   const state = opts.state ?? {};
   const sdk: Partial<NaviSdk> = {
-    getPools: (async () => POOLS) as unknown as NaviSdk["getPools"],
+    getPools: (async () => pools) as unknown as NaviSdk["getPools"],
     getConfig: (async () => ({ storage: normalizeSuiAddress("0x5707") })) as unknown as NaviSdk["getConfig"],
     getAllFlashLoanAssets: (async () =>
       (opts.flashCoins ?? [USDC_T, USDT_T]).map((t, i) => ({ coinType: t.slice(2), flashloanFee: 0.0006, supplierFee: 0.8, assetId: i, poolId: "0x1", max: "100000000000000", min: "0" }))) as unknown as NaviSdk["getAllFlashLoanAssets"],
@@ -325,8 +328,8 @@ function mkHarness(opts: { caps?: { marketId: number; emodeId: number; accountCa
       const s = state[normalizeSuiAddress(addr)];
       if (!s) return [];
       return [
-        { assetId: 10, supplyBalance: String(Math.round(s.coll * 1e9)), borrowBalance: "0", market: "main", pool: POOLS[0] },
-        { assetId: 19, supplyBalance: "0", borrowBalance: String(Math.round(s.debt * 1e9)), market: "main", pool: POOLS[1] },
+        { assetId: 10, supplyBalance: String(Math.round(s.coll * 1e9)), borrowBalance: "0", market: "main", pool: pools[0] },
+        { assetId: 19, supplyBalance: "0", borrowBalance: String(Math.round(s.debt * 1e9)), market: "main", pool: pools[1] },
       ];
     }) as unknown as NaviSdk["getLendingState"],
     getLendingPositions: (async () => []) as unknown as NaviSdk["getLendingPositions"],
@@ -375,6 +378,12 @@ function mkHarness(opts: { caps?: { marketId: number; emodeId: number; accountCa
     }) as unknown as NaviSdk["claimLendingRewardsPTB"],
   };
   let simulations = 0;
+  /**
+   * sim: "ok" | "abort" | an Error to throw (a thrown BroadcastUnconfirmedError stands in for
+   * executePtb's post-sign failure: it propagates out of executePtb unchanged).
+   * wait: what core.waitForTransaction does when the adapter re-checks a digest.
+   */
+  const control: { sim: "ok" | "abort" | Error; wait: "landed" | "failed" | "timeout"; waited: string[] } = { sim: "ok", wait: "timeout", waited: [] };
   const env = {
     network: "mainnet",
     address: ADDR,
@@ -384,15 +393,24 @@ function mkHarness(opts: { caps?: { marketId: number; emodeId: number; accountCa
       core: {
         simulateTransaction: async () => {
           simulations++;
+          if (control.sim instanceof Error) throw control.sim;
+          if (control.sim === "abort") return { $kind: "FailedTransaction", FailedTransaction: { status: { success: false, error: "MoveAbort(1503)" } } };
           return { $kind: "Transaction", Transaction: { effects: { gasUsed: { computationCost: "1000000", storageCost: "2000000", storageRebate: "1000000" } } } };
+        },
+        waitForTransaction: async ({ digest }: { digest: string }) => {
+          control.waited.push(digest);
+          if (control.wait === "timeout") throw new Error("timeout waiting for transaction");
+          return control.wait === "landed"
+            ? { $kind: "Transaction", Transaction: { digest } }
+            : { $kind: "FailedTransaction", FailedTransaction: { digest, status: { success: false, error: "MoveAbort" } } };
         },
         getBalance: async () => ({ balance: { balance: "1000000000000000" } }),
         getCoinMetadata: async ({ coinType }: { coinType: string }) => {
-          const p = POOLS.find((x) => x.suiCoinType === normalizeStructTag(coinType));
+          const p = pools.find((x) => x.suiCoinType === normalizeStructTag(coinType));
           return { coinMetadata: p ? { decimals: p.token.decimals, symbol: p.token.symbol, name: p.token.symbol, description: "", id: null, iconUrl: null } : null };
         },
         getObject: async ({ objectId }: { objectId: string }) => {
-          const p = POOLS.find((x) => x.contract.pool === objectId);
+          const p = pools.find((x) => x.contract.pool === objectId);
           if (p) return { object: { objectId, type: `0x${"9".repeat(64)}::pool::Pool<${p.suiCoinType}>` } };
           return { object: { objectId, type: `0x${"9".repeat(64)}::storage::Storage` } };
         },
@@ -419,7 +437,7 @@ function mkHarness(opts: { caps?: { marketId: number; emodeId: number; accountCa
       return tx.moveCall({ target: "0x1::mock::swap" });
     },
   };
-  return { sdk, env, ctx, calls, swapper, swapCalls, sims: () => simulations };
+  return { sdk, env, ctx, calls, swapper, swapCalls, control, sims: () => simulations };
 }
 
 function u64Input(x: unknown): bigint {
@@ -666,5 +684,187 @@ describe("NaviAdapter", () => {
     assert.ok(issues.some((i) => /FOO\/FOO: no Navi pool for collateral FOO/.test(i)));
     assert.ok(issues.some((i) => /FOO\/FOO: collateral FOO coin type .* has no on-chain metadata/.test(i)));
     assert.ok(issues.some((i) => /USDC\/USDC-2: shares Navi account/.test(i)));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SupplyAdapter (plain deposits) + broadcast honesty
+// ---------------------------------------------------------------------------
+
+const NO_EMODE_POOLS = POOLS.map((p) => ({ ...p, emodes: [] as unknown[] })) as typeof POOLS;
+const SUPPLY_USDC = { asset: USDC };
+
+describe("NaviAdapter as SupplyAdapter", () => {
+  test("config: pairs optional; supply shares no account with an emode-'off' loop; ids unique", () => {
+    const h = mkHarness();
+    assert.doesNotThrow(() => new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk }));
+    assert.throws(
+      () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDC, debt: USDC, emode: "off" }], supply: [SUPPLY_USDC], sdk: h.sdk }),
+      /share the wallet's Navi account in market main: both hold USDC \(positions conflated\) and the deposit would collateralize the loop/
+    );
+    // even without a shared asset the account would be shared
+    assert.throws(
+      () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDT, debt: USDT, emode: "off" }], supply: [SUPPLY_USDC], sdk: h.sdk }),
+      /would collateralize the loop/
+    );
+    // other market, or an e-mode-capable pair: fine
+    assert.doesNotThrow(
+      () => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDC, debt: USDC, emode: "off", market: "sui-usdc" }], supply: [SUPPLY_USDC], sdk: h.sdk })
+    );
+    assert.doesNotThrow(() => new NaviAdapter({ env: h.env, pairs: [{ pairId: "L", collateral: USDC, debt: USDC }], supply: [SUPPLY_USDC], sdk: h.sdk }));
+    assert.throws(() => new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC, { asset: USDC, marketId: "x" }], sdk: h.sdk }), /configured twice/);
+    assert.throws(() => new NaviAdapter({ env: h.env, pairs: [{ pairId: "main:USDC", collateral: USDC, debt: USDC }], supply: [SUPPLY_USDC], sdk: h.sdk }), /not unique/);
+  });
+
+  test("supplyMarkets(): base APR, incentives, IRM, totals, cash, caps, my deposit", async () => {
+    const h = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
+    const extra = async () => [{ token: "MERKL", apr: 0.01 }];
+    const a = new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk, extraRewards: extra });
+    const [m] = await a.supplyMarkets();
+    assert.ok(m);
+    assert.equal(m.protocol, "navi");
+    assert.equal(m.chain, "sui");
+    assert.equal(m.marketId, "main:USDC");
+    assert.deepEqual(m.asset, { symbol: "USDC", assetId: USDC_T, priceUsd: 1 });
+    close(m.totalSupplyUsd, 50_000_000);
+    close(m.totalBorrowUsd, 30_000_000);
+    close(m.supplyAprBase, (0.02 + 0.6 * 0.05) * 0.6 * 0.9, 1e-9);
+    assert.deepEqual(m.rewards, [
+      { token: "NAVX", apr: 0.04, endsAtMs: null },
+      { token: "MERKL", apr: 0.01 },
+    ]);
+    assert.ok(m.irm && m.irm.points.length === 3);
+    close(m.withdrawableUsd!, 20_000_000);
+    close(m.supplyCapRemainingUsd!, 100_000_000);
+    assert.equal(m.paused, false);
+    close(m.myDepositUsd!, 500);
+    assert.ok(m.dataAsOfMs! > 0);
+  });
+
+  test("supplyPosition(): wallet-account deposit + its own rewards only", async () => {
+    const h = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
+    const a = new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk });
+    const v = await a.supplyPosition("main:USDC");
+    assert.ok(v);
+    assert.equal(v.units, 500_000_000n);
+    close(v.depositUsd, 500);
+    assert.deepEqual(v.rewardsUnclaimed, [{ token: "NAVX", amount: 1_000_000_000n, decimals: 9, usd: 0.05 }]);
+    const none = new NaviAdapter({ env: mkHarness().env, supply: [SUPPLY_USDC], sdk: mkHarness().sdk });
+    assert.equal(await none.supplyPosition("main:USDC"), null);
+  });
+
+  test("deposit(): one PTB, no oracle refresh, refuses a wallet account with debt", async () => {
+    const h = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
+    const a = new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk });
+    const r = await a.deposit("main:USDC", 100_000_000n, h.ctx);
+    assert.equal(r.ok, true, r.detail);
+    assert.equal(r.txs[0]!.simulated, true);
+    assert.deepEqual(
+      h.calls.map((c) => [c.fn, c.args[0], c.args[1]]),
+      [["deposit", 10, undefined]]
+    );
+    close(r.amountUsd!, 100);
+    const hd = mkHarness({ state: { [ADDR]: { coll: 500, debt: 100 } } });
+    const b = new NaviAdapter({ env: hd.env, supply: [SUPPLY_USDC], sdk: hd.sdk });
+    const rd = await b.deposit("main:USDC", 100_000_000n, hd.ctx);
+    assert.equal(rd.ok, false);
+    assert.match(rd.detail!, /debt-free account/);
+    assert.equal(hd.sims(), 0);
+  });
+
+  test("withdraw(): fraction 1 requests >= balance (max semantics), fraction < 1 exact; oracle first", async () => {
+    const h = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
+    const a = new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk });
+    const all = await a.withdraw("main:USDC", 1, h.ctx);
+    assert.equal(all.ok, true, all.detail);
+    assert.deepEqual(
+      h.calls.map((c) => c.fn),
+      ["updateOraclePricesPTB", "withdraw"]
+    );
+    const req = u64Input(h.calls[1]!.args[1]);
+    assert.ok(req > 500_000_000n && req < 500_500_000n, `request ${req}`);
+    h.calls.length = 0;
+    await a.withdraw("main:USDC", 0.25, h.ctx);
+    assert.equal(u64Input(h.calls.find((c) => c.fn === "withdraw")!.args[1]), 125_000_000n);
+    const none = mkHarness();
+    const r0 = await new NaviAdapter({ env: none.env, supply: [SUPPLY_USDC], sdk: none.sdk }).withdraw("main:USDC", 1, none.ctx);
+    assert.equal(r0.ok, true);
+    assert.equal(r0.txs.length, 0);
+  });
+
+  test("simulateWithdraw(): true / false on abort / throws on read errors", async () => {
+    const h = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
+    const a = new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk });
+    assert.equal(await a.simulateWithdraw("main:USDC", h.ctx), true);
+    h.control.sim = "abort";
+    assert.equal(await a.simulateWithdraw("main:USDC", h.ctx), false);
+    h.control.sim = new Error("grpc unavailable");
+    await assert.rejects(a.simulateWithdraw("main:USDC", h.ctx), /grpc unavailable/);
+    h.control.sim = "ok";
+    const broken = new NaviAdapter({
+      env: h.env,
+      supply: [SUPPLY_USDC],
+      sdk: { ...h.sdk, getLendingState: (async () => { throw new Error("devInspect failed"); }) as unknown as NaviSdk["getLendingState"] },
+    });
+    await assert.rejects(broken.simulateWithdraw("main:USDC", h.ctx), /devInspect failed/);
+    const posFail = new NaviAdapter({
+      env: h.env,
+      supply: [SUPPLY_USDC],
+      sdk: { ...h.sdk, getLendingPositions: (async () => { throw new Error("positions read failed"); }) as unknown as NaviSdk["getLendingPositions"] },
+    });
+    await assert.rejects(posFail.simulateWithdraw("main:USDC", h.ctx), /positions read failed/);
+  });
+
+  test("broadcast unconfirmed: landed -> ok; unknown -> ok:false + unconfirmed digest; failed -> ok:false", async () => {
+    const h = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
+    const a = new NaviAdapter({ env: h.env, supply: [SUPPLY_USDC], sdk: h.sdk });
+    const live = { ...h.ctx, dryRun: false };
+    h.control.sim = new BroadcastUnconfirmedError("sui", "DIGEST1", "navi: deposit", "execute error: 504");
+    h.control.wait = "landed";
+    const landed = await a.deposit("main:USDC", 1_000_000n, live);
+    assert.equal(landed.ok, true, landed.detail);
+    assert.deepEqual(landed.txs, [{ chain: "sui", id: "DIGEST1", description: "navi: deposit 1000000 USDC (main:USDC)", simulated: false }]);
+    h.control.wait = "timeout";
+    const unknown = await a.withdraw("main:USDC", 1, live);
+    assert.equal(unknown.ok, false);
+    assert.equal(unknown.txs[0]!.id, "DIGEST1");
+    assert.equal(unknown.txs[0]!.unconfirmed, true);
+    assert.equal(unknown.txs[0]!.simulated, false);
+    assert.match(unknown.detail!, /MAY HAVE LANDED/);
+    h.control.wait = "failed";
+    const failed = await a.deposit("main:USDC", 1_000_000n, live);
+    assert.equal(failed.ok, false);
+    assert.equal(failed.txs[0]!.unconfirmed, false);
+    assert.match(failed.detail!, /failed on-chain/);
+    // loop writes and claims report the same way (never "nothing happened")
+    const hl = mkHarness();
+    hl.control.sim = new BroadcastUnconfirmedError("sui", "DIGEST2", "x", "timeout");
+    const loop = new NaviAdapter({ env: hl.env, pairs: [{ pairId: "USDC/USDC", collateral: USDC, debt: USDC }], sdk: hl.sdk });
+    const o = await loop.open("USDC/USDC", 1_000_000_000n, 0.8, { ...hl.ctx, dryRun: false });
+    assert.equal(o.ok, false);
+    assert.equal(o.txs[0]!.id, "DIGEST2");
+    assert.equal(o.txs[0]!.unconfirmed, true);
+    assert.deepEqual(hl.control.waited, ["DIGEST2"]);
+  });
+
+  test("loop/supply separation at runtime and claimRewards by supply marketId", async () => {
+    // "auto" pair with no covering e-mode would land in the wallet account holding supply deposits
+    const h = mkHarness({ pools: NO_EMODE_POOLS });
+    const a = new NaviAdapter({ env: h.env, pairs: [{ pairId: "USDC/USDC", collateral: USDC, debt: USDC }], supply: [SUPPLY_USDC], sdk: h.sdk });
+    const r = await a.open("USDC/USDC", 1_000_000_000n, 0.7, h.ctx);
+    assert.equal(r.ok, false);
+    assert.match(r.detail!, /holds plain supply deposits/);
+    const issues = await a.verifyConfig();
+    assert.ok(issues.some((i) => /main:USDC: loop pair USDC\/USDC has no covering e-mode/.test(i)), issues.join("\n"));
+    // the supply deposit in the wallet account is not reported as a loop position
+    const h2 = mkHarness({ state: { [ADDR]: { coll: 500, debt: 0 } } });
+    const b = new NaviAdapter({ env: h2.env, pairs: [{ pairId: "USDC/USDC", collateral: USDC, debt: USDC }], supply: [SUPPLY_USDC], sdk: h2.sdk });
+    assert.equal(await b.position("USDC/USDC"), null);
+    assert.equal((await b.supplyPosition("main:USDC"))!.units, 500_000_000n);
+    assert.deepEqual(await b.verifyConfig(), []);
+    const c = await b.claimRewards(h2.ctx, "main:USDC");
+    assert.equal(c.ok, true, c.detail);
+    assert.equal(h2.calls.find((x) => x.fn === "claim")!.args[0], 1, "only the wallet-account USDC entry");
+    assert.deepEqual(c.claimed, [{ token: "NAVX", amount: 1_000_000_000n, decimals: 9, coinType: NAVX_T }]);
   });
 });

@@ -23,11 +23,23 @@
  * `apy` field is the plain sum vaultApr + boostedApr (+ staking yields), i.e.
  * not compounded, so boostedApr is used as an APR. Set
  * `incentiveRateKind: "apy"` to convert it with daily compounding instead.
+ *
+ * Supply-only (SupplyAdapter): plain deposits live in the wallet address's
+ * Navi account of their market. That account must stay debt-free and must not
+ * be shared with a loop: loops there use e-mode caps; a pair with emode "off"
+ * in a market that has supply markets is refused at construction, an "auto"
+ * pair that resolves to no e-mode is refused at open(), and deposit() refuses
+ * when the wallet account has any debt in that market.
+ *
+ * Broadcasts: a BroadcastUnconfirmedError is never treated as "nothing
+ * happened": the digest is awaited once more; if still unknown the result is
+ * ok:false with an `unconfirmed` TxRecord carrying the digest ("may have landed").
  */
 import { coinWithBalance } from "@mysten/sui/transactions";
 import type { TransactionResult } from "@mysten/sui/transactions";
-import type { LoopLeg, LoopPair, RewardRate } from "@incentive-router/core";
+import type { LoopLeg, LoopPair, RewardRate, SupplyMarket } from "@incentive-router/core";
 import {
+  BroadcastUnconfirmedError,
   minusBps,
   toUnits,
   type AssetRef,
@@ -37,6 +49,8 @@ import {
   type Logger,
   type LoopPositionView,
   type RewardRateProvider,
+  type SupplyAdapter,
+  type SupplyPositionView,
   type TxRecord,
 } from "@incentive-router/live-common";
 import {
@@ -78,9 +92,21 @@ export interface NaviPairConfig {
   emode?: "auto" | "off" | number;
 }
 
+/** A plain-deposit market (SupplyAdapter). */
+export interface NaviSupplyConfig {
+  asset: AssetRef;
+  /** Navi market key, default "main". */
+  market?: string;
+  /** Default `${market}:${asset.symbol}`. Must not collide with a loop pairId. */
+  marketId?: string;
+}
+
 export interface NaviAdapterOptions {
   env: SuiEnv;
-  pairs: NaviPairConfig[];
+  /** Loop pairs (may be empty / omitted for a supply-only adapter). */
+  pairs?: NaviPairConfig[];
+  /** Plain-deposit markets. */
+  supply?: NaviSupplyConfig[];
   /** Required for pairs whose collateral and debt coin types differ. */
   swapper?: PtbSwapper;
   /** Extra reward streams (Merkl etc.) merged into markets(). */
@@ -145,6 +171,60 @@ interface AccountState {
   entries: NaviUserLendingInfo[];
 }
 
+interface SupplyCfg {
+  marketId: string;
+  asset: AssetRef;
+  market: string;
+  type: string;
+}
+
+interface SupplyState {
+  cfg: SupplyCfg;
+  market: NaviMarketConfig;
+  pools: NaviPool[];
+  pool: NaviPool;
+  /** Market price (Pool.token.price; Navi oracle price as fallback). */
+  priceUsd: number;
+  paused: boolean;
+  asOfMs: number;
+}
+
+/**
+ * A signed tx whose fate is still unknown (or that failed on-chain) after a
+ * BroadcastUnconfirmedError; carries the LiveResult to return.
+ */
+class NaviUnsettledError extends Error {
+  constructor(
+    readonly digest: string,
+    readonly description: string,
+    readonly landed: "failed" | "unknown",
+    cause: string
+  ) {
+    super(
+      landed === "failed"
+        ? `sui: ${description} (${digest}) failed on-chain after a broadcast error: ${cause}`
+        : `sui: ${description} submitted as ${digest}, NOT CONFIRMED — MAY HAVE LANDED; re-read state before retrying (${cause})`
+    );
+    this.name = "NaviUnsettledError";
+  }
+  result(): LiveResult {
+    return {
+      ok: false,
+      txs: [{ chain: "sui", id: this.digest, description: this.description, simulated: false, unconfirmed: this.landed === "unknown" }],
+      detail: this.message,
+    };
+  }
+}
+function isBroadcastUnconfirmed(e: unknown): e is BroadcastUnconfirmedError {
+  return e instanceof BroadcastUnconfirmedError || (e as { name?: unknown })?.name === "BroadcastUnconfirmedError";
+}
+/** Append a note when an executed tx's checkpoint was not observed (effects reported success). */
+function noteUnconfirmed(r: LiveResult): LiveResult {
+  const u = r.txs.filter((t) => t.unconfirmed && !t.simulated);
+  if (!u.length) return r;
+  return { ...r, detail: `${r.detail ?? ""} [unconfirmed: ${u.map((t) => t.id).join(", ")} executed (effects success) but checkpoint not observed]`.trim() };
+}
+
 interface FlashInfo {
   fee: number;
   min?: bigint;
@@ -204,12 +284,13 @@ function digitsToBig(s: unknown): bigint | undefined {
 // Adapter
 // ---------------------------------------------------------------------------
 
-export class NaviAdapter implements LendingAdapter {
+export class NaviAdapter implements LendingAdapter, SupplyAdapter {
   readonly id = "navi";
   readonly chain = "sui";
 
   private readonly env: SuiEnv;
   private readonly pairs: Map<string, PairState["cfg"]>;
+  private readonly supply: Map<string, SupplyCfg>;
   private readonly swapper?: PtbSwapper;
   private readonly extraRewards?: RewardRateProvider;
   private readonly sdk: NaviSdk;
@@ -236,13 +317,43 @@ export class NaviAdapter implements LendingAdapter {
     this.includeMyLtv = opts.includeMyLtv ?? true;
     this.flashFeeMargin = opts.flashFeeMarginFrac ?? 0.0001;
     this.pairs = new Map();
-    for (const p of opts.pairs) {
+    for (const p of opts.pairs ?? []) {
       if (this.pairs.has(p.pairId)) throw new Error(`navi: duplicate pairId ${p.pairId}`);
       if (p.collateral.chain !== "sui" || p.debt.chain !== "sui") throw new Error(`navi: pair ${p.pairId} assets must be on chain "sui"`);
       const same = normType(p.collateral.address) === normType(p.debt.address);
       if (!same && !this.swapper) throw new Error(`navi: pair ${p.pairId} has different assets and needs a swapper`);
       this.pairs.set(p.pairId, { ...p, market: p.market ?? NAVI_DEFAULT_MARKET, emode: p.emode ?? "auto" });
     }
+    this.supply = new Map();
+    const supplyKeys = new Set<string>();
+    for (const s of opts.supply ?? []) {
+      if (s.asset.chain !== "sui") throw new Error(`navi: supply asset ${s.asset.symbol} must be on chain "sui"`);
+      const market = s.market ?? NAVI_DEFAULT_MARKET;
+      const marketId = s.marketId ?? `${market}:${s.asset.symbol}`;
+      const type = normType(s.asset.address);
+      if (this.supply.has(marketId) || this.pairs.has(marketId)) throw new Error(`navi: supply marketId ${marketId} is not unique (vs supply markets and loop pairIds)`);
+      if (supplyKeys.has(`${market}|${type}`)) throw new Error(`navi: supply asset ${s.asset.symbol} configured twice in market ${market}`);
+      supplyKeys.add(`${market}|${type}`);
+      // Supply deposits sit in the wallet's Navi account of `market`. A loop pair with emode "off"
+      // would use that same account: positions of a shared asset would be conflated, and even
+      // without a shared asset the deposit would become collateral of the loop (a loop liquidation
+      // could seize it; its withdrawals would be health-checked against the loop's debt).
+      for (const p of this.pairs.values()) {
+        if (p.market === market && p.emode === "off")
+          throw new Error(
+            `navi: supply market ${marketId} and loop pair ${p.pairId} (emode "off") would share the wallet's Navi account in market ${market}: ` +
+              `${[p.collateral, p.debt].some((a) => normType(a.address) === type) ? `both hold ${s.asset.symbol} (positions conflated) and ` : ""}` +
+              `the deposit would collateralize the loop (seizable on liquidation, withdrawals health-checked against its debt). ` +
+              `Use emode "auto"/an e-mode id for the pair (separate e-mode account) or put them in different markets.`
+          );
+      }
+      this.supply.set(marketId, { marketId, asset: s.asset, market, type });
+    }
+  }
+
+  /** Markets (keys) that hold supply deposits in the wallet address account. */
+  private supplyMarketKeys(): Set<string> {
+    return new Set([...this.supply.values()].map((s) => s.market));
   }
 
   private get client(): NaviSuiClient {
@@ -366,9 +477,9 @@ export class NaviAdapter implements LendingAdapter {
     return true;
   }
 
-  private async coinInfo(ps: PairState | null, coinType: string): Promise<{ symbol: string; decimals: number }> {
+  private async coinInfo(pools: NaviPool[] | null, coinType: string): Promise<{ symbol: string; decimals: number }> {
     const t = normType(coinType);
-    const p = ps?.pools.find((x) => normType(x.suiCoinType ?? x.coinType) === t);
+    const p = pools?.find((x) => normType(x.suiCoinType ?? x.coinType) === t);
     if (p?.token) return { symbol: p.token.symbol, decimals: p.token.decimals };
     if (!this.coinMeta.has(t)) {
       try {
@@ -381,9 +492,9 @@ export class NaviAdapter implements LendingAdapter {
     return this.coinMeta.get(t) ?? { symbol: t.split("::").pop() ?? t, decimals: 9 };
   }
 
-  private priceOf(ps: PairState, coinType: string): number {
+  private priceOf(pools: NaviPool[], coinType: string): number {
     const t = normType(coinType);
-    const p = ps.pools.find((x) => normType(x.suiCoinType ?? x.coinType) === t);
+    const p = pools.find((x) => normType(x.suiCoinType ?? x.coinType) === t);
     const v = Number(p?.oracle?.price ?? p?.token?.price ?? 0);
     return Number.isFinite(v) ? v : 0;
   }
@@ -392,9 +503,16 @@ export class NaviAdapter implements LendingAdapter {
   // Accounts (wallet address vs e-mode cap)
   // -------------------------------------------------------------------------
 
+  /**
+   * Loop accounts: write target + read candidates. When the market holds supply
+   * deposits, the wallet address account belongs to those deposits and is never a
+   * loop candidate (open() refuses a loop that would need it).
+   */
   private async accounts(ps: PairState): Promise<{ target: WriteAccount; candidates: NaviAccount[] }> {
     const addr: NaviAccount = { kind: "address", id: normalizeSuiAddress(this.env.address) };
-    if (ps.cfg.emode === "off") return { target: addr, candidates: [addr] };
+    const addrOk = !this.supplyMarketKeys().has(ps.market.key);
+    const withAddr = (xs: NaviAccount[]) => (addrOk ? [...xs, addr] : xs);
+    if (ps.cfg.emode === "off") return { target: addr, candidates: withAddr([]) };
     const caps = (await this.sdk.getUserEModeCaps(this.env.address, { client: this.client, disableCache: true }))
       .filter((c) => c.marketId === ps.market.id)
       .map((c): NaviAccount => ({ kind: "cap", id: normalizeSuiAddress(c.accountCap), emodeId: c.emodeId }));
@@ -402,9 +520,9 @@ export class NaviAdapter implements LendingAdapter {
       const id = ps.emode.emodeId;
       const mine = caps.filter((c) => c.kind === "cap" && c.emodeId === id);
       const others = caps.filter((c) => !(c.kind === "cap" && c.emodeId === id));
-      return { target: mine[0] ?? { kind: "newCap", emodeId: id }, candidates: [...mine, ...others, addr] };
+      return { target: mine[0] ?? { kind: "newCap", emodeId: id }, candidates: withAddr([...mine, ...others]) };
     }
-    return { target: addr, candidates: [...caps, addr] };
+    return { target: addr, candidates: withAddr(caps) };
   }
 
   private async readAccount(ps: PairState, account: NaviAccount): Promise<AccountState> {
@@ -470,13 +588,16 @@ export class NaviAdapter implements LendingAdapter {
     return this.incentiveRateKind === "apy" ? M.apyToApr(f) : f;
   }
 
+  private async rewardSymbols(pools: NaviPool[], types: string[] | undefined): Promise<string[]> {
+    return Promise.all((types ?? []).map(async (t) => (await this.coinInfo(pools, t)).symbol));
+  }
+
   private async buildLeg(ps: PairState, pool: NaviPool, asset: AssetRef, borrowFeeFrac?: number): Promise<LoopLeg> {
     const price = Number(pool.oracle?.price);
     const amt = M.poolAmounts(pool);
     const caps = M.capsRemaining(pool);
-    const sym = async (types: string[] | undefined) => Promise.all((types ?? []).map(async (t) => (await this.coinInfo(ps, t)).symbol));
-    const supplyTokens = await sym(pool.supplyIncentiveApyInfo?.rewardCoin);
-    const borrowTokens = await sym(pool.borrowIncentiveApyInfo?.rewardCoin);
+    const supplyTokens = await this.rewardSymbols(ps.pools, pool.supplyIncentiveApyInfo?.rewardCoin);
+    const borrowTokens = await this.rewardSymbols(ps.pools, pool.borrowIncentiveApyInfo?.rewardCoin);
     return {
       symbol: asset.symbol,
       assetId: normType(asset.address),
@@ -636,7 +757,7 @@ export class NaviAdapter implements LendingAdapter {
   }
 
   private async groupRewards(
-    ps: PairState | null,
+    pools: NaviPool[] | null,
     rewards: NaviLendingReward[]
   ): Promise<{ token: string; coinType: string; amount: bigint; decimals: number; usd: number }[]> {
     const sums = new Map<string, number>();
@@ -647,8 +768,8 @@ export class NaviAdapter implements LendingAdapter {
     }
     const out: { token: string; coinType: string; amount: bigint; decimals: number; usd: number }[] = [];
     for (const [coinType, human] of sums) {
-      const info = await this.coinInfo(ps, coinType);
-      const price = ps ? this.priceOf(ps, coinType) : 0;
+      const info = await this.coinInfo(pools, coinType);
+      const price = pools ? this.priceOf(pools, coinType) : 0;
       // userClaimableReward is a human amount (SDK divides the raw u256 by the reward feed's decimals)
       out.push({ token: info.symbol, coinType, amount: toUnits(human, info.decimals), decimals: info.decimals, usd: human * price });
     }
@@ -658,7 +779,7 @@ export class NaviAdapter implements LendingAdapter {
   private async unclaimed(ps: PairState, st: AccountState) {
     const rewards = await this.sdk.getUserAvailableLendingRewards(this.env.address, { client: this.client, markets: [ps.market.key] });
     return this.groupRewards(
-      ps,
+      ps.pools,
       rewards.filter((r) => this.rewardMatches(ps, st, r))
     );
   }
@@ -669,25 +790,58 @@ export class NaviAdapter implements LendingAdapter {
 
   /** Fresh tx with Navi oracle updates for every asset of the account + this pair (Pyth push when stale). */
   private async txWithOracle(ps: PairState, ctx: LiveContext): Promise<Transaction> {
+    return this.txWithOracleFor(ps.market.key, [ps.coll, ps.debt], ctx);
+  }
+
+  /**
+   * Navi checks the health factor on borrow AND withdraw, valuing every asset of the
+   * account at the Navi oracle (stale price -> abort), so all of the wallet's assets in
+   * the market (incl. e-mode caps) plus `pools` are refreshed. `strict`: a failed
+   * position read throws instead of narrowing the feed set (simulateWithdraw contract).
+   */
+  private async txWithOracleFor(marketKey: string, pools: NaviPool[], ctx: LiveContext, strict = false): Promise<Transaction> {
     // getPriceFeeds' d.ts omits `market`, but it forwards options to getConfig({market}) at runtime
     // (the SDK's own updateOraclePriceBeforeUserOperationPTB passes market the same way).
-    const feeds = await this.sdk.getPriceFeeds({ market: ps.market.key } as unknown as Parameters<NaviSdk["getPriceFeeds"]>[0]);
+    const feeds = await this.sdk.getPriceFeeds({ market: marketKey } as unknown as Parameters<NaviSdk["getPriceFeeds"]>[0]);
     let positions: Awaited<ReturnType<NaviSdk["getLendingPositions"]>> = [];
     try {
-      positions = await this.sdk.getLendingPositions(this.env.address, { client: this.client, markets: [ps.market.key], disableCache: true });
+      positions = await this.sdk.getLendingPositions(this.env.address, { client: this.client, markets: [marketKey], disableCache: true });
     } catch (e) {
-      ctx.log("warn", "navi: could not read positions for oracle feed selection; updating pair feeds only", { error: errMsg(e) });
+      if (strict) throw e;
+      ctx.log("warn", "navi: could not read positions for oracle feed selection; updating the touched pools' feeds only", { error: errMsg(e) });
     }
-    const relevant = this.sdk.filterPriceFeeds(feeds, { lendingPositions: positions, pools: [ps.coll, ps.debt] });
+    const relevant = this.sdk.filterPriceFeeds(feeds, { lendingPositions: positions, pools });
     const tx = new Transaction();
     try {
-      await this.sdk.updateOraclePricesPTB(tx, relevant, { client: this.client, market: ps.market.key, updatePythPriceFeeds: true });
+      await this.sdk.updateOraclePricesPTB(tx, relevant, { client: this.client, market: marketKey, updatePythPriceFeeds: true });
       return tx;
     } catch (e) {
       ctx.log("warn", "navi: Pyth price push failed; refreshing Navi oracle without it", { error: errMsg(e) });
       const tx2 = new Transaction();
-      await this.sdk.updateOraclePricesPTB(tx2, relevant, { client: this.client, market: ps.market.key, updatePythPriceFeeds: false });
+      await this.sdk.updateOraclePricesPTB(tx2, relevant, { client: this.client, market: marketKey, updatePythPriceFeeds: false });
       return tx2;
+    }
+  }
+
+  /**
+   * executePtb + broadcast honesty: a BroadcastUnconfirmedError is followed by one more
+   * wait on the digest; landed -> normal record; failed on-chain / still unknown ->
+   * NaviUnsettledError (callers return its result(): ok:false + the digest, "may have landed").
+   */
+  private async exec(ctx: LiveContext, tx: Transaction, description: string): Promise<TxRecord> {
+    try {
+      return await executePtb(this.env, ctx, tx, description);
+    } catch (e) {
+      if (!isBroadcastUnconfirmed(e)) throw e;
+      ctx.log("warn", `navi: ${description}: broadcast ${e.id} unconfirmed; re-checking`, { error: e.message });
+      try {
+        const r = await this.env.grpc.core.waitForTransaction({ digest: e.id, timeout: 30_000 });
+        if (r.$kind === "Transaction") return { chain: "sui", id: e.id, description, simulated: false };
+        throw new NaviUnsettledError(e.id, description, "failed", JSON.stringify(r.FailedTransaction?.status ?? "failed"));
+      } catch (e2) {
+        if (e2 instanceof NaviUnsettledError) throw e2;
+        throw new NaviUnsettledError(e.id, description, "unknown", errMsg(e2));
+      }
     }
   }
 
@@ -747,6 +901,11 @@ export class NaviAdapter implements LendingAdapter {
       if (existing && !sameAccount(existing.account, acc.target))
         return fail(`existing ${pairId} position is in ${describeAccount(existing.account)}, pair now resolves to ${describeAccount(acc.target)}; close it first`);
       const target: WriteAccount = existing?.account ?? acc.target;
+      if (target.kind === "address" && this.supplyMarketKeys().has(ps.market.key))
+        return fail(
+          `${pairId}: no covering e-mode, so this loop would use the wallet's Navi account in market ${ps.market.key}, ` +
+            `which holds plain supply deposits (they must stay in a separate, debt-free account); refusing`
+        );
       const bf = await this.borrowFeeFrac(ps, target.kind === "newCap" ? this.env.address : target.id);
       const fi = await this.flashInfo(ps, ps.coll);
       const ex = { existingCollateral: existing?.collateral ?? 0n, existingDebt: existing?.debt ?? 0n };
@@ -756,8 +915,8 @@ export class NaviAdapter implements LendingAdapter {
         const b = await this.buildFlashOpen(ps, target, equity, targetLtv, bf, fi, ex, ctx);
         if (isBuilt(b)) {
           try {
-            const rec = await executePtb(this.env, ctx, b.tx, b.description);
-            return { ok: true, txs: [rec], detail: b.detail, amountUsd: b.amountUsd };
+            const rec = await this.exec(ctx, b.tx, b.description);
+            return noteUnconfirmed({ ok: true, txs: [rec], detail: b.detail, amountUsd: b.amountUsd });
           } catch (e) {
             if (!(e instanceof SuiSimulationError)) throw e;
             errors.push(`flash: ${e.message}`);
@@ -768,9 +927,13 @@ export class NaviAdapter implements LendingAdapter {
 
       const it = await this.buildIterativeOpen(ps, target, equity, targetLtv, bf, ex, ctx);
       if (!isBuilt(it)) return fail([...errors, `iterative: ${it.error}`].join("; "));
-      const rec = await executePtb(this.env, ctx, it.tx, it.description);
-      return { ok: true, txs: [rec], detail: [it.detail, ...errors.map((x) => `(fallback because ${x})`)].join(" "), amountUsd: it.amountUsd };
+      const rec = await this.exec(ctx, it.tx, it.description);
+      return noteUnconfirmed({ ok: true, txs: [rec], detail: [it.detail, ...errors.map((x) => `(fallback because ${x})`)].join(" "), amountUsd: it.amountUsd });
     } catch (e) {
+      if (e instanceof NaviUnsettledError) {
+        ctx.log("error", `navi: open ${pairId}: ${e.message}`);
+        return e.result();
+      }
       ctx.log("error", `navi: open ${pairId} failed`, { error: errMsg(e) });
       return fail(errMsg(e));
     }
@@ -958,8 +1121,8 @@ export class NaviAdapter implements LendingAdapter {
       const flash = await this.buildUnwind(ps, st, mode, ctx, true);
       if (isBuilt(flash)) {
         try {
-          txs.push(await executePtb(this.env, ctx, flash.tx, flash.description));
-          return { ok: true, txs, detail: flash.detail, amountUsd: flash.amountUsd };
+          txs.push(await this.exec(ctx, flash.tx, flash.description));
+          return noteUnconfirmed({ ok: true, txs, detail: flash.detail, amountUsd: flash.amountUsd });
         } catch (e) {
           if (!(e instanceof SuiSimulationError)) throw e;
           errors.push(`flash: ${e.message}`);
@@ -968,9 +1131,13 @@ export class NaviAdapter implements LendingAdapter {
       } else errors.push(`flash: ${flash.error}`);
       const it = await this.buildUnwind(ps, st, mode, ctx, false);
       if (!isBuilt(it)) return fail([...errors, `iterative: ${it.error}`].join("; "));
-      txs.push(await executePtb(this.env, ctx, it.tx, it.description));
-      return { ok: true, txs, detail: [it.detail, ...errors.map((x) => `(fallback because ${x})`)].join(" "), amountUsd: it.amountUsd };
+      txs.push(await this.exec(ctx, it.tx, it.description));
+      return noteUnconfirmed({ ok: true, txs, detail: [it.detail, ...errors.map((x) => `(fallback because ${x})`)].join(" "), amountUsd: it.amountUsd });
     } catch (e) {
+      if (e instanceof NaviUnsettledError) {
+        ctx.log("error", `navi: unwind ${pairId}: ${e.message}`);
+        return e.result();
+      }
       ctx.log("error", `navi: unwind ${pairId} failed`, { error: errMsg(e) });
       return fail(errMsg(e));
     }
@@ -1175,32 +1342,255 @@ export class NaviAdapter implements LendingAdapter {
   // Rewards / wallet / verification
   // -------------------------------------------------------------------------
 
+  /**
+   * Claim Navi incentives into the wallet. `id` = a loop pairId (that pair's account +
+   * assets), a supply marketId (wallet account + that asset), or omitted (everything
+   * in every configured market). Shared by LendingAdapter and SupplyAdapter.
+   */
   async claimRewards(
     ctx: LiveContext,
-    pairId?: string
+    id?: string
   ): Promise<LiveResult & { claimed: { token: string; amount: bigint; decimals: number; coinType: string }[] }> {
     try {
-      const markets = pairId ? [this.pairCfg(pairId).market] : [...new Set([...this.pairs.values()].map((p) => p.market))];
+      const sc = id !== undefined ? this.supply.get(id) : undefined;
+      if (id !== undefined && !sc) this.pairCfg(id); // throws on unknown id
+      const markets =
+        id === undefined ? [...new Set([...[...this.pairs.values()].map((p) => p.market), ...this.supplyMarketKeys()])] : [sc ? sc.market : this.pairCfg(id).market];
       let rewards = await this.sdk.getUserAvailableLendingRewards(this.env.address, { client: this.client, markets });
       rewards = rewards.filter((r) => r.userClaimableReward > 0);
-      let ps: PairState | null = null;
-      if (pairId) {
-        ps = await this.loadPair(pairId);
+      let pools: NaviPool[] | null = null;
+      if (sc) {
+        const ss = await this.loadSupply(sc);
+        pools = ss.pools;
+        rewards = rewards.filter((r) => this.supplyRewardMatches(sc, r));
+      } else if (id !== undefined) {
+        const ps = await this.loadPair(id);
+        pools = ps.pools;
         const st = await this.positionState(ps, (await this.accounts(ps)).candidates);
-        rewards = st ? rewards.filter((r) => this.rewardMatches(ps!, st, r)) : [];
+        rewards = st ? rewards.filter((r) => this.rewardMatches(ps, st, r)) : [];
       }
       if (!rewards.length) return { ok: true, txs: [], claimed: [], detail: "nothing to claim" };
       const tx = new Transaction();
       // Transfer every claimed coin to the wallet (also e-mode cap rewards, which the SDK
       // would otherwise send to the cap's address).
       await this.sdk.claimLendingRewardsPTB(tx, rewards, { customCoinReceive: { type: "transfer", transfer: this.env.address } });
-      const rec = await executePtb(this.env, ctx, tx, `navi: claim rewards (${rewards.length} entries${pairId ? `, ${pairId}` : ""})`);
-      const claimed = (await this.groupRewards(ps, rewards)).map(({ token, amount, decimals, coinType }) => ({ token, amount, decimals, coinType }));
-      return { ok: true, txs: [rec], claimed, detail: "amounts are the pre-claim estimate from Navi's claimable query" };
+      const rec = await this.exec(ctx, tx, `navi: claim rewards (${rewards.length} entries${id ? `, ${id}` : ""})`);
+      const claimed = (await this.groupRewards(pools, rewards)).map(({ token, amount, decimals, coinType }) => ({ token, amount, decimals, coinType }));
+      return { ...noteUnconfirmed({ ok: true, txs: [rec], detail: "amounts are the pre-claim estimate from Navi's claimable query" }), claimed };
     } catch (e) {
+      if (e instanceof NaviUnsettledError) {
+        ctx.log("error", `navi: claimRewards: ${e.message}`);
+        return { ...e.result(), claimed: [] };
+      }
       ctx.log("error", "navi: claimRewards failed", { error: errMsg(e) });
       return { ok: false, txs: [], claimed: [], detail: errMsg(e) };
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // SupplyAdapter: plain deposits in the wallet address's Navi account
+  // -------------------------------------------------------------------------
+
+  private supplyCfg(marketId: string): SupplyCfg {
+    const c = this.supply.get(marketId);
+    if (!c) throw new Error(`navi: unknown supply marketId ${marketId}`);
+    return c;
+  }
+
+  private async loadSupply(cfg: SupplyCfg): Promise<SupplyState> {
+    const market = this.sdk.getMarketConfig(cfg.market);
+    const markets = market.key === NAVI_DEFAULT_MARKET ? [market.key] : [market.key, NAVI_DEFAULT_MARKET];
+    const pools = await this.sdk.getPools({ markets, disableCache: true });
+    const asOfMs = Date.now();
+    const pool = pools.find((p) => p.market === market.key && normType(p.suiCoinType ?? p.coinType) === cfg.type);
+    if (!pool) throw new Error(`navi: no pool for ${cfg.asset.symbol} (${cfg.type}) in market ${market.key}`);
+    if (pool.token?.decimals !== undefined && pool.token.decimals !== cfg.asset.decimals)
+      throw new Error(`navi: ${cfg.asset.symbol} decimals mismatch: config ${cfg.asset.decimals}, Navi ${pool.token.decimals}`);
+    const mkt = Number(pool.token?.price);
+    const priceUsd = Number.isFinite(mkt) && mkt > 0 ? mkt : Number(pool.oracle?.price);
+    const paused = (!!pool.status && pool.status !== "active") || !!pool.isDeprecated || pool.oracle?.valid === false;
+    return { cfg, market, pools, pool, priceUsd, paused, asOfMs };
+  }
+
+  /** The wallet address account in this market: my deposit of the asset + whether the account has any debt. */
+  private async readSupplyAccount(ss: SupplyState): Promise<{ units: bigint; debtUsd: number; entries: NaviUserLendingInfo[] }> {
+    const all = await this.sdk.getLendingState(this.env.address, { client: this.client, markets: [ss.market.key], disableCache: true });
+    const entries = all.filter((e) => e.market === ss.market.key);
+    const mine = entries.find((e) => e.assetId === ss.pool.id);
+    const debtUsd = entries.reduce((s, e) => s + (Number(e.borrowBalance) / 1e9) * Number(e.pool?.oracle?.price ?? 0), 0);
+    return { units: mine ? M.naviNormalToBase(mine.supplyBalance, ss.cfg.asset.decimals) : 0n, debtUsd, entries };
+  }
+
+  private supplyRewardMatches(sc: SupplyCfg, r: NaviLendingReward): boolean {
+    return r.market === sc.market && normalizeSuiAddress(r.address) === normalizeSuiAddress(this.env.address) && normType(r.assetCoinType) === sc.type;
+  }
+
+  async supplyMarkets(): Promise<SupplyMarket[]> {
+    const out: SupplyMarket[] = [];
+    for (const sc of this.supply.values()) {
+      try {
+        out.push(await this.supplyMarketFor(sc));
+      } catch (e) {
+        this.log("error", `navi: supplyMarkets() failed for ${sc.marketId}`, { error: errMsg(e) });
+      }
+    }
+    return out;
+  }
+
+  private async supplyMarketFor(sc: SupplyCfg): Promise<SupplyMarket> {
+    const ss = await this.loadSupply(sc);
+    const p = ss.pool;
+    const price = ss.priceUsd;
+    const amt = M.poolAmounts(p);
+    const caps = M.capsRemaining(p);
+    const rewards: RewardRate[] = M.splitRewardApr(this.rate(p.supplyIncentiveApyInfo?.boostedApr), await this.rewardSymbols(ss.pools, p.supplyIncentiveApyInfo?.rewardCoin));
+    if (this.extraRewards) {
+      try {
+        rewards.push(...(await this.extraRewards({ protocol: "navi", chain: "sui", asset: sc.asset, side: "supply", marketId: ss.market.key })));
+      } catch (e) {
+        this.log("warn", `navi: extraRewards(supply) failed for ${sc.marketId}`, { error: errMsg(e) });
+      }
+    }
+    let myDepositUsd: number | undefined;
+    try {
+      const acct = await this.readSupplyAccount(ss);
+      myDepositUsd = M.unitsToNumber(acct.units, sc.asset.decimals) * price;
+      if (acct.debtUsd > 0) this.log("warn", `navi: wallet Navi account in ${ss.market.key} has $${acct.debtUsd.toFixed(2)} debt; supply deposit ${sc.marketId} is encumbered`);
+    } catch (e) {
+      this.log("warn", `navi: deposit read failed for ${sc.marketId}`, { error: errMsg(e) });
+    }
+    return {
+      protocol: "navi",
+      chain: "sui",
+      marketId: sc.marketId,
+      asset: { symbol: sc.asset.symbol, assetId: sc.type, priceUsd: price },
+      totalSupplyUsd: amt.supply * price,
+      totalBorrowUsd: amt.borrow * price,
+      supplyAprBase: M.rayToFrac(p.currentSupplyRate),
+      rewards,
+      irm: M.buildIrmModel(p.borrowRateFactors?.fields),
+      // Navi withdraw needs pool supply - borrow >= amount (validation.move validate_withdraw)
+      withdrawableUsd: Number.isFinite(amt.supply - amt.borrow) ? Math.max(0, amt.supply - amt.borrow) * price : NaN,
+      supplyCapRemainingUsd: caps.supply === null ? undefined : caps.supply * price,
+      depositFeeFrac: 0,
+      withdrawFeeFrac: 0,
+      paused: ss.paused,
+      myDepositUsd,
+      dataAsOfMs: ss.asOfMs,
+      note: `Navi ${ss.market.key} pool #${p.id} (wallet account)`,
+    };
+  }
+
+  async supplyPosition(marketId: string): Promise<SupplyPositionView | null> {
+    const sc = this.supplyCfg(marketId);
+    const ss = await this.loadSupply(sc);
+    const acct = await this.readSupplyAccount(ss);
+    if (acct.units <= 0n) return null;
+    let rewardsUnclaimed: SupplyPositionView["rewardsUnclaimed"] = [];
+    try {
+      const all = await this.sdk.getUserAvailableLendingRewards(this.env.address, { client: this.client, markets: [ss.market.key] });
+      rewardsUnclaimed = (await this.groupRewards(ss.pools, all.filter((r) => this.supplyRewardMatches(sc, r)))).map(({ coinType: _c, ...r }) => r);
+    } catch (e) {
+      this.log("warn", `navi: reward read failed for ${marketId}`, { error: errMsg(e) });
+    }
+    return {
+      marketId,
+      depositUsd: M.unitsToNumber(acct.units, sc.asset.decimals) * ss.priceUsd,
+      units: acct.units,
+      rewardsUnclaimed,
+      asOfMs: Date.now(),
+    };
+  }
+
+  async deposit(marketId: string, amount: bigint, ctx: LiveContext): Promise<LiveResult> {
+    try {
+      const sc = this.supplyCfg(marketId);
+      if (!(amount > 0n)) return fail("amount must be > 0");
+      const ss = await this.loadSupply(sc);
+      if (ss.paused) return fail(`${marketId}: Navi pool inactive / deprecated / oracle invalid`);
+      const caps = M.capsRemaining(ss.pool);
+      const human = M.unitsToNumber(amount, sc.asset.decimals);
+      if (caps.supply !== null && human > caps.supply) return fail(`supply cap: ${caps.supply.toFixed(2)} ${sc.asset.symbol} left, deposit ${human.toFixed(2)}`);
+      const bal = await this.walletBalance(sc.asset);
+      if (bal < amount) return fail(`wallet has ${bal} ${sc.asset.symbol} base units < ${amount}`);
+      const acct = await this.readSupplyAccount(ss);
+      if (acct.debtUsd > 0)
+        return fail(
+          `wallet's Navi account in ${ss.market.key} has $${acct.debtUsd.toFixed(2)} of debt; plain deposits must sit in a debt-free account ` +
+            `(they would collateralize that debt). Repay it or move the loop to an e-mode account first`
+        );
+      // Deposit has no health check on Navi, so no oracle refresh is needed.
+      const tx = new Transaction();
+      const coin = tx.add(coinWithBalance({ type: sc.type, balance: amount }));
+      await this.sdk.depositCoinPTB(tx, ss.pool, coin, { market: ss.market.key });
+      const rec = await this.exec(ctx, tx, `navi: deposit ${amount} ${sc.asset.symbol} (${marketId})`);
+      return noteUnconfirmed({ ok: true, txs: [rec], detail: `deposited ${amount} ${sc.asset.symbol}`, amountUsd: human * ss.priceUsd });
+    } catch (e) {
+      if (e instanceof NaviUnsettledError) {
+        ctx.log("error", `navi: deposit ${marketId}: ${e.message}`);
+        return e.result();
+      }
+      ctx.log("error", `navi: deposit ${marketId} failed`, { error: errMsg(e) });
+      return fail(errMsg(e));
+    }
+  }
+
+  /** Withdraw PTB (oracle refresh first: Navi health-checks every withdraw). null = no deposit. */
+  private async buildSupplyWithdraw(ss: SupplyState, fraction: number, ctx: LiveContext, strict: boolean): Promise<{ tx: Transaction; request: bigint; units: bigint } | null> {
+    const acct = await this.readSupplyAccount(ss);
+    if (acct.units <= 0n) return null;
+    // fraction 1: request a bit more than the balance; Navi withdraws min(request, balance) and
+    // sends a <= 1000 (9-dec) remainder to the treasury, so nothing is left behind.
+    const request =
+      fraction >= 1
+        ? M.withdrawAllRequest(acct.units, M.rayToFrac(ss.pool.currentSupplyRate), secondsSince(ss.pool.lastUpdateTimestamp, Date.now()))
+        : M.mulFracFloor(acct.units, fraction);
+    if (request <= 0n) return null;
+    const tx = await this.txWithOracleFor(ss.market.key, [ss.pool], ctx, strict);
+    const coin = await this.sdk.withdrawCoinPTB(tx, ss.pool, u64(tx, request), { market: ss.market.key });
+    tx.transferObjects([coin], this.env.address);
+    return { tx, request, units: acct.units };
+  }
+
+  async withdraw(marketId: string, fraction: number, ctx: LiveContext): Promise<LiveResult> {
+    try {
+      if (!(fraction > 0 && fraction <= 1)) return fail(`fraction ${fraction} out of (0,1]`);
+      const sc = this.supplyCfg(marketId);
+      const ss = await this.loadSupply(sc);
+      const b = await this.buildSupplyWithdraw(ss, fraction, ctx, false);
+      if (!b) return { ok: true, txs: [], detail: "no deposit" };
+      const amt = M.minBig(b.request, b.units);
+      const rec = await this.exec(ctx, b.tx, `navi: withdraw ${fraction >= 1 ? "all" : b.request} ${sc.asset.symbol} (${marketId})`);
+      return noteUnconfirmed({
+        ok: true,
+        txs: [rec],
+        detail: `withdrew ${fraction >= 1 ? `all (~${b.units})` : b.request} ${sc.asset.symbol}`,
+        amountUsd: M.unitsToNumber(amt, sc.asset.decimals) * ss.priceUsd,
+      });
+    } catch (e) {
+      if (e instanceof NaviUnsettledError) {
+        ctx.log("error", `navi: withdraw ${marketId}: ${e.message}`);
+        return e.result();
+      }
+      ctx.log("error", `navi: withdraw ${marketId} failed`, { error: errMsg(e) });
+      return fail(errMsg(e));
+    }
+  }
+
+  /**
+   * Simulate a full withdraw: true = would succeed, false = would abort (liquidity,
+   * health, paused ...). Read / RPC errors THROW (unknown is not a failure).
+   */
+  async simulateWithdraw(marketId: string, ctx: LiveContext): Promise<boolean> {
+    const sc = this.supplyCfg(marketId);
+    const ss = await this.loadSupply(sc);
+    const b = await this.buildSupplyWithdraw(ss, 1, ctx, true);
+    if (!b) return true;
+    b.tx.setSenderIfNotSet(this.env.address);
+    const sim = await this.env.grpc.core.simulateTransaction({ transaction: b.tx, include: { effects: true } });
+    if (sim.$kind === "Transaction") return true;
+    ctx.log("warn", `navi: simulateWithdraw ${marketId} would abort`, { error: JSON.stringify(sim.FailedTransaction?.status ?? null) });
+    return false;
   }
 
   async walletBalance(asset: AssetRef): Promise<bigint> {
@@ -1211,7 +1601,8 @@ export class NaviAdapter implements LendingAdapter {
    * On-chain config checks: coin types exist with the configured decimals,
    * a Navi pool exists for each (market, coinType) and the pool object on
    * chain is a Pool<coinType>, the market's Storage object exists, explicit
-   * e-modes cover the pair, and pairs do not share an account+asset.
+   * e-modes cover the pair, pairs do not share an account+asset, and supply
+   * markets get a debt-free wallet account no loop uses.
    * Returns issues (empty = ok).
    */
   async verifyConfig(env: SuiEnv = this.env): Promise<string[]> {
@@ -1220,30 +1611,26 @@ export class NaviAdapter implements LendingAdapter {
     const poolsByMarket = new Map<string, NaviPool[]>();
     const storageChecked = new Set<string>();
     const usage = new Map<string, string>();
-    for (const cfg of this.pairs.values()) {
-      const pid = cfg.pairId;
-      let market: NaviMarketConfig;
-      try {
-        market = this.sdk.getMarketConfig(cfg.market);
-      } catch {
-        issues.push(`${pid}: unknown Navi market "${cfg.market}"`);
-        continue;
-      }
-      const collType = normType(cfg.collateral.address);
-      const debtType = normType(cfg.debt.address);
-      if ((collType === debtType) !== (cfg.collateral.symbol === cfg.debt.symbol))
-        issues.push(`${pid}: same-asset detection disagrees (coin types ${collType === debtType ? "equal" : "differ"}, symbols ${cfg.collateral.symbol}/${cfg.debt.symbol})`);
-      if (collType !== debtType && !this.swapper) issues.push(`${pid}: different assets but no swapper configured`);
+    /** pairs resolving to the wallet address account, by market */
+    const addressLoops = new Map<string, string[]>();
 
+    const marketOf = (id: string, key: string): NaviMarketConfig | null => {
+      try {
+        return this.sdk.getMarketConfig(key);
+      } catch {
+        issues.push(`${id}: unknown Navi market "${key}"`);
+        return null;
+      }
+    };
+    const poolsFor = async (id: string, market: NaviMarketConfig): Promise<NaviPool[]> => {
       if (!poolsByMarket.has(market.key)) {
         try {
           poolsByMarket.set(market.key, await this.sdk.getPools({ markets: [market.key], disableCache: true }));
         } catch (e) {
-          issues.push(`${pid}: cannot fetch Navi pools for market ${market.key}: ${errMsg(e)}`);
+          issues.push(`${id}: cannot fetch Navi pools for market ${market.key}: ${errMsg(e)}`);
           poolsByMarket.set(market.key, []);
         }
       }
-      const pools = poolsByMarket.get(market.key)!;
       if (!storageChecked.has(market.key)) {
         storageChecked.add(market.key);
         try {
@@ -1254,37 +1641,44 @@ export class NaviAdapter implements LendingAdapter {
           issues.push(`${market.key}: Navi storage object check failed: ${errMsg(e)}`);
         }
       }
-
-      const poolOf: Record<string, NaviPool | undefined> = {};
-      for (const [role, a, t] of [
-        ["collateral", cfg.collateral, collType],
-        ["debt", cfg.debt, debtType],
-      ] as const) {
-        try {
-          const meta = await core.getCoinMetadata({ coinType: t });
-          if (!meta.coinMetadata) issues.push(`${pid}: ${role} ${a.symbol} coin type ${t} has no on-chain metadata`);
-          else if (meta.coinMetadata.decimals !== a.decimals)
-            issues.push(`${pid}: ${role} ${a.symbol} decimals ${a.decimals} != on-chain ${meta.coinMetadata.decimals}`);
-        } catch (e) {
-          issues.push(`${pid}: ${role} ${a.symbol} metadata read failed: ${errMsg(e)}`);
-        }
-        const pool = pools.find((p) => p.market === market.key && normType(p.suiCoinType ?? p.coinType) === t);
-        poolOf[role] = pool;
-        if (!pool) {
-          issues.push(`${pid}: no Navi pool for ${role} ${a.symbol} (${t}) in market ${market.key}`);
-          continue;
-        }
-        if (pool.token?.decimals !== a.decimals) issues.push(`${pid}: ${role} ${a.symbol} decimals ${a.decimals} != Navi pool ${pool.token?.decimals}`);
-        if ((pool.status && pool.status !== "active") || pool.isDeprecated) issues.push(`${pid}: Navi ${a.symbol} pool status ${pool.status ?? "deprecated"}`);
-        try {
-          const { object } = await core.getObject({ objectId: pool.contract.pool });
-          if (!normType(object.type).endsWith(`::pool::Pool<${t}>`)) issues.push(`${pid}: Navi pool object ${pool.contract.pool} type ${object.type} is not Pool<${t}>`);
-        } catch (e) {
-          issues.push(`${pid}: Navi pool object ${pool.contract.pool} not readable: ${errMsg(e)}`);
-        }
+      return poolsByMarket.get(market.key)!;
+    };
+    const checkAsset = async (id: string, role: string, a: AssetRef, t: string, market: NaviMarketConfig, pools: NaviPool[]): Promise<NaviPool | undefined> => {
+      try {
+        const meta = await core.getCoinMetadata({ coinType: t });
+        if (!meta.coinMetadata) issues.push(`${id}: ${role} ${a.symbol} coin type ${t} has no on-chain metadata`);
+        else if (meta.coinMetadata.decimals !== a.decimals) issues.push(`${id}: ${role} ${a.symbol} decimals ${a.decimals} != on-chain ${meta.coinMetadata.decimals}`);
+      } catch (e) {
+        issues.push(`${id}: ${role} ${a.symbol} metadata read failed: ${errMsg(e)}`);
       }
-      const cp = poolOf.collateral;
-      const dp = poolOf.debt;
+      const pool = pools.find((p) => p.market === market.key && normType(p.suiCoinType ?? p.coinType) === t);
+      if (!pool) {
+        issues.push(`${id}: no Navi pool for ${role} ${a.symbol} (${t}) in market ${market.key}`);
+        return undefined;
+      }
+      if (pool.token?.decimals !== a.decimals) issues.push(`${id}: ${role} ${a.symbol} decimals ${a.decimals} != Navi pool ${pool.token?.decimals}`);
+      if ((pool.status && pool.status !== "active") || pool.isDeprecated) issues.push(`${id}: Navi ${a.symbol} pool status ${pool.status ?? "deprecated"}`);
+      try {
+        const { object } = await core.getObject({ objectId: pool.contract.pool });
+        if (!normType(object.type).endsWith(`::pool::Pool<${t}>`)) issues.push(`${id}: Navi pool object ${pool.contract.pool} type ${object.type} is not Pool<${t}>`);
+      } catch (e) {
+        issues.push(`${id}: Navi pool object ${pool.contract.pool} not readable: ${errMsg(e)}`);
+      }
+      return pool;
+    };
+
+    for (const cfg of this.pairs.values()) {
+      const pid = cfg.pairId;
+      const market = marketOf(pid, cfg.market);
+      if (!market) continue;
+      const collType = normType(cfg.collateral.address);
+      const debtType = normType(cfg.debt.address);
+      if ((collType === debtType) !== (cfg.collateral.symbol === cfg.debt.symbol))
+        issues.push(`${pid}: same-asset detection disagrees (coin types ${collType === debtType ? "equal" : "differ"}, symbols ${cfg.collateral.symbol}/${cfg.debt.symbol})`);
+      if (collType !== debtType && !this.swapper) issues.push(`${pid}: different assets but no swapper configured`);
+      const pools = await poolsFor(pid, market);
+      const cp = await checkAsset(pid, "collateral", cfg.collateral, collType, market, pools);
+      const dp = await checkAsset(pid, "debt", cfg.debt, debtType, market, pools);
       let emodeId: number | null = null;
       if (cp && dp) {
         const poolLtv = Number(cp.ltvValue);
@@ -1293,12 +1687,24 @@ export class NaviAdapter implements LendingAdapter {
         emodeId = em?.emodeId ?? null;
       }
       const acct = emodeId === null ? "address" : `emode:${emodeId}`;
+      if (emodeId === null) addressLoops.set(market.key, [...(addressLoops.get(market.key) ?? []), pid]);
       for (const t of new Set([collType, debtType])) {
         const key = `${market.key}|${acct}|${t}`;
         const prev = usage.get(key);
         if (prev) issues.push(`${pid}: shares Navi account (${acct}) and asset ${t} with ${prev} in market ${market.key}; positions would be conflated`);
         else usage.set(key, pid);
       }
+    }
+
+    for (const sc of this.supply.values()) {
+      const market = marketOf(sc.marketId, sc.market);
+      if (!market) continue;
+      const pools = await poolsFor(sc.marketId, market);
+      await checkAsset(sc.marketId, "supply", sc.asset, sc.type, market, pools);
+      for (const pid of addressLoops.get(market.key) ?? [])
+        issues.push(
+          `${sc.marketId}: loop pair ${pid} has no covering e-mode in market ${market.key}, so it would use the wallet account that holds this deposit; open(${pid}) will refuse`
+        );
     }
     return issues;
   }
