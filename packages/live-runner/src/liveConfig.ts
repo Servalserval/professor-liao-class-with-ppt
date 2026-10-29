@@ -37,6 +37,26 @@ export interface PairSpec {
   expected_price_ratio?: number | "oracle";
 }
 
+/** A plain deposit (supply-only) on the same venue as a lending spec. */
+export interface SupplySpec {
+  /** asset symbol from `assets.<chain>` */
+  asset: string;
+  /** Expected SupplyMarket.marketId (default: matched by asset). */
+  marketId?: string;
+  /** Navi: market name; Aave V4: reserve id. */
+  market?: string;
+  reserveId?: number;
+  /** Scallop: stake the sCoin in the pool's spool when it is live (default true). */
+  stakeInSpool?: boolean;
+}
+
+/** ERC-4626 vaults on one chain (Euler EVaults, MetaMorpho vaults, Fluid fTokens, sUSDS ...). */
+export interface VaultSpec {
+  chain: string;
+  vaults: { address: string; asset: string; flavor: "euler" | "metamorpho" | "fluid" | "generic"; marketId?: string; protocol?: string; curator?: string }[];
+  options?: Record<string, unknown>;
+}
+
 export interface LendingSpec {
   /** "aave-v3" (any Aave v3 family market) | "morpho" | "navi" | "suilend" | "scallop" */
   type: string;
@@ -46,7 +66,10 @@ export interface LendingSpec {
   addresses?: Record<string, string>;
   /** Venue id override (e.g. "spark") */
   protocol?: string;
+  /** Loop pairs (may be empty for a supply-only venue). */
   pairs: PairSpec[];
+  /** Plain deposits on this venue (no borrow). */
+  supply?: SupplySpec[];
   options?: Record<string, unknown>;
 }
 
@@ -62,6 +85,7 @@ export interface LiveConfig {
   /** chain -> symbol of the stablecoin that idle cash / reward proceeds are kept in */
   cash_asset: Record<string, string>;
   lending: LendingSpec[];
+  vaults?: VaultSpec[];
   swaps: Record<string, { type: string; options?: Record<string, unknown> }>;
   bridges: Record<string, { enabled: boolean; options?: Record<string, unknown> }>;
   rewards: {
@@ -122,8 +146,21 @@ export function validateLiveConfig(c: LiveConfig): string[] {
     for (const [sym, a] of Object.entries(m ?? {}))
       if (!a || (!a.address && !a.aave_book && !a.usdt0)) e.push(`assets.${chain}.${sym}: needs address+decimals, aave_book or usdt0`);
       else if (a.address && a.decimals === undefined) e.push(`assets.${chain}.${sym}: address without decimals`);
+  for (const v of c.vaults ?? []) {
+    if (!c.chains?.[v.chain]) e.push(`vaults@${v.chain}: chain has no entry in chains`);
+    for (const x of v.vaults ?? []) {
+      if (!c.assets?.[v.chain]?.[x.asset]) e.push(`vault ${x.address}@${v.chain}: asset ${x.asset} not in assets.${v.chain}`);
+      if (!allowNonStable && !STABLE_SYMBOLS.has(x.asset)) e.push(`vault ${x.address}@${v.chain}: ${x.asset} is not a stablecoin (set allow_non_stable: true to override)`);
+      if (!["euler", "metamorpho", "fluid", "generic"].includes(x.flavor)) e.push(`vault ${x.address}@${v.chain}: flavor must be euler|metamorpho|fluid|generic`);
+    }
+  }
   for (const l of c.lending ?? []) {
     if (!c.chains?.[l.chain]) e.push(`lending ${l.type}: chain ${l.chain} has no entry in chains`);
+    if (!(l.pairs ?? []).length && !(l.supply ?? []).length) e.push(`lending ${l.type}@${l.chain}: needs pairs or supply`);
+    for (const sp of l.supply ?? []) {
+      if (!c.assets?.[l.chain]?.[sp.asset]) e.push(`lending ${l.type}@${l.chain} supply: asset ${sp.asset} not in assets.${l.chain}`);
+      if (!allowNonStable && !STABLE_SYMBOLS.has(sp.asset)) e.push(`lending ${l.type}@${l.chain} supply: ${sp.asset} is not a stablecoin (set allow_non_stable: true to override)`);
+    }
     for (const p of l.pairs ?? []) {
       for (const sym of [p.collateral, p.debt]) {
         if (!c.assets?.[l.chain]?.[sym]) e.push(`lending ${l.type}@${l.chain} pair ${p.pairId}: asset ${sym} not in assets.${l.chain}`);

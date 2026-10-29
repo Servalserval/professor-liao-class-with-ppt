@@ -23,6 +23,7 @@ import {
   type LendingAdapter,
   type LiveContext,
   type RewardClaimer,
+  type SupplyAdapter,
   type SwapAdapter,
   unitsToUsd,
 } from "@incentive-router/live-common";
@@ -41,6 +42,9 @@ export interface RewardKeeperDeps {
   claimers: RewardClaimer[];
   /** Adapter + the pair ids configured on it (for position reads). */
   lending: { adapter: LendingAdapter; pairIds: string[] }[];
+  /** Supply adapters + their market ids (plain deposits). An adapter in both lists is claimed once. */
+  /** marketIds is read at claim time (ids are learned from the first market read). */
+  supply?: { adapter: SupplyAdapter; marketIds: () => string[] }[];
   owner: (chain: string) => string | undefined;
   /** chain -> reward tokens to sell when they sit in the wallet. */
   sellables: Record<string, AssetRef[]>;
@@ -113,19 +117,28 @@ export class RewardKeeper {
       }
     }
 
-    // 2. native protocol rewards
+    // 2. native protocol rewards (one claim per adapter, loops + deposits summed)
+    const byAdapter = new Map<string, { claim: (c: LiveContext) => Promise<{ ok: boolean; detail?: string }>; reads: (() => Promise<number>)[] }>();
+    const sumRewards = (rs: { usd: number }[]) => rs.reduce((a, r) => a + (Number.isFinite(r.usd) ? r.usd : 0), 0);
     for (const { adapter, pairIds } of this.d.lending) {
+      const e = byAdapter.get(adapter.id) ?? { claim: (c) => adapter.claimRewards(c), reads: [] };
+      for (const id of pairIds) e.reads.push(async () => sumRewards((await adapter.position(id))?.rewardsUnclaimed ?? []));
+      byAdapter.set(adapter.id, e);
+    }
+    for (const { adapter, marketIds } of this.d.supply ?? []) {
+      const e = byAdapter.get(adapter.id) ?? { claim: (c) => adapter.claimRewards(c), reads: [] };
+      for (const id of marketIds()) e.reads.push(async () => sumRewards((await adapter.supplyPosition(id))?.rewardsUnclaimed ?? []));
+      byAdapter.set(adapter.id, e);
+    }
+    for (const [id, { claim, reads }] of byAdapter) {
       try {
         let usd = 0;
-        for (const id of pairIds) {
-          const v = await adapter.position(id);
-          if (v) usd += v.rewardsUnclaimed.reduce((a, r) => a + (Number.isFinite(r.usd) ? r.usd : 0), 0);
-        }
+        for (const r of reads) usd += await r();
         if (usd < this.d.opts.minClaimUsd) continue;
-        const r = await adapter.claimRewards(ctx);
-        out.push(`${tag}${adapter.id}: native claim $${usd.toFixed(2)} ${r.ok ? "OK" : `FAILED ${r.detail ?? ""}`}`);
+        const r = await claim(ctx);
+        out.push(`${tag}${id}: native claim $${usd.toFixed(2)} ${r.ok ? "OK" : `FAILED ${r.detail ?? ""}`}`);
       } catch (e) {
-        out.push(`${adapter.id}: ERROR ${(e as Error).message}`);
+        out.push(`${id}: ERROR ${(e as Error).message}`);
       }
     }
 

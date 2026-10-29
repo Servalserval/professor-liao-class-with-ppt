@@ -232,13 +232,25 @@ async function reconcile(rt: Runtime, store: FileStore, notifier: Notifier): Pro
     let changed = false;
     for (const opp of opps) {
       if (st.positions.some((p) => p.oppId === opp.id)) continue;
-      const b = rt.registry.bind(opp.id);
-      if (!b) continue;
-      const v = await b.adapter.position(b.pairId).catch(() => null);
-      if (!v || !(v.equityUsd > 10)) continue;
-      upsertPosition(st, opp, v.equityUsd, Date.now());
+      let usd = 0;
+      let what = "";
+      if (opp.kind === "deposit") {
+        const b = rt.supplyRegistry.bind(opp.id);
+        if (!b) continue;
+        const v = await b.adapter.supplyPosition(b.marketId).catch(() => null);
+        usd = v?.depositUsd ?? 0;
+        what = "deposit";
+      } else {
+        const b = rt.registry.bind(opp.id);
+        if (!b) continue;
+        const v = await b.adapter.position(b.pairId).catch(() => null);
+        usd = v?.equityUsd ?? 0;
+        what = v ? `loop, LTV ${v.ltv.toFixed(3)}` : "loop";
+      }
+      if (!(usd > 10)) continue;
+      upsertPosition(st, opp, usd, Date.now());
       changed = true;
-      await notifier.send("critical", `adopted untracked on-chain position ${opp.id} ($${v.equityUsd.toFixed(2)}, LTV ${v.ltv.toFixed(3)}) — it is now managed by the router`);
+      await notifier.send("critical", `adopted untracked on-chain position ${opp.id} ($${usd.toFixed(2)}, ${what}) — it is now managed by the router`);
     }
     if (changed) store.save(st);
   } catch (e) {

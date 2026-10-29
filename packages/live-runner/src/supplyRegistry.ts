@@ -58,6 +58,19 @@ export class SupplyRegistry {
     });
   }
 
+  /**
+   * Market ids of an adapter as the adapter names them (learned on the first
+   * read; before that, only explicitly configured ids). Adapters derive
+   * default ids differently (Navi `main:USDC`, Aave V4 `<spoke>:<reserve>`),
+   * so callers must not guess them from the asset symbol.
+   */
+  marketIds(adapter: SupplyAdapter): string[] {
+    const seen = new Set<string>();
+    for (const b of this.bindings.values()) if (b.adapter === adapter) seen.add(b.marketId);
+    if (seen.size) return [...seen];
+    return this.wired.filter((x) => x.adapter === adapter && x.w.marketId !== undefined).map((x) => x.w.marketId!);
+  }
+
   /** Binding for an opportunity id; falls back to the configuration before the first read. */
   bind(oppId: string): SupplyBinding | undefined {
     const hit = this.bindings.get(oppId);

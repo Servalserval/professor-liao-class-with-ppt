@@ -27,9 +27,20 @@ import {
   type Logger,
   type RewardClaimer,
   type RewardRateProvider,
+  type SupplyAdapter,
   type SwapAdapter,
 } from "@incentive-router/live-common";
-import { AaveV3Adapter, aaveAssetFromAddressBook, aaveMarketFromAddressBook, MerklClaimer, merklRewardRateProvider, AggregatorSwapAdapter, MorphoBlueAdapter, type AaveMarketConfig } from "@incentive-router/live-evm";
+import {
+  AaveV3Adapter,
+  aaveAssetFromAddressBook,
+  aaveMarketFromAddressBook,
+  AggregatorSwapAdapter,
+  ERC4626VaultAdapter,
+  MerklClaimer,
+  merklRewardRateProvider,
+  MorphoBlueAdapter,
+  type AaveMarketConfig,
+} from "@incentive-router/live-evm";
 import { assertChainId, erc20Balance, makeEvmEnv, verifyAsset, type Address, type EvmEnv, type Hex } from "@incentive-router/live-evm-base";
 import {
   CetusPtbSwapper,
@@ -54,6 +65,8 @@ import { applyCanaryToRouterConfig, CanaryExecutor } from "./guards.js";
 import type { AssetSpec, LendingSpec, LiveConfig, PairSpec } from "./liveConfig.js";
 import { LoopExecutor } from "./loopExecutor.js";
 import { PairRegistry, type PairWiring } from "./pairs.js";
+import { SupplyExecutor } from "./supplyExecutor.js";
+import { SupplyRegistry, type SupplyWiring } from "./supplyRegistry.js";
 import { PriceFeed } from "./prices.js";
 import { RewardKeeper } from "./rewardKeeper.js";
 import { ShadowBridgeExecutor } from "./shadowBridge.js";
@@ -72,6 +85,7 @@ export interface Runtime {
   sui?: SuiEnv;
   assets: Record<string, Record<string, AssetRef>>;
   registry: PairRegistry;
+  supplyRegistry: SupplyRegistry;
   sources: Source[];
   executor: Executor;
   executors: Record<string, Executor>;
@@ -312,42 +326,79 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
     });
   }
 
-  // --- lending adapters -----------------------------------------------------------
+  // --- lending adapters (loops + plain deposits) and ERC-4626 vaults ----------------
   const registry = new PairRegistry({ marketPrice: (a) => prices.priceUsd(a), log });
-  const sources: Source[] = [];
+  const supplyRegistry = new SupplyRegistry({ marketPrice: (a) => prices.priceUsd(a), log });
+  const loopSources: Source[] = [];
+  const supplySources: Source[] = [];
   const lendingForKeeper: { adapter: LendingAdapter; pairIds: string[] }[] = [];
+  const supplyForKeeper: { adapter: SupplyAdapter; marketIds: () => string[] }[] = [];
   const wiringOf = (l: LendingSpec): PairWiring[] =>
-    l.pairs.map((p: PairSpec) => ({ pairId: p.pairId, collateral: asset(l.chain, p.collateral), debt: asset(l.chain, p.debt), expectedPriceRatio: p.expected_price_ratio }));
+    (l.pairs ?? []).map((p: PairSpec) => ({ pairId: p.pairId, collateral: asset(l.chain, p.collateral), debt: asset(l.chain, p.debt), expectedPriceRatio: p.expected_price_ratio }));
+  const supplyWiringOf = (l: LendingSpec): (SupplyWiring & SupplySpecResolved)[] =>
+    (l.supply ?? []).map((sp) => ({ asset: asset(l.chain, sp.asset), marketId: sp.marketId, market: sp.market, reserveId: sp.reserveId, stakeInSpool: sp.stakeInSpool }));
+  const addVerifier = (id: string, target: unknown) => {
+    const v = (target as { verifyConfig?: () => Promise<unknown> }).verifyConfig;
+    verifiers.push({ id, run: v ? async () => issuesOf(await v.call(target)) : async () => [`${id}: adapter has no verifyConfig()`] });
+  };
+  const factoryDeps: FactoryDeps = {
+    evmEnv,
+    suiEnv,
+    swappers: lendingSwappers,
+    suiPtbSwapper,
+    extraRewards,
+    priceUsd: (a) => prices.priceUsd(a),
+    log,
+    pythUpdates,
+  };
   for (const l of cfg.lending ?? []) {
     const wiring = wiringOf(l);
+    const supplyWiring = supplyWiringOf(l);
     const opt = (l.options ?? {}) as Record<string, unknown>;
-    const adapter = makeLendingAdapter(l, wiring, opt, {
-      evmEnv,
-      suiEnv,
-      swappers: lendingSwappers,
-      suiPtbSwapper,
-      extraRewards,
-      priceUsd: (a) => prices.priceUsd(a),
-      log,
-      pythUpdates,
-    });
-    sources.push(registry.source(adapter, wiring));
-    lendingForKeeper.push({ adapter, pairIds: wiring.map((w) => w.pairId) });
-    const v = (adapter as unknown as { verifyConfig?: () => Promise<unknown> }).verifyConfig;
-    if (v) verifiers.push({ id: `lending:${adapter.id}`, run: async () => issuesOf(await v.call(adapter)) });
-    else verifiers.push({ id: `lending:${adapter.id}`, run: async () => [`${adapter.id}: adapter has no verifyConfig()`] });
+    const adapter = makeLendingAdapter(l, wiring, opt, factoryDeps, supplyWiring);
+    if (wiring.length) {
+      loopSources.push(registry.source(adapter, wiring));
+      lendingForKeeper.push({ adapter, pairIds: wiring.map((w) => w.pairId) });
+    }
+    if (supplyWiring.length) {
+      if (!isSupplyAdapter(adapter)) throw new Error(`lending ${l.type}@${l.chain}: this adapter does not support plain deposits (supply)`);
+      supplySources.push(supplyRegistry.source(adapter, supplyWiring));
+      supplyForKeeper.push({ adapter, marketIds: () => supplyRegistry.marketIds(adapter) });
+    }
+    addVerifier(`lending:${adapter.id}`, adapter);
   }
+  for (const v of cfg.vaults ?? []) {
+    const opt = (v.options ?? {}) as Record<string, unknown>;
+    const vaults = v.vaults.map((x) => ({
+      address: x.address as Address,
+      asset: asset(v.chain, x.asset),
+      flavor: x.flavor,
+      marketId: x.marketId ?? x.address.toLowerCase(),
+      protocol: x.protocol,
+      curator: x.curator,
+    }));
+    const adapter = new ERC4626VaultAdapter({ env: evmEnv(v.chain), vaults, extraRewards, priceUsd: (a: AssetRef) => prices.priceUsd(a), log, ...(opt as object) });
+    supplySources.push(supplyRegistry.source(adapter, vaults.map((x) => ({ marketId: x.marketId, asset: x.asset }))));
+    supplyForKeeper.push({ adapter, marketIds: () => supplyRegistry.marketIds(adapter) });
+    addVerifier(`vaults:${v.chain}`, adapter);
+  }
+  const sources: Source[] = [...loopSources, ...supplySources];
 
   // --- executors ----------------------------------------------------------------------
   const mode = cfg.mode === "live" ? "live" : "shadow";
   const cash: Record<string, AssetRef> = {};
   for (const [chain, sym] of Object.entries(cfg.cash_asset ?? {})) cash[chain] = asset(chain, sym);
-  const sellCfg = ((cfg.rewards as { sell?: Record<string, string[]> } | undefined)?.sell ?? {}) as Record<string, string[]>;
+  const sellCfg = cfg.rewards?.sell ?? {};
   const rewardAssets: Record<string, Record<string, AssetRef>> = {};
   for (const [chain, syms] of Object.entries(sellCfg)) for (const s of syms) (rewardAssets[chain] ??= {})[s] = asset(chain, s);
   const loop = new LoopExecutor({ mode, ctx, bind: (id) => registry.bind(id), swappers, rewardAssets, proceedsAsset: cash, swapMode });
-  const executor = new CanaryExecutor(loop, cfg.canary, () => o.positions() as never, o.entriesAllowed);
-  const executors = Object.fromEntries(sources.map((s) => [s.id, executor as Executor]));
+  const supply = new SupplyExecutor({ mode, ctx, bind: (id) => supplyRegistry.bind(id), swappers, rewardAssets, proceedsAsset: cash });
+  const loopExecutor = new CanaryExecutor(loop, cfg.canary, () => o.positions() as never, o.entriesAllowed);
+  const supplyExecutor = new CanaryExecutor(supply, cfg.canary, () => o.positions() as never, o.entriesAllowed);
+  const executor = loopExecutor;
+  const executors: Record<string, Executor> = {};
+  for (const s of loopSources) executors[s.id] = loopExecutor;
+  for (const s of supplySources) executors[s.id] = supplyExecutor;
 
   // --- bridges -----------------------------------------------------------------------
   const bridgeAdapters: BridgeAdapter[] = [];
@@ -432,6 +483,7 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
     ctx: { ...ctx, dryRun: mode !== "live" },
     claimers,
     lending: lendingForKeeper,
+    supply: supplyForKeeper,
     owner: (chain) => (chainInfo(chain).family === "sui" ? sui?.address : evm[chain]?.account),
     sellables,
     cash,
@@ -444,7 +496,11 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
 
   // --- wallet buckets ------------------------------------------------------------------
   const bucketAssets: AssetRef[] = [...Object.values(cash)];
-  for (const l of cfg.lending ?? []) for (const w of wiringOf(l)) bucketAssets.push(w.collateral, w.debt);
+  for (const l of cfg.lending ?? []) {
+    for (const w of wiringOf(l)) bucketAssets.push(w.collateral, w.debt);
+    for (const w of supplyWiringOf(l)) bucketAssets.push(w.asset);
+  }
+  for (const v of cfg.vaults ?? []) for (const x of v.vaults) bucketAssets.push(asset(v.chain, x.asset));
   for (const r of routes.filter((x) => x.enabled)) {
     const f = assets[r.from.chain]?.[r.from.asset];
     const t = assets[r.to.chain]?.[r.to.asset];
@@ -505,6 +561,7 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
     sui,
     assets,
     registry,
+    supplyRegistry,
     sources,
     executor,
     executors,
@@ -521,6 +578,20 @@ export async function buildRuntime(cfg: LiveConfig, raw: unknown, o: BuildOption
 // Lending adapter factories (one per `lending[].type`)
 // ---------------------------------------------------------------------------
 
+/** A resolved supply entry handed to adapter factories. */
+export interface SupplySpecResolved {
+  asset: AssetRef;
+  marketId?: string;
+  market?: string;
+  stakeInSpool?: boolean;
+  reserveId?: number;
+}
+
+export function isSupplyAdapter(a: unknown): a is SupplyAdapter {
+  const x = a as Partial<SupplyAdapter>;
+  return typeof x?.supplyMarkets === "function" && typeof x.deposit === "function" && typeof x.withdraw === "function";
+}
+
 export interface FactoryDeps {
   evmEnv: (chain: string) => EvmEnv;
   suiEnv: () => SuiEnv;
@@ -533,7 +604,12 @@ export interface FactoryDeps {
   pythUpdates?: { getPriceFeedsUpdateData(ids: string[]): Promise<Buffer[]> };
 }
 
-export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Record<string, unknown>, d: FactoryDeps): LendingAdapter {
+export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Record<string, unknown>, d: FactoryDeps, supply: SupplySpecResolved[] = []): LendingAdapter {
+  // Each adapter reads only the fields it knows: Aave V3 / Suilend {asset, marketId}, Aave V4 + reserveId,
+  // Navi + market, Scallop + stakeInSpool. Undefined fields fall back to the adapter's defaults.
+  const supplyOpt = supply.length
+    ? { supply: supply.map((x) => ({ ...(Object.fromEntries(Object.entries(x).filter(([, v]) => v !== undefined)) as Partial<SupplySpecResolved>), asset: x.asset })) }
+    : {};
   switch (l.type) {
     case "aave-v3": {
       // Address-book market (e.g. AaveV3Plasma) or explicit addresses for markets the
@@ -570,6 +646,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
         swapper: d.swappers[l.chain],
         extraRewards: d.extraRewards,
         log: d.log,
+        ...supplyOpt,
         ...(opt as object),
       });
     }
@@ -589,6 +666,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
         extraRewards: rewards ? (q) => rewards({ ...q, marketId: a.hub }) : undefined,
         priceUsd: d.priceUsd,
         log: d.log,
+        ...supplyOpt,
         ...(opt as object),
       });
     }
@@ -607,6 +685,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
         swapper: d.swappers[l.chain],
         extraRewards: d.extraRewards,
         log: d.log,
+        ...supplyOpt,
         ...(opt as object),
       });
     case "scallop":
@@ -616,6 +695,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
         swapper: d.suiPtbSwapper,
         extraRewards: d.extraRewards,
         sdkOptions: { pythApiKey: process.env.PYTH_API_KEY || undefined },
+        ...supplyOpt,
         ...(opt as object),
       });
     case "navi":
@@ -631,6 +711,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
         swapper: d.suiPtbSwapper,
         extraRewards: d.extraRewards,
         log: d.log,
+        ...supplyOpt,
         ...(opt as object),
       });
     case "suilend":
@@ -642,6 +723,7 @@ export function makeLendingAdapter(l: LendingSpec, wiring: PairWiring[], opt: Re
         extraRewards: d.extraRewards,
         priceUpdateSource: d.pythUpdates,
         log: d.log,
+        ...supplyOpt,
         ...(opt as object),
       });
     default:

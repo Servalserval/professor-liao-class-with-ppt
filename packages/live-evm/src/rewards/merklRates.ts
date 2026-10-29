@@ -66,6 +66,9 @@ export const DEFAULT_MERKL_PROTOCOLS: Record<string, MerklProtocolRule> = {
   "aave-v4": { mainProtocolId: "aave", typePattern: /^AAVE_V4/, collateralIsSupply: true, matcher: "aave-v4-hub" },
   morpho: { mainProtocolId: "morpho", typePattern: /^MORPHO/, collateralIsSupply: false, matcher: "receipt" },
   "euler-v2": { mainProtocolId: "euler", typePattern: /^EULER/, collateralIsSupply: true, matcher: "receipt" },
+  // Fluid fTokens (ERC-4626 vault adapter). No type filter: Fluid campaign type names are not
+  // pinned yet, so matching relies on the receipt (fToken address) alone. VERIFY_LIVE.
+  fluid: { mainProtocolId: "fluid", collateralIsSupply: true, matcher: "receipt" },
 };
 
 export interface MerklRateProviderOptions {

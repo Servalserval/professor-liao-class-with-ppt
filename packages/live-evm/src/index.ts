@@ -14,3 +14,5 @@ export {
   type AaveMarketConfig,
   type AavePairConfig,
 } from "./aave/index.js";
+export * as vault from "./vault/index.js";
+export { ERC4626VaultAdapter, type ERC4626VaultAdapterOptions, type VaultConfig, type VaultFlavor } from "./vault/index.js";
