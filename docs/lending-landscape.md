@@ -169,6 +169,19 @@
 
 ---
 
+### 5.1 程式層面已知的限制
+
+- **EVM 循環是逐筆交易，不是原子操作。** repo 不部署自訂合約，所以沒有 flash loan 一筆完成的路徑。
+  - 目標 LTV 0.7、10 輪大約能做到 3.27x（目標是 3.33x）。
+  - 每輪約 5 筆交易，gas 成本已經用 `txs_per_entry`／`txs_per_exit` 算進進出場成本。
+  - 沒有到達目標時，adapter 會在結果裡寫出實際槓桿。
+- **一個錢包在一個 Aave 市場只有一個帳戶。** 同一市場的多個組合共用 e-mode 和健康因子；不同 spoke 或市場建議用不同錢包。
+- **Suilend 的獎勵資格。** 從 Move 原始碼看，同一個 obligation 存借同一資產，鏈上會把整個 obligation 的獎勵份額歸零。文件另外寫「穩定幣存、穩定幣借」也不符資格，但 v8 原始碼沒有公開，無法確認。
+  - adapter 預設把這類組合的獎勵視為 0（`assumeRewardsEligible: false`）。
+  - **如果你手上還有 Suilend 主市場「USDC 抵押、借 USDsui」的部位，它可能已經沒有在領獎勵**，請在 Suilend UI 確認。
+- **Scallop 的抵押品不生息**，循環只能靠借款獎勵。出場需要債務池有足夠現金做 flash loan，這已經算進出場容量。
+- **Aave V4 的地址還沒取得。** 沙箱連不到 AaveKit API，Avalanche spoke／hub 地址要從 AaveKit 或官方 dashboard 取得，再用 verify 確認。
+
 ## 6. 上線前必須現場確認（`verify` 會做的事 + 人工確認）
 
 1. 每個市場的合約地址從 address book 或 AaveKit 讀出，並用鏈上反查核對（`verifyConfig()`）。Plasma、Monad、X Layer、Mantle 的 Aave V3 地址可能不在 address book 4.44.22 裡，要從官方地址頁填進 `config/live.yaml`，再由 verify 檢查。

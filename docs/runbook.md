@@ -31,6 +31,8 @@
 
 三種模式：
 
+shadow 模式可以**完全不放金鑰**：只要 `EVM_ADDRESS`／`SUI_ADDRESS`，所有交易都從這個地址模擬。建議 staging 機器先這樣跑。
+
 | 模式 | 會不會動錢 | 用途 |
 |---|---|---|
 | `shadow` | **不會**。每筆交易都用真實錢包在鏈上模擬，成功就照 paper 方式記帳 | 驗證交易路徑、獎勵資格、數字 |
@@ -79,9 +81,13 @@ install -m 600 /dev/null /etc/incentive-router/sui.key   # 貼上 suiprivkey1...
 每條鏈用付費節點（Alchemy、QuickNode、dRPC、Ankr 等），把 URL 放在環境變數：
 
 ```
-RPC_ETHEREUM=…  RPC_ARBITRUM=…  RPC_PLASMA=…  RPC_MONAD=…  RPC_AVALANCHE=…
+RPC_ETHEREUM=…  RPC_ARBITRUM=…  RPC_BASE=…  RPC_PLASMA=…  RPC_MANTLE=…  (RPC_MONAD、RPC_AVALANCHE 視需要)
 SUI_GRPC=…      SUI_JSONRPC=…
+EVM_ADDRESS=…   SUI_ADDRESS=…        # shadow 可以只給地址、不給金鑰
+PYTH_HERMES_URL=… PYTH_API_KEY=…     # Suilend／Scallop 在交易內推價格時需要
 ```
+
+完整範本在 `deploy/env.example`。
 
 公開 RPC 會限流，也可能回傳錯誤資料，不能拿來寫入。程式在每次寫入前都會用 `assertChainId` 確認 RPC 的 chain id。
 
@@ -190,6 +196,14 @@ LIVE_CONFIRM=yes npm run live -- run --config config/live.yaml
 - `critical`：熔斷觸發、出場失敗、橋卡住、在途資金失敗。**要人處理。**
 - `warn`：資料源失敗、價格過期、模擬失敗、獎勵領取失敗。
 - `info`：進出場、搬運完成。
+
+### 領獎
+
+`RewardKeeper` 每 `rewards.keeper.interval_hours` 小時跑一次（Merkl 約每 2 小時更新）。它負責：
+- 領 Merkl 與各協議原生獎勵。
+- 把 `rewards.sell` 列出的獎勵幣換成該鏈的 `cash_asset`。
+
+Ethena Liquid Leverage 發的 aUSDe 本身就是抵押品，不會被賣掉。要立刻跑一次：`npm run live -- rewards`。
 
 ### 例行檢查（每天）
 

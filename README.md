@@ -1,90 +1,99 @@
 # incentive-router
 
-把循環貸（loop-farm）的風控框架通用化，用同一套規則管理所有「吃項目方行銷預算」的部位：
-循環貸、LP 激勵、跨所 perp 積分、存款補貼。
+這個 repo 把循環貸（loop-farm）的風控框架通用化，用同一套規則管理所有「吃項目方行銷預算」的部位：循環貸、LP 激勵、跨所 perp 積分、存款補貼。
+它還加上跨鏈資金配置，並接上 Sui 與 EVM 的實盤 adapter。
 
 對應課堂簡報 *Arbitrage_2026* 第 56–59 頁「Marketing purpose」：激勵是項目方付給套利者的服務費。
 這個 repo 回答的是「怎麼拿這筆錢，又不變成最後買單的豬」。
 
-完整設計說明（公式、規則優先序、參數對照、限制）在 **[docs/design.md](docs/design.md)**。
+| 文件 | 內容 |
+|---|---|
+| [docs/lending-landscape.md](docs/lending-landscape.md) | **哪些借貸市場現在能這樣跑**（2026-10-29 盤點）、跨鏈路由與成本、$300k 起始配置 |
+| [docs/runbook.md](docs/runbook.md) | **上實盤的步驟**：verify → shadow → canary → 放大、Telegram 指令、緊急處理、systemd |
+| [docs/design.md](docs/design.md) | 風控框架設計：公式、規則優先序、參數對照、限制 |
 
-> 範例與情境裡的數字都是示意，不是即時市場資料，也不是投資建議。
-> 這個 repo 沒有任何鏈上 executor，`run` 只支援 `--paper`。
+> 範例與情境裡的數字只是示意，不是即時市場資料，也不是投資建議。
+> 實盤 adapter 只在 mock 上測過，還沒對真鏈跑過。每個模組的 VERIFY_LIVE 項目必須在 staging 機器上用 `verify` 和 shadow 模式逐一確認。
 
 ## 它做什麼
 
-- **統一的機會模型**：每個 source 把自家協議翻譯成 `Opportunity`（收益流、出場容量、壓力訊號、健康度、資金放在哪幾個 venue）。
-- **估值**：可實現淨 APR ＝ 每條收益流 × 獎勵幣可實現比例 × 時間權重 − 成本；自己進場造成的稀釋與利率變化都算進去。
-- **進場閘門**：通用版 1/10 規則、分 tier 的門檻（無風險利率＋溢價）、venue / chain / token / kind / 單一機會 / 獎勵幣 / 積分預算上限。
-- **出場優先序**：通用版 1/5 規則、壓力訊號、流動性被抽乾、出口模擬失敗、獎勵即將結束、利差壓縮（去抖動、分段減倉）、被自己稀釋。
-- **配置器**：按邊際淨 APR 做水位填充。
-- **獎勵處理**：領了就賣／對沖／持有，崩盤自動賣，單一獎勵幣曝險上限。
-- **組合保護**：回撤熔斷、資料驗證與過期判定、資料源失聯出場、全退鎖存重試、告警去重、Telegram 指令。
+- **統一的機會模型**：每個 source 把自家協議翻譯成 `Opportunity`，內容包括收益流、出場容量、壓力訊號、健康度，以及資金放在哪幾個 venue。
+- **估值**：可實現淨 APR ＝ 每條收益流 × 獎勵幣可實現比例 × 時間權重 − 成本。自己進場造成的稀釋與利率變化都算進去。
+- **穩定幣對循環**：支援「存 A 借 B」，兩邊各用自己的利率模型，並納入換匯成本與深度、脫鉤訊號（用市價，不用協議預言機）。
+  獎勵規則看得懂淨額型補貼（`netOf`）、每人上限、HF 上限（Ethena Liquid Leverage 的 HF ≤ 2），以及「借了某幣就失格」的規則。
+- **進場閘門**：
+  - 通用版 1/10 規則。
+  - 分 tier 的門檻（無風險利率＋溢價）。
+  - venue／chain／token／kind／單一機會／獎勵幣／積分預算的上限。
+- **出場優先序**：
+  - 通用版 1/5 規則與壓力訊號。
+  - 流動性被抽乾、出口模擬失敗。
+  - 獎勵即將結束、利差壓縮（去抖動、分段減倉）。
+  - 被自己稀釋。
+- **跨鏈資金配置**：閒置資金按 `chain:asset` 分桶。
+  - 只有通過全部規則才搬錢：單次搬運成本 ≤ 目的地一天收益、過去 24 小時總磨損 ≤ 整本一天收益、14 天回本、最小金額、在途上限。
+  - 在途資金計入淨值，卡住會告警，不會自動重送。
+- **組合保護**：
+  - 回撤熔斷、資料驗證與過期判定、資料源失聯出場。
+  - 全退鎖存重試、告警去重、Telegram 指令。
+- **實盤**：
+  - 每一筆交易都先在鏈上模擬才送出，並受 gas 上限約束。
+  - 影子模式（shadow）只模擬、不廣播。
+  - 要 live 必須通過 live gate：近 7 天內 verify 過、config hash 相符、零問題，還要設 `LIVE_CONFIRM=yes`。
+  - canary 硬上限、單一實例鎖。
+
+## 結構（npm workspaces）
+
+```
+packages/core            風控框架：估值、閘門、配置器、Router、跨鏈 planner（xchain/）、情境模擬、CLI
+packages/live-common     SDK-free 介面：LendingAdapter / SwapAdapter / BridgeAdapter、金鑰、單位換算、鏈表
+packages/live-evm-base   viem：sendTx（模擬 → gas 上限 → dry-run 停止 → 送出 → 收據）、ERC20 工具
+packages/live-evm        Aave v3 家族、Morpho Blue（含 Lista）、KyberSwap/Odos 聚合器、Merkl 領取與獎勵率
+packages/live-aave-v4    Aave V4（hub & spoke），spoke 呼叫自行編碼並做 guard 檢查
+packages/live-sui        Navi、Suilend、Scallop、Cetus 聚合器；executePtb（模擬 → gas 上限 → 送出）
+packages/live-bridges    CCTP V2（EVM + Sui）、USDT0（LayerZero OFT）、core BridgeExecutor glue、鏈上驗證
+packages/live-runner     把以上接進 Router：shadow／live 模式、verify stamp 與 live gate、錢包分桶、獎勵 keeper、CLI
+config/default.yaml      Router 預設參數（含註解）
+config/live-router.yaml  實盤用 Router 參數與跨鏈路由
+config/live.example.yaml 實盤設定範本（地址、鏈、上限；不含秘密）
+deploy/                  systemd unit、環境變數範本
+examples/                範例機會、代幣資料、離線樣本、情境（含 cross-chain.yaml）
+```
 
 ## 快速開始
 
 ```bash
-npm install
-npm test                 # 79 個測試：單元、兩個情境的整合測試、獨立審查的回歸測試
+npm ci
+npm test                 # 全部離線測試
 npm run typecheck
 
+# 情境重播：Plasma 式獎勵崩盤、擠兌、跨鏈搬運（一天收益規則）
+npx tsx packages/core/src/cli.ts sim examples/scenarios/plasma-reward-collapse.yaml
+npx tsx packages/core/src/cli.ts sim examples/scenarios/bank-run.yaml
+npx tsx packages/core/src/cli.ts sim examples/scenarios/cross-chain.yaml
+
 # 用範例機會掃描（--why 顯示沒過的原因）
-npx tsx src/cli.ts scan --static examples/static.yaml --tokens examples/tokens.yaml \
-  --config config/default.yaml --probe 20000 --why
-
-# 用 Merkl / DefiLlama 的離線樣本掃描（有網路時改用 --live）
-npx tsx src/cli.ts scan --merkl-fixture examples/fixtures/merkl-opportunities.json \
-  --llama-fixture examples/fixtures/defillama-pools.json \
-  --llama-lendborrow-fixture examples/fixtures/defillama-lendborrow.json --why
-
-# 情境重播：Plasma 式獎勵崩盤、擠兌／出口失效／資料源失聯
-npx tsx src/cli.ts sim examples/scenarios/plasma-reward-collapse.yaml
-npx tsx src/cli.ts sim examples/scenarios/bank-run.yaml
-
-# Paper 模式持續跑（設定 TG_BOT_TOKEN / TG_CHAT_ID 就會推 Telegram）
-npx tsx src/cli.ts run --paper --static examples/static.yaml --tokens examples/tokens.yaml \
-  --config config/default.yaml --cycles 3 --interval 5
-
-# 在有網路的機器上確認 Merkl / DefiLlama 的欄位
-npx tsx src/cli.ts verify-sources
+npx tsx packages/core/src/cli.ts scan --static examples/static.yaml --tokens examples/tokens.yaml --probe 20000 --why
 ```
 
-想看「抱著獎勵幣」會怎樣：在 `plasma-reward-collapse.yaml` 的 `config` 加上
-`rewards: {tokens: {XPL: {policy: hold, max_hold_usd: 1000000}}}` 再跑一次。
+## 實盤（詳見 runbook）
 
-## 結構
+```bash
+cp config/live.example.yaml config/live.yaml     # 改市場、上限
+set -a; . /etc/incentive-router/env; set +a       # RPC、金鑰檔路徑、Telegram
 
-```
-src/
-  types.ts            Opportunity / YieldStream / Leg / Position / Action
-  config.ts           設定型別、預設值、驗證
-  valuation.ts        淨 APR、獎勵幣折價模型、稀釋、邊際 APR
-  tiers.ts            venue 評分與門檻
-  exposure.ts         以 leg 為單位的曝險與上限
-  signals.ts          歷史訊號：流動性被抽乾、指標暴衝、排放被砍、代幣回撤、組合回撤
-  gates/entry.ts      進場閘門
-  gates/exit.ts       出場優先序
-  allocator.ts        邊際 APR 水位填充
-  rewards.ts          領取／賣出／對沖
-  monitor.ts          Router：每輪的觀察 → 出場 → 出口模擬 → 獎勵 → 配置
-  validate.ts         進來的資料是否為有限數字、是否過期
-  store.ts notify.ts executor.ts scenario.ts cli.ts
-  sources/
-    loopLending.ts    同資產循環貸（含 IRM、loop-farm MarketState 轉接）
-    lpIncentive.ts    LP 激勵（稀釋、LVR、對沖）
-    perpHedge.ts      跨所 delta-neutral perp（拒絕同所對沖）
-    merkl.ts          Merkl 掃描（探索用）
-    defillama.ts      DefiLlama yields 掃描（探索用）
-    static.ts         手寫 YAML 機會（也驅動情境模擬）
-config/default.yaml   預設參數（附 loop-farm 對照註解）
-examples/             範例機會、代幣資料、離線樣本、情境
-test/                 node:test 測試
-docs/design.md        設計說明
+npm run live -- verify      # 到鏈上讀回所有地址、資產、市場、橋、swap router；寫 stamp
+npm run live -- markets --why
+npm run live -- balances
+npm run live -- plan --why  # 模擬一輪：會進哪些、要不要跨鏈搬
+npm run live -- run         # mode: shadow → 只模擬；mode: live + LIVE_CONFIRM=yes → 實盤
+npm run live -- status
 ```
 
-## 接上真實協議
+## 接上新協議
 
-1. 寫一個 `Source`：回傳 `Opportunity[]`。循環貸可以直接用 `LoopLendingSource` 包 loop-farm 的 market provider（見 `fromLoopFarmMarket`）。
-2. 寫一個 `Executor`：`enter / exit / rebalance / simulateExit / claim / sell / hedge`，全部以 USD 為介面；
-   實盤再加 `markToMarket`，讓熔斷看得到真實損益。source 請設 `dataAsOfMs`，槓桿部位請給健康度。
-3. 在 `Router` 的 `executors` 用 `sourceId` 對應起來。沒有 executor 的 source 只會出現在掃描報告。
+1. 實作 `LendingAdapter`（`packages/live-common`）：`markets()` 回傳 `LoopPair[]`，另外實作 `position / open / close / deleverage / simulateClose / claimRewards / walletBalance`。每一筆寫入都走 `sendTx` 或 `executePtb`，並提供 `verifyConfig()`。
+2. 在 `packages/live-runner/src/build.ts` 的 `makeLendingAdapter` 加一個 `type`。
+3. 在 `config/live-router.yaml` 的 `venues` 給它 tier。
+
+非循環類（LP、perp）沿用 core 的 `Source` + `Executor` 介面，見 `docs/design.md`。
