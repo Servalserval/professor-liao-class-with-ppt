@@ -47,7 +47,7 @@ export async function verifyScallopConfig(
   env: SuiEnv,
   sdk: ScallopSdkLike,
   pairs: PairLike[],
-  opts: { obligationIds?: Record<string, string | undefined> } = {}
+  opts: { obligationIds?: Record<string, string | undefined>; supply?: { marketId: string; asset: AssetRef }[] } = {}
 ): Promise<ScallopVerifyReport> {
   const checks: ScallopVerifyCheck[] = [];
   const add = (name: string, ok: boolean, detail?: string) => checks.push(detail === undefined ? { name, ok } : { name, ok, detail });
@@ -123,6 +123,26 @@ export async function verifyScallopConfig(
     for (const n of flashNames) add(`flashloan_fee:${n}`, typeof fees[n] === "number" && fees[n]! >= 0 && fees[n]! < 0.01, `${fees[n]}`);
   } catch (e) {
     add("flashloan_fees", false, e instanceof Error ? e.message : String(e));
+  }
+
+  // 3b) supply (lending) markets
+  for (const m of opts.supply ?? []) {
+    const tag = `supply:${m.marketId}`;
+    const type = normType(m.asset.address);
+    const name = sdk.utils.parseCoinNameFromType(type);
+    const known = c.coinTypes[name];
+    add(`${tag}:coin_type`, !!known && normType(known) === type, `${name} -> ${known ?? "unknown"}`);
+    add(`${tag}:decimals_registry`, c.coinDecimals[name] === m.asset.decimals, `config ${m.asset.decimals}, scallop ${c.coinDecimals[name]}`);
+    try {
+      const md = await env.grpc.core.getCoinMetadata({ coinType: type });
+      add(`${tag}:decimals_onchain`, md.coinMetadata?.decimals === m.asset.decimals, `on-chain ${md.coinMetadata?.decimals ?? "none"}`);
+    } catch (e) {
+      add(`${tag}:decimals_onchain`, false, e instanceof Error ? e.message : String(e));
+    }
+    add(`${tag}:lending_pool`, wl.lending.has(name), name);
+    add(`${tag}:not_deprecated`, !wl.deprecated.has(name), wl.deprecated.has(name) ? `${name} is deprecated` : undefined);
+    const spool = `s${name}`;
+    add(`${tag}:spool_info`, true, wl.spool.has(spool) ? (wl.deprecated.has(spool) ? `${spool} spool DEPRECATED (never staked)` : `${spool} spool whitelisted`) : "no spool");
   }
 
   // 4) pinned obligations are ours

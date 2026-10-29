@@ -17,11 +17,14 @@
  * program (as the SDK's own BorrowService does around borrow/repay).
  */
 import { coinWithBalance, type Transaction, type TransactionObjectArgument, type TransactionResult } from "@mysten/sui/transactions";
-import type { LoopPair, RewardRate } from "@incentive-router/core";
+import type { LoopPair, RewardRate, SupplyMarket } from "@incentive-router/core";
 import {
+  BroadcastUnconfirmedError,
   minusBps,
   type AssetRef,
   type LendingAdapter,
+  type SupplyAdapter,
+  type SupplyPositionView,
   type LiveContext,
   type LiveResult,
   type Logger,
@@ -41,7 +44,13 @@ import {
 } from "../common.js";
 import {
   buildScallopLoopPair,
+  buildScallopSupplyMarket,
   claimableRewards,
+  holdingUnits,
+  planWithdraw,
+  spoolIsLive,
+  spoolPendingReward,
+  underlyingOf,
   measuredBoost,
   ltvOf,
   nextSwapIn,
@@ -60,6 +69,9 @@ import {
   type ObligationAccountLike,
   type OpenPlanInput,
   type PoolLike,
+  type SpoolLike,
+  type StakeAccountLike,
+  type SupplyHoldings,
   type SwapProbe,
   type UnwindPlan,
 } from "./math.js";
@@ -74,9 +86,29 @@ export interface ScallopPairConfig {
   obligationId?: string;
 }
 
+/**
+ * Supply-only market = Scallop LENDING: the coin is minted into the pool's
+ * MarketCoin (held as sCoin, or staked in the spool). Obligation collateral
+ * earns nothing on Scallop, so "supply" never means collateral here.
+ */
+export interface ScallopSupplyConfig {
+  asset: AssetRef;
+  /** Default: asset.symbol. */
+  marketId?: string;
+  /**
+   * Stake the MarketCoin in the asset's spool for spool rewards. Only ever
+   * done when that spool is live (whitelisted, not deprecated, emitting, not
+   * full); default true (= stake whenever it is live). false = hold sCoin.
+   */
+  stakeInSpool?: boolean;
+}
+
 export interface ScallopAdapterOptions {
   env: SuiEnv;
+  /** Loop pairs (may be empty when only supply markets are configured). */
   pairs: ScallopPairConfig[];
+  /** Plain-lending markets for SupplyAdapter. */
+  supply?: ScallopSupplyConfig[];
   /** Required for any write: Scallop cannot loop the same asset, so every loop swaps. */
   swapper?: PtbSwapper;
   extraRewards?: RewardRateProvider;
@@ -98,7 +130,11 @@ export interface ScallopAdapterOptions {
   closeDebtBufferBps?: number;
   /** Refuse open/deleverage when Scallop's price and ctx.priceUsd differ by more than this. Default 0.02. */
   maxPriceDeviation?: number;
-  /** Also claim legacy spool (sCoin staking) rewards in claimRewards. Default false (this adapter never stakes in spools). */
+  /**
+   * Also claim spool rewards of stake accounts NOT belonging to a configured
+   * supply market (configured supply markets' spools are always claimed).
+   * Default false. Deprecated spools are never claimed.
+   */
   claimSpoolRewards?: boolean;
   now?: () => number;
   /** Logger for ctx-free reads (markets() skips failing pairs with a warning). Default: console.warn. */
@@ -111,6 +147,29 @@ interface ResolvedPair {
   debtType: string;
   collName: string;
   debtName: string;
+}
+
+interface ResolvedSupply {
+  cfg: ScallopSupplyConfig;
+  marketId: string;
+  coinType: string;
+  coinName: string;
+  sCoinName?: string;
+  sCoinType?: string;
+  marketCoinType: string;
+  /** Spool / stake market coin name (= market coin name, e.g. "susdc"). */
+  spoolName: string;
+}
+
+interface SupplyState {
+  pool: PoolLike & { conversionRate: number };
+  spool?: SpoolLike;
+  spoolDeprecated: boolean;
+  /** Spool live AND staking enabled for this market. */
+  staking: boolean;
+  holdings: SupplyHoldings;
+  accounts: StakeAccountLike[];
+  paused: boolean;
 }
 
 interface ObligationRef {
@@ -148,19 +207,27 @@ const defaultLog: Logger = (level, msg, data) => console.warn(`[${level}] ${msg}
 
 const normType = (t: string) => normalizeStructTag(t.startsWith("0x") ? t : `0x${t}`);
 
-export class ScallopAdapter implements LendingAdapter {
+export class ScallopAdapter implements LendingAdapter, SupplyAdapter {
   readonly id = "scallop";
   readonly chain = "sui";
 
   private readonly env: SuiEnv;
   private readonly pairs = new Map<string, ScallopPairConfig>();
+  private readonly supplyCfg = new Map<string, ScallopSupplyConfig>();
   private sdkP?: Promise<ScallopSdkLike>;
   private resolved?: Promise<Map<string, ResolvedPair>>;
+  private resolvedSupply?: Promise<Map<string, ResolvedSupply>>;
   private obligationCache = new Map<string, ObligationRef | null>();
 
   constructor(private readonly opts: ScallopAdapterOptions) {
     this.env = opts.env;
-    if (!opts.pairs.length) throw new Error("scallop: no pairs configured");
+    if (!opts.pairs.length && !opts.supply?.length) throw new Error("scallop: no pairs or supply markets configured");
+    for (const m of opts.supply ?? []) {
+      const id = m.marketId ?? m.asset.symbol;
+      if (this.supplyCfg.has(id)) throw new Error(`scallop: duplicate supply marketId ${id}`);
+      if (m.asset.chain !== "sui") throw new Error(`scallop supply ${id}: asset must be on sui`);
+      this.supplyCfg.set(id, m);
+    }
     const shapes = new Set<string>();
     for (const p of opts.pairs) {
       if (this.pairs.has(p.pairId)) throw new Error(`scallop: duplicate pairId ${p.pairId}`);
@@ -236,6 +303,49 @@ export class ScallopAdapter implements LendingAdapter {
     const p = (await this.resolvePairs()).get(pairId);
     if (!p) throw new Error(`scallop: unknown pair ${pairId}`);
     return p;
+  }
+
+  private resolveSupply(): Promise<Map<string, ResolvedSupply>> {
+    if (!this.resolvedSupply) {
+      this.resolvedSupply = (async () => {
+        const sdk = await this.sdk();
+        const out = new Map<string, ResolvedSupply>();
+        for (const [marketId, cfg] of this.supplyCfg) {
+          const coinType = normType(cfg.asset.address);
+          const coinName = sdk.utils.parseCoinNameFromType(coinType);
+          const known = sdk.constants.coinTypes[coinName];
+          if (!known || normType(known) !== coinType) throw new Error(`scallop supply ${marketId}: ${cfg.asset.symbol} (${coinType}) is not a Scallop asset`);
+          const dec = sdk.constants.coinDecimals[coinName];
+          if (dec !== undefined && dec !== cfg.asset.decimals) throw new Error(`scallop supply ${marketId}: decimals ${cfg.asset.decimals} != Scallop ${dec}`);
+          if (!sdk.constants.whitelist.lending.has(coinName)) throw new Error(`scallop supply ${marketId}: ${coinName} has no Scallop lending pool`);
+          const sCoinName = sdk.utils.parseSCoinName<string>(coinName);
+          const r: ResolvedSupply = {
+            cfg,
+            marketId,
+            coinType,
+            coinName,
+            marketCoinType: normType(sdk.utils.parseMarketCoinType(coinName)),
+            spoolName: sdk.utils.parseMarketCoinName<string>(coinName),
+          };
+          if (sCoinName) {
+            r.sCoinName = sCoinName;
+            r.sCoinType = normType(sdk.utils.parseSCoinType(sCoinName));
+          }
+          out.set(marketId, r);
+        }
+        return out;
+      })().catch((e) => {
+        this.resolvedSupply = undefined;
+        throw e;
+      });
+    }
+    return this.resolvedSupply;
+  }
+
+  private async supplyMarket(marketId: string): Promise<ResolvedSupply> {
+    const m = (await this.resolveSupply()).get(marketId);
+    if (!m) throw new Error(`scallop: unknown supply market ${marketId}`);
+    return m;
   }
 
   /** The obligation backing a pair: pinned, else the owned one holding only this pair's assets. null = none yet. */
@@ -410,6 +520,7 @@ export class ScallopAdapter implements LendingAdapter {
 
   async markets(): Promise<LoopPair[]> {
     const resolved = [...(await this.resolvePairs()).values()];
+    if (!resolved.length) return [];
     const nowMs = this.now();
     const sdk = await this.sdk();
     const { snaps, incentives } = await this.snapshots(resolved);
@@ -479,6 +590,7 @@ export class ScallopAdapter implements LendingAdapter {
   async verifyConfig(env: SuiEnv = this.env): Promise<ScallopVerifyReport> {
     const sdk = await this.sdk();
     return verifyScallopConfig(env, sdk, [...this.pairs.values()], {
+      supply: [...this.supplyCfg].map(([marketId, c]) => ({ marketId, asset: c.asset })),
       obligationIds: Object.fromEntries(
         [...this.pairs.values()].map((p) => [p.pairId, p.obligationId ?? (this.pairs.size === 1 ? this.opts.obligationId : undefined)])
       ),
@@ -499,14 +611,30 @@ export class ScallopAdapter implements LendingAdapter {
       }
       const rec = await executePtb(this.env, ctx, b.tx, b.description);
       if (!ctx.dryRun) this.invalidate();
-      const res: LiveResult = { ok: true, txs: [rec], detail: b.description };
+      const res: LiveResult = { ok: true, txs: [rec], detail: rec.unconfirmed ? `executed (${rec.id}), checkpoint not yet observed: ${b.description}` : b.description };
       if (b.amountUsd !== undefined) res.amountUsd = b.amountUsd;
       return res;
     } catch (e) {
+      if (e instanceof BroadcastUnconfirmedError) return this.unconfirmed(ctx, label, e);
       const msg = e instanceof Error ? e.message : String(e);
       ctx.log("error", `scallop: ${label} failed: ${msg}`);
       return { ok: false, txs: [], detail: msg };
     }
+  }
+
+  /**
+   * Signed and handed to the network, fate unknown: it MAY HAVE LANDED. Report
+   * the digest as an unconfirmed record (never "nothing happened") and drop
+   * cached state so the next read re-reads the chain.
+   */
+  private unconfirmed(ctx: LiveContext, label: string, e: BroadcastUnconfirmedError): LiveResult {
+    this.invalidate();
+    ctx.log("warn", `scallop: ${label} UNCONFIRMED, may have landed: ${e.id}`, { error: e.message });
+    return {
+      ok: false,
+      txs: [{ chain: e.chain, id: e.id, description: e.description, simulated: false, unconfirmed: true }],
+      detail: `UNCONFIRMED: may have landed as ${e.id}; re-read state before retrying (${e.message})`,
+    };
   }
 
   async open(pairId: string, equity: bigint, targetLtv: number, ctx: LiveContext): Promise<LiveResult> {
@@ -746,16 +874,27 @@ export class ScallopAdapter implements LendingAdapter {
     };
   }
 
-  async claimRewards(ctx: LiveContext, pairId?: string): Promise<LiveResult & { claimed: { token: string; amount: bigint; decimals: number }[] }> {
+  /**
+   * Claim everything claimable, in ONE PTB: borrow incentives of the loop
+   * obligations and spool rewards of the configured supply markets (plus all
+   * other non-deprecated spool stake accounts when `claimSpoolRewards`).
+   * `id` = a pairId or a supply marketId to restrict the claim.
+   */
+  async claimRewards(ctx: LiveContext, id?: string): Promise<LiveResult & { claimed: { token: string; amount: bigint; decimals: number }[] }> {
     const claimed: { token: string; amount: bigint; decimals: number }[] = [];
     try {
       const sdk = await this.sdk();
-      const resolved = pairId ? [await this.pair(pairId)] : [...(await this.resolvePairs()).values()];
+      const allPairs = await this.resolvePairs();
+      const allSupply = await this.resolveSupply();
+      if (id !== undefined && !allPairs.has(id) && !allSupply.has(id)) throw new Error(`scallop: unknown pair / supply market ${id}`);
+      const pairs = id === undefined ? [...allPairs.values()] : allPairs.has(id) ? [allPairs.get(id)!] : [];
+      const supply = id === undefined ? [...allSupply.values()] : allSupply.has(id) ? [allSupply.get(id)!] : [];
       const { tx, stx } = sdk.createPtb();
       tx.setSender(this.env.address);
       const coins: TransactionObjectArgument[] = [];
+
       const seen = new Set<string>();
-      for (const p of resolved) {
+      for (const p of pairs) {
         const ob = await this.obligationFor(p);
         if (!ob || seen.has(ob.id)) continue;
         seen.add(ob.id);
@@ -771,26 +910,251 @@ export class ScallopAdapter implements LendingAdapter {
           claimed.push({ token: v.token, amount: v.amount, decimals: v.decimals });
         }
       }
-      if (this.opts.claimSpoolRewards) {
-        const wl = sdk.constants.whitelist;
-        const accounts = await sdk.query.getAllStakeAccounts(this.env.address);
-        for (const [name, accs] of Object.entries(accounts)) {
-          if (!wl.spool.has(name) || wl.deprecated.has(name)) continue;
-          for (const acc of accs) {
-            if (!(acc.points > 0)) continue;
-            coins.push(...(await stx.claimQuick(name, acc.id)));
-            claimed.push({ token: `spool:${name}`, amount: BigInt(Math.floor(acc.points)), decimals: 0 });
+
+      // Spool rewards (normal `claim` = spool user::redeem_rewards per stake account).
+      const wl = sdk.constants.whitelist;
+      const spoolNames = new Set(supply.map((m) => m.spoolName));
+      if (this.opts.claimSpoolRewards && id === undefined) for (const n of wl.spool) spoolNames.add(n);
+      const names = [...spoolNames].filter((n) => {
+        if (wl.deprecated.has(n)) {
+          ctx.log("warn", `scallop: not claiming deprecated spool ${n}`);
+          return false;
+        }
+        return wl.spool.has(n);
+      });
+      if (names.length) {
+        const [accounts, spools] = await Promise.all([sdk.query.getAllStakeAccounts(this.env.address), sdk.query.getSpools(names)]);
+        for (const n of names) {
+          const spool = spools[n];
+          if (!spool) continue;
+          for (const acc of accounts[n] ?? []) {
+            const pending = spoolPendingReward(spool, [acc]);
+            if (pending <= 0n) continue;
+            coins.push(stx.claim(acc.id, n));
+            claimed.push({ token: this.symbolOf(sdk, spool.rewardCoinType), amount: pending, decimals: spool.rewardCoinDecimal });
           }
         }
       }
+
       if (!coins.length) return { ok: true, txs: [], claimed: [], detail: "nothing to claim" };
       tx.transferObjects(coins, this.env.address);
       const rec: TxRecord = await executePtb(this.env, ctx, tx, `scallop claim ${claimed.map((c) => `${c.amount} ${c.token}`).join(", ")}`);
       return { ok: true, txs: [rec], claimed };
     } catch (e) {
+      if (e instanceof BroadcastUnconfirmedError) return { ...this.unconfirmed(ctx, "claimRewards", e), claimed };
       const msg = e instanceof Error ? e.message : String(e);
       ctx.log("error", `scallop: claimRewards failed: ${msg}`);
       return { ok: false, txs: [], claimed: [], detail: msg };
     }
+  }
+
+  private symbolOf(sdk: ScallopSdkLike, coinType: string): string {
+    const name = sdk.utils.parseCoinNameFromType(coinType);
+    return sdk.utils.parseSymbol(name) || name;
+  }
+
+  // -------------------------------------------------------------------------
+  // SupplyAdapter: plain Scallop lending
+  // -------------------------------------------------------------------------
+
+  private async supplyState(m: ResolvedSupply): Promise<SupplyState> {
+    const sdk = await this.sdk();
+    const wl = sdk.constants.whitelist;
+    const spoolListed = wl.spool.has(m.spoolName);
+    const [{ pools }, spools, accountsAll, sBal, mBal] = await Promise.all([
+      sdk.query.getMarketPools([m.coinName]),
+      spoolListed ? sdk.query.getSpools([m.spoolName]) : Promise.resolve({} as Partial<Record<string, SpoolLike>>),
+      sdk.query.getAllStakeAccounts(this.env.address),
+      m.sCoinType ? coinBalance(this.env, m.sCoinType) : Promise.resolve(0n),
+      coinBalance(this.env, m.marketCoinType),
+    ]);
+    const pool = pools[m.coinName];
+    if (!pool) throw new Error(`scallop supply ${m.marketId}: no lending pool for ${m.coinName}`);
+    const spool = spools[m.spoolName] ?? undefined;
+    const spoolDeprecated = wl.deprecated.has(m.spoolName) || wl.deprecated.has(m.coinName);
+    const live = spoolIsLive(spool, this.now(), { whitelisted: spoolListed, deprecated: spoolDeprecated });
+    const accounts = (accountsAll[m.spoolName] ?? []).map((a) => ({ id: a.id, staked: a.staked, index: a.index, points: a.points }));
+    return {
+      pool,
+      spool: spool ?? undefined,
+      spoolDeprecated,
+      staking: live && (m.cfg.stakeInSpool ?? true),
+      holdings: {
+        sCoin: sBal,
+        marketCoin: mBal,
+        staked: accounts.filter((a) => a.staked > 0).map((a) => ({ accountId: a.id, units: unitsFromNumber(a.staked) })),
+      },
+      accounts,
+      // The SDK does not expose the pool's active flag (VERIFY_LIVE); a
+      // deprecated pool or a zero supply limit means deposits are off.
+      paused: wl.deprecated.has(m.coinName) || !(pool.maxSupplyCoin > 0),
+    };
+  }
+
+  private depositUsd(m: ResolvedSupply, st: SupplyState): { units: bigint; usd: number } {
+    const units = underlyingOf(holdingUnits(st.holdings), st.pool.conversionRate);
+    return { units, usd: unitsUsd(units, st.pool.coinPrice, m.cfg.asset.decimals) };
+  }
+
+  async supplyMarkets(): Promise<SupplyMarket[]> {
+    const all = [...(await this.resolveSupply()).values()];
+    if (!all.length) return [];
+    const nowMs = this.now();
+    const sdk = await this.sdk();
+    const results = await Promise.allSettled(
+      all.map(async (m) => {
+        const st = await this.supplyState(m);
+        const extra = this.opts.extraRewards
+          ? await this.opts.extraRewards({ protocol: "scallop", chain: "sui", asset: m.cfg.asset, side: "supply", marketId: m.marketId })
+          : [];
+        const input: Parameters<typeof buildScallopSupplyMarket>[0] = {
+          marketId: m.marketId,
+          asset: m.cfg.asset,
+          pool: st.pool,
+          extra,
+          paused: st.paused,
+          myDepositUsd: this.depositUsd(m, st).usd,
+          nowMs,
+        };
+        if (st.staking && st.spool) {
+          input.spool = st.spool;
+          input.spoolRewardToken = this.symbolOf(sdk, st.spool.rewardCoinType);
+        }
+        return buildScallopSupplyMarket(input);
+      })
+    );
+    const out: SupplyMarket[] = [];
+    const errors: string[] = [];
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") out.push(r.value);
+      else {
+        const msg = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        errors.push(`${all[i]!.marketId}: ${msg}`);
+        (this.opts.log ?? defaultLog)("warn", `scallop: supplyMarkets() skipping ${all[i]!.marketId}: ${msg}`);
+      }
+    });
+    if (!out.length) throw new Error(`scallop: supplyMarkets() failed for every market: ${errors.join("; ")}`);
+    return out;
+  }
+
+  async supplyPosition(marketId: string): Promise<SupplyPositionView | null> {
+    const m = await this.supplyMarket(marketId);
+    const st = await this.supplyState(m);
+    const { units, usd } = this.depositUsd(m, st);
+    const rewards: SupplyPositionView["rewardsUnclaimed"] = [];
+    if (st.spool && st.accounts.length && !st.spoolDeprecated) {
+      const pending = spoolPendingReward(st.spool, st.accounts);
+      if (pending > 0n) {
+        const sdk = await this.sdk();
+        rewards.push({
+          token: this.symbolOf(sdk, st.spool.rewardCoinType),
+          amount: pending,
+          decimals: st.spool.rewardCoinDecimal,
+          usd: unitsUsd(pending, st.spool.rewardCoinPrice, st.spool.rewardCoinDecimal),
+        });
+      }
+    }
+    if (units === 0n && !rewards.length) return null;
+    return { marketId, depositUsd: usd, units, rewardsUnclaimed: rewards, asOfMs: this.now() };
+  }
+
+  async deposit(marketId: string, amount: bigint, ctx: LiveContext): Promise<LiveResult> {
+    return this.run(ctx, `deposit ${marketId}`, () => this.buildDeposit(marketId, amount));
+  }
+
+  private async buildDeposit(marketId: string, amount: bigint): Promise<Built> {
+    const m = await this.supplyMarket(marketId);
+    if (amount <= 0n) return { kind: "refuse", detail: "amount must be > 0" };
+    const st = await this.supplyState(m);
+    if (st.paused) return { kind: "refuse", detail: `${m.coinName} lending is paused / deprecated / has no supply limit` };
+    const bal = await this.walletBalance(m.cfg.asset);
+    if (bal < amount) return { kind: "refuse", detail: `wallet ${m.cfg.asset.symbol} ${bal} < ${amount}` };
+    const dec = m.cfg.asset.decimals;
+    const room = unitsFromNumber(Math.max(0, (st.pool.maxSupplyCoin - st.pool.supplyCoin) * 10 ** dec));
+    if (amount > room) return { kind: "refuse", detail: `supply-limit headroom ${room} < ${amount}` };
+    let staking = st.staking;
+    if (staking && st.spool) {
+      const marketUnits = Number(amount) / st.pool.conversionRate;
+      if (st.spool.maxStake - st.spool.stakedAmount < marketUnits) staking = false; // spool full: hold sCoin instead
+    }
+
+    const sdk = await this.sdk();
+    const { tx, stx } = sdk.createPtb();
+    tx.setSender(this.env.address);
+    const coin = tx.add(coinWithBalance({ type: m.coinType, balance: amount }));
+    const marketCoin = stx.supply(coin, m.coinName); // mint::mint -> MarketCoin<T>
+    let how: string;
+    if (staking) {
+      const existing = st.accounts[0]?.id;
+      if (existing) stx.stake(existing, marketCoin, m.spoolName);
+      else {
+        const account = stx.createStakeAccount(m.spoolName);
+        stx.stake(account, marketCoin, m.spoolName);
+        tx.transferObjects([account], this.env.address);
+      }
+      how = `staked in spool ${m.spoolName}${existing ? "" : " (new stake account)"}`;
+    } else if (m.sCoinName) {
+      const sCoin = stx.mintSCoin(m.spoolName, marketCoin);
+      tx.transferObjects([sCoin], this.env.address);
+      how = `held as ${m.sCoinName}`;
+    } else {
+      tx.transferObjects([marketCoin], this.env.address);
+      how = "held as MarketCoin";
+    }
+    return {
+      kind: "tx",
+      tx,
+      amountUsd: unitsUsd(amount, st.pool.coinPrice, dec),
+      description: `scallop deposit ${marketId}: ${amount} ${m.coinName}, ${how}`,
+    };
+  }
+
+  async withdraw(marketId: string, fraction: number, ctx: LiveContext): Promise<LiveResult> {
+    return this.run(ctx, `withdraw ${marketId}`, () => this.buildWithdraw(marketId, fraction));
+  }
+
+  private async buildWithdraw(marketId: string, fraction: number): Promise<Built> {
+    const m = await this.supplyMarket(marketId);
+    if (!(fraction > 0 && fraction <= 1)) return { kind: "refuse", detail: `fraction ${fraction} out of (0,1]` };
+    const st = await this.supplyState(m);
+    const plan = planWithdraw(st.holdings, fraction);
+    if (plan.units === 0n) return { kind: "noop", detail: "no deposit" };
+    const underlying = underlyingOf(plan.units, st.pool.conversionRate);
+    const cash = unitsFromNumber(Math.max(0, st.pool.supplyAmount - st.pool.borrowAmount));
+    if (underlying > cash) return { kind: "refuse", detail: `${m.coinName} pool cash ${cash} < withdrawal ${underlying}` };
+
+    const sdk = await this.sdk();
+    const { tx, stx } = sdk.createPtb();
+    tx.setSender(this.env.address);
+    const parts: TransactionObjectArgument[] = [];
+    for (const u of plan.unstake) parts.push(stx.unstake(u.accountId, toSafeNumber(u.units, "unstake amount"), m.spoolName));
+    if (plan.sCoin > 0n) {
+      if (!m.sCoinName || !m.sCoinType) throw new Error(`scallop supply ${marketId}: sCoin balance without an sCoin type`);
+      const sCoin = tx.add(coinWithBalance({ type: m.sCoinType, balance: plan.sCoin }));
+      parts.push(stx.burnSCoin(m.sCoinName, sCoin));
+    }
+    if (plan.marketCoin > 0n) parts.push(tx.add(coinWithBalance({ type: m.marketCoinType, balance: plan.marketCoin })));
+    const [first, ...rest] = parts;
+    if (rest.length) tx.mergeCoins(first!, rest);
+    const out = stx.withdraw(first!, m.coinName); // redeem::redeem -> Coin<T>
+    tx.transferObjects([out], this.env.address);
+    return {
+      kind: "tx",
+      tx,
+      amountUsd: unitsUsd(underlying, st.pool.coinPrice, m.cfg.asset.decimals),
+      description:
+        `scallop withdraw ${(fraction * 100).toFixed(1)}% ${marketId}: ${plan.units} market units (~${underlying} ${m.coinName})` +
+        (plan.unstake.length ? `, unstaking ${plan.unstake.length} spool account(s)` : ""),
+    };
+  }
+
+  /** Full-withdraw simulation: true = would succeed, false = would revert / no liquidity; read errors THROW. */
+  async simulateWithdraw(marketId: string, _ctx: LiveContext): Promise<boolean> {
+    const b = await this.buildWithdraw(marketId, 1);
+    if (b.kind === "noop") return true;
+    if (b.kind === "refuse") return false;
+    b.tx.setSenderIfNotSet(this.env.address);
+    const sim = await this.env.grpc.core.simulateTransaction({ transaction: b.tx, include: { effects: true } });
+    return sim.$kind === "Transaction";
   }
 }

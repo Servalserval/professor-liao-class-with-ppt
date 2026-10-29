@@ -1,4 +1,4 @@
-export { ScallopAdapter, type ScallopAdapterOptions, type ScallopPairConfig } from "./adapter.js";
+export { ScallopAdapter, type ScallopAdapterOptions, type ScallopPairConfig, type ScallopSupplyConfig } from "./adapter.js";
 export {
   createScallopSdk,
   DEFAULT_SCALLOP_ADDRESS_ID,
@@ -12,6 +12,12 @@ export { verifyScallopConfig, type ScallopVerifyCheck, type ScallopVerifyReport 
 export {
   borrowIncentiveRates,
   buildScallopLoopPair,
+  buildScallopSupplyMarket,
+  holdingUnits,
+  planWithdraw,
+  spoolIsLive,
+  spoolPendingReward,
+  underlyingOf,
   flashFee,
   grossBorrowFor,
   irmFromPool,
@@ -26,6 +32,10 @@ export {
   summarizeSwapProbe,
   type OpenAmounts,
   type OpenPlanInput,
+  type SpoolLike,
+  type StakeAccountLike,
+  type SupplyHoldings,
+  type WithdrawPlan,
   type UnwindPlan,
   type UnwindPlanInput,
 } from "./math.js";

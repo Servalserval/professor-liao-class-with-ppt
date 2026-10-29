@@ -6,12 +6,14 @@
  * SDK references (node_modules/@scallop-io/sui-scallop-sdk/dist/query-*.d.ts):
  *  - ScallopQuery.getMarketPools / getBorrowIncentivePools / getFlashLoanFees /
  *    getObligations / queryObligation / getObligationAccountById /
- *    getBindedVeScaKey / getAllStakeAccounts
+ *    getBindedVeScaKey / getAllStakeAccounts / getSpools
  *  - ScallopTxBlock core normal methods (openObligation, depositCollateral,
  *    takeCollateral, borrow, repay, borrowFlashLoan, repayFlashLoan),
  *    updateAssetPricesQuick (xOracle price_update_request + Pyth/Supra/
  *    Switchboard rule set_price + confirm, per coin), borrow-incentive
- *    stake/unstake/claim, spool claimQuick.
+ *    stake/unstake/claim, spool claimQuick; lending: supply (mint::mint ->
+ *    MarketCoin), withdraw (redeem::redeem), mintSCoin / burnSCoin, spool
+ *    createStakeAccount / stake / unstake / claim (normal methods).
  */
 import type { ScallopConstants, ScallopQuery, ScallopTxBlock, ScallopUtils } from "@scallop-io/sui-scallop-sdk";
 import type { Transaction } from "@mysten/sui/transactions";
@@ -27,6 +29,7 @@ export type ScallopQueryLike = Pick<
   | "getObligationAccountById"
   | "getBindedVeScaKey"
   | "getAllStakeAccounts"
+  | "getSpools"
 >;
 
 export type ScallopTxLike = Pick<
@@ -45,6 +48,15 @@ export type ScallopTxLike = Pick<
   | "unstakeObligationQuick"
   | "claimBorrowIncentive"
   | "claimQuick"
+  // supply-only lending (mint/redeem MarketCoin, sCoin wrap, spool staking)
+  | "supply"
+  | "withdraw"
+  | "mintSCoin"
+  | "burnSCoin"
+  | "createStakeAccount"
+  | "stake"
+  | "unstake"
+  | "claim"
 >;
 
 /**
@@ -60,7 +72,10 @@ export interface ScallopPtb {
 
 export interface ScallopSdkLike {
   query: ScallopQueryLike;
-  utils: Pick<ScallopUtils, "parseCoinNameFromType" | "parseSCoinName">;
+  utils: Pick<
+    ScallopUtils,
+    "parseCoinNameFromType" | "parseSCoinName" | "parseSCoinType" | "parseMarketCoinType" | "parseMarketCoinName" | "parseSymbol"
+  >;
   constants: Pick<ScallopConstants, "whitelist" | "get" | "protocolObjectId" | "coinTypes" | "coinDecimals">;
   createPtb(): ScallopPtb;
 }

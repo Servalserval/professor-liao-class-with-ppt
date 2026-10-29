@@ -21,7 +21,7 @@
  *    the borrowed balance. Flash fee: mul_div(amount, rate, scale) + 1 when the
  *    rate is non-zero.
  */
-import type { IrmModel, LoopLeg, LoopPair, RewardRate } from "@incentive-router/core";
+import type { IrmModel, LoopLeg, LoopPair, RewardRate, SupplyMarket } from "@incentive-router/core";
 import type { AssetRef, LoopPositionView } from "@incentive-router/live-common";
 
 // ---------------------------------------------------------------------------
@@ -579,4 +579,152 @@ export function summarizeSwapProbe(results: { sizeUsd: number; costBps: number |
     depth = r.sizeUsd;
   }
   return { costFrac: Math.max(0, ok[0]!.costBps) / 10_000, depthUsd: depth };
+}
+
+// ---------------------------------------------------------------------------
+// Supply-only lending (deposit -> MarketCoin/sCoin, optional spool staking)
+// ---------------------------------------------------------------------------
+//
+// Scallop lending: mint::mint(coin) -> MarketCoin<T> (1:1 lockable into the
+// sCoin via mintSCoin). The interest accrues in the MarketCoin exchange rate:
+// underlying = marketCoinUnits * conversionRate, conversionRate =
+// (cash + debt - reserve) / marketCoinSupply (SDK calculateMarketPoolData).
+// Spool staking locks the MarketCoin in a stake account to earn spool rewards.
+
+/** Subset of the SDK Spool used here. */
+export interface SpoolLike {
+  marketCoinName: string;
+  coinDecimal: number;
+  rewardCoinType: string;
+  rewardCoinDecimal: number;
+  rewardCoinPrice: number;
+  rewardApr: number;
+  endDate: Date;
+  maxPoint: number;
+  distributedPoint: number;
+  maxStake: number;
+  stakedAmount: number;
+  currentPointIndex: number;
+  exchangeRateNumerator: number;
+  exchangeRateDenominator: number;
+}
+
+export interface StakeAccountLike {
+  id: string;
+  staked: number;
+  index: number;
+  points: number;
+}
+
+/**
+ * A spool we would stake into: whitelisted, not deprecated, still emitting
+ * (end date in the future, undistributed points left, finite positive APR)
+ * and not full.
+ */
+export function spoolIsLive(spool: SpoolLike | null | undefined, nowMs: number, flags: { whitelisted: boolean; deprecated: boolean }): boolean {
+  if (!spool || !flags.whitelisted || flags.deprecated) return false;
+  const end = spool.endDate instanceof Date ? spool.endDate.getTime() : NaN;
+  return (
+    Number.isFinite(end) &&
+    end > nowMs &&
+    spool.maxPoint > spool.distributedPoint &&
+    Number.isFinite(spool.rewardApr) &&
+    spool.rewardApr > 0 &&
+    spool.stakedAmount < spool.maxStake
+  );
+}
+
+/** Pending spool reward (reward-coin base units) for stake accounts; SDK buildLending formula. */
+export function spoolPendingReward(spool: SpoolLike, accounts: StakeAccountLike[]): bigint {
+  let total = 0;
+  for (const a of accounts) {
+    const rate = spool.currentPointIndex ? Math.max(0, (spool.currentPointIndex - a.index) / 1e9) : 1;
+    const pts = a.staked * rate + a.points;
+    total += spool.exchangeRateDenominator > 0 ? (pts * spool.exchangeRateNumerator) / spool.exchangeRateDenominator : 0;
+  }
+  return Number.isFinite(total) && total > 0 ? BigInt(Math.floor(total)) : 0n;
+}
+
+/** My lending position: market-coin units held as sCoin / legacy MarketCoin in the wallet and staked in spools. */
+export interface SupplyHoldings {
+  sCoin: bigint;
+  marketCoin: bigint;
+  staked: { accountId: string; units: bigint }[];
+}
+
+export function holdingUnits(h: SupplyHoldings): bigint {
+  return h.sCoin + h.marketCoin + h.staked.reduce((a, s) => a + s.units, 0n);
+}
+
+/** Underlying base units for market-coin units at the pool's conversion rate. */
+export function underlyingOf(marketUnits: bigint, conversionRate: number): bigint {
+  if (!(conversionRate > 0) || !Number.isFinite(conversionRate)) throw new Error(`scallop: invalid conversion rate ${conversionRate}`);
+  return mulFracFloor(marketUnits, conversionRate);
+}
+
+export interface WithdrawPlan {
+  sCoin: bigint;
+  marketCoin: bigint;
+  unstake: { accountId: string; units: bigint }[];
+  /** Total market-coin units redeemed. */
+  units: bigint;
+}
+
+/** Withdraw `fraction` of every source (1 = everything, no dust). */
+export function planWithdraw(h: SupplyHoldings, fraction: number): WithdrawPlan {
+  if (!(fraction > 0 && fraction <= 1)) throw new Error(`scallop: withdraw fraction ${fraction} out of (0,1]`);
+  const take = (x: bigint) => (fraction >= 1 ? x : mulFracFloor(x, fraction));
+  const unstake = h.staked.map((s) => ({ accountId: s.accountId, units: take(s.units) })).filter((s) => s.units > 0n);
+  const plan = { sCoin: take(h.sCoin), marketCoin: take(h.marketCoin), unstake, units: 0n };
+  plan.units = plan.sCoin + plan.marketCoin + unstake.reduce((a, s) => a + s.units, 0n);
+  return plan;
+}
+
+export interface BuildSupplyInput {
+  marketId: string;
+  asset: AssetRef;
+  pool: PoolLike & { conversionRate: number };
+  /** Spool data when we stake (live spool); undefined = not staking. */
+  spool?: SpoolLike;
+  spoolRewardToken?: string;
+  extra: RewardRate[];
+  paused: boolean;
+  myDepositUsd?: number;
+  nowMs: number;
+}
+
+/**
+ * Scallop lending pool -> core SupplyMarket. Base APR is the pool's supply APR
+ * (SDK: borrowApr * utilization * (1 - reserveFactor), an APR); spool rewards
+ * only when this adapter stakes the deposit; withdrawable = pool cash.
+ */
+export function buildScallopSupplyMarket(a: BuildSupplyInput): SupplyMarket {
+  const p = a.pool;
+  const price = p.coinPrice;
+  if (!(price > 0)) throw new Error(`scallop ${a.marketId}: missing oracle price`);
+  const rewards: RewardRate[] = [];
+  if (a.spool) {
+    const apr = finiteOr0(a.spool.rewardApr);
+    if (apr > 0) rewards.push({ token: a.spoolRewardToken ?? a.spool.rewardCoinType, apr, endsAtMs: a.spool.endDate.getTime() });
+  }
+  rewards.push(...a.extra);
+  const m: SupplyMarket = {
+    protocol: "scallop",
+    chain: "sui",
+    marketId: a.marketId,
+    asset: { symbol: a.asset.symbol, assetId: a.asset.address, priceUsd: price },
+    totalSupplyUsd: Math.max(0, p.supplyCoin) * price,
+    totalBorrowUsd: Math.max(0, p.borrowCoin) * price,
+    supplyAprBase: finiteOr0(p.supplyApr),
+    rewards,
+    withdrawableUsd: Math.max(0, p.supplyCoin - p.borrowCoin) * price,
+    supplyCapRemainingUsd: Math.max(0, p.maxSupplyCoin - p.supplyCoin) * price,
+    paused: a.paused,
+    dataAsOfMs: a.nowMs,
+    note: a.spool ? "Scallop lending (MarketCoin staked in spool)" : "Scallop lending (sCoin held in wallet)",
+  };
+  const irm = irmFromPool(p);
+  if (irm) m.irm = irm;
+  if (a.myDepositUsd !== undefined) m.myDepositUsd = a.myDepositUsd;
+  return m;
 }

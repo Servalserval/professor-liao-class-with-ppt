@@ -4,12 +4,18 @@ import { Transaction, type TransactionObjectArgument } from "@mysten/sui/transac
 import { normalizeStructTag } from "@mysten/sui/utils";
 import { SuiGrpcClient } from "@mysten/sui/grpc";
 import { POOL_ADDRESSES, ScallopBuilder, TEST_ADDRESSES, WHITELIST, type PoolAddress } from "@scallop-io/sui-scallop-sdk";
-import type { AssetRef, LiveContext, RewardRateQuery } from "@incentive-router/live-common";
+import { BroadcastUnconfirmedError, type AssetRef, type LiveContext, type RewardRateQuery } from "@incentive-router/live-common";
 import { DEFAULT_CONFIG, loopPairOpportunity } from "@incentive-router/core";
 import { Mutex, type PtbSwapper, type SuiEnv } from "../src/common.js";
 import {
   borrowIncentiveRates,
   buildScallopLoopPair,
+  buildScallopSupplyMarket,
+  holdingUnits,
+  planWithdraw,
+  spoolIsLive,
+  spoolPendingReward,
+  underlyingOf,
   flashFee,
   grossBorrowFor,
   irmFromPool,
@@ -25,7 +31,7 @@ import {
   verifyScallopConfig,
   type ScallopSdkLike,
 } from "../src/scallop/index.js";
-import type { CollateralLike, IncentivePoolLike, ObligationAccountLike, PoolLike } from "../src/scallop/math.js";
+import type { CollateralLike, IncentivePoolLike, ObligationAccountLike, PoolLike, SpoolLike } from "../src/scallop/math.js";
 
 // ---------------------------------------------------------------------------
 // fixtures (fake coin types; nothing here is a real address)
@@ -35,6 +41,9 @@ const SUI_T = normalizeStructTag("0x2::sui::SUI");
 const USDC_T = normalizeStructTag("0xa11ce::usdc::USDC");
 const SSCA_T = normalizeStructTag("0xb0b::scallop_sca::SCALLOP_SCA");
 const ME = "0x" + "ab".repeat(32);
+const PROTO = "0x" + "ee".repeat(32);
+const SUSDC_T = normalizeStructTag("0xb0b::scallop_usdc::SCALLOP_USDC");
+const MUSDC_T = normalizeStructTag(`${PROTO}::reserve::MarketCoin<${USDC_T}>`);
 const OB_ID = "0x" + "0b".repeat(32);
 const KEY_ID = "0x" + "0c".repeat(32);
 
@@ -47,7 +56,8 @@ const prices = { collPriceUsd: 3, debtPriceUsd: 1, collDecimals: 9, debtDecimals
 const rateDC = (bps = 0) => (1e-6 / 3e-9) * (1 - bps / 1e4);
 const rateCD = (bps = 0) => (3e-9 / 1e-6) * (1 - bps / 1e4);
 
-const pool = (over: Partial<PoolLike> = {}): PoolLike => ({
+const pool = (over: Partial<PoolLike & { conversionRate: number }> = {}): PoolLike & { conversionRate: number } => ({
+  conversionRate: 1,
   coinName: "usdc",
   coinPrice: 1,
   coinDecimal: 6,
@@ -382,10 +392,52 @@ interface FakeState {
   bound: boolean;
   simFail: boolean;
   balance: bigint;
+  /** supply side */
+  sCoin: bigint;
+  marketCoin: bigint;
+  stakeAccounts: { id: string; staked: number; index: number; points: number }[];
+  spoolListed: boolean;
+  spoolOver: Partial<SpoolLike>;
+  deprecated: string[];
+  poolOver: Partial<PoolLike & { conversionRate: number }>;
+  simThrow?: unknown;
 }
 
+const spoolFix = (over: Partial<SpoolLike> = {}): SpoolLike => ({
+  marketCoinName: "susdc",
+  coinDecimal: 6,
+  rewardCoinType: SUI_T,
+  rewardCoinDecimal: 9,
+  rewardCoinPrice: 3,
+  rewardApr: 0.04,
+  endDate: new Date(NOW + 30 * 86_400_000),
+  maxPoint: 1e15,
+  distributedPoint: 1e14,
+  maxStake: 1e14,
+  stakedAmount: 1e12,
+  currentPointIndex: 2e9,
+  exchangeRateNumerator: 1,
+  exchangeRateDenominator: 1,
+  ...over,
+});
+
 function fakeWorld(over: Partial<FakeState> = {}) {
-  const st: FakeState = { obligations: [], coll: 0, debt: 0, bound: false, simFail: false, balance: 10n ** 15n, ...over };
+  const st: FakeState = {
+    obligations: [],
+    coll: 0,
+    debt: 0,
+    bound: false,
+    simFail: false,
+    balance: 10n ** 15n,
+    sCoin: 0n,
+    marketCoin: 0n,
+    stakeAccounts: [],
+    spoolListed: true,
+    spoolOver: {},
+    deprecated: [],
+    poolOver: {},
+    ...over,
+  };
   const calls: Call[] = [];
   const lastTx: { tx?: Transaction } = {};
   const typeToName: Record<string, string> = { [SUI_T]: "sui", [USDC_T]: "usdc", [SSCA_T]: "ssca" };
@@ -393,6 +445,10 @@ function fakeWorld(over: Partial<FakeState> = {}) {
     utils: {
       parseCoinNameFromType: (t: string) => typeToName[normalizeStructTag(t)] ?? "unknown",
       parseSCoinName: (n: string) => `s${n}`,
+      parseSCoinType: (n: string) => (n === "susdc" ? SUSDC_T : `0xb0b::${n}::X`),
+      parseMarketCoinType: (n: string) => (n === "usdc" ? MUSDC_T : `${PROTO}::reserve::MarketCoin<0x2::sui::SUI>`),
+      parseMarketCoinName: (n: string) => `s${n}`,
+      parseSymbol: (n: string) => ({ sui: "SUI", usdc: "USDC", ssca: "sSCA" })[n] ?? "",
     },
     constants: {
       coinTypes: { sui: SUI_T, usdc: USDC_T, ssca: SSCA_T },
@@ -402,14 +458,14 @@ function fakeWorld(over: Partial<FakeState> = {}) {
         lending: new Set(["sui", "usdc"]),
         collateral: new Set(["sui", "usdc"]),
         borrowing: new Set(["sui", "usdc"]),
-        spool: new Set(["ssui"]),
-        deprecated: new Set<string>(),
+        spool: new Set(["ssui", ...(st.spoolListed ? ["susdc"] : [])]),
+        deprecated: new Set<string>(st.deprecated),
         rewardsAsPoint: new Set<string>(),
       },
       get: (path: string) => `0x${(path.length % 16).toString(16).repeat(64)}`,
     },
     query: {
-      getMarketPools: async () => ({ pools: { usdc: pool(), sui: pool({ coinName: "sui", coinPrice: 3, coinDecimal: 9 }) }, collaterals: { sui: collMarket() } }),
+      getMarketPools: async () => ({ pools: { usdc: pool(st.poolOver), sui: pool({ coinName: "sui", coinPrice: 3, coinDecimal: 9 }) }, collaterals: { sui: collMarket() } }),
       getFlashLoanFees: async () => ({ usdc: 0.0005, sui: 0.0005 }),
       getBorrowIncentivePools: async () => ({ usdc: incentive() }),
       getObligations: async () => st.obligations,
@@ -419,7 +475,8 @@ function fakeWorld(over: Partial<FakeState> = {}) {
       }),
       getObligationAccountById: async () => account(st.coll, st.debt),
       getBindedVeScaKey: async () => (st.bound ? "0xveSCA" : null),
-      getAllStakeAccounts: async () => ({}),
+      getAllStakeAccounts: async () => ({ susdc: st.stakeAccounts }),
+      getSpools: async () => (st.spoolListed ? { susdc: spoolFix(st.spoolOver) } : {}),
     },
     createPtb: () => {
       const tx = new Transaction();
@@ -446,6 +503,14 @@ function fakeWorld(over: Partial<FakeState> = {}) {
         unstakeObligationQuick: async (...a: unknown[]) => void mc("unstakeObligationQuick", a),
         claimBorrowIncentive: (...a: unknown[]) => mc("claimBorrowIncentive", a),
         claimQuick: async (...a: unknown[]) => [mc("claimQuick", a)],
+        supply: (...a: unknown[]) => mc("supply", a),
+        withdraw: (...a: unknown[]) => mc("withdraw", a),
+        mintSCoin: (...a: unknown[]) => mc("mintSCoin", a),
+        burnSCoin: (...a: unknown[]) => mc("burnSCoin", a),
+        createStakeAccount: (...a: unknown[]) => mc("createStakeAccount", a),
+        stake: (...a: unknown[]) => void mc("stake", a),
+        unstake: (...a: unknown[]) => mc("unstake", a),
+        claim: (...a: unknown[]) => mc("claim", a),
       };
       lastTx.tx = tx;
       return { tx, stx };
@@ -474,11 +539,17 @@ function fakeWorld(over: Partial<FakeState> = {}) {
     jsonRpc: {},
     grpc: {
       core: {
-        simulateTransaction: async () =>
-          st.simFail
+        simulateTransaction: async () => {
+          if (st.simThrow) throw st.simThrow;
+          return st.simFail
             ? { $kind: "FailedTransaction", FailedTransaction: { status: { success: false, error: { message: "abort" } } } }
-            : { $kind: "Transaction", Transaction: { effects: { gasUsed: gas } } },
-        getBalance: async () => ({ balance: { balance: String(st.balance) } }),
+            : { $kind: "Transaction", Transaction: { effects: { gasUsed: gas } } };
+        },
+        getBalance: async ({ coinType }: { coinType: string }) => {
+          const t = normalizeStructTag(coinType);
+          const b = t === SUSDC_T ? st.sCoin : t === MUSDC_T ? st.marketCoin : st.balance;
+          return { balance: { balance: String(b) } };
+        },
         getObjects: async ({ objectIds }: { objectIds: string[] }) => ({
           objects: objectIds.map((id, i) => ({
             objectId: id,
@@ -810,6 +881,22 @@ describe("ScallopAdapter x real SDK tx builder (offline)", () => {
     assert.ok(kinds.includes("MergeCoins") && kinds.includes("TransferObjects"));
   });
 
+  it("supply deposit (new spool account) and full withdraw (unstake + burn sCoin + redeem) with the real Move calls", async () => {
+    const w = fakeWorld({ sCoin: 2_000_000n, stakeAccounts: [] });
+    const f = await realPtbFactory();
+    const sdk = { ...w.sdk, createPtb: f.createPtb } as ScallopSdkLike;
+    const a = new ScallopAdapter({ env: w.env, sdk, pairs: [], supply: [{ asset: USDC }], now: () => NOW });
+    const d = await a.deposit("USDC", 1_000_000n, w.ctx);
+    assert.ok(d.ok, d.detail);
+    assert.deepEqual(moveFns(f.txs[0]!).filter((x) => x.includes("::")), ["mint::mint", "user::new_spool_account", "user::stake"]);
+    w.st.stakeAccounts = [{ id: "0x" + "ac".repeat(32), staked: 1_000_000, index: 0, points: 0 }];
+    const r = await a.withdraw("USDC", 1, w.ctx);
+    assert.ok(r.ok, r.detail);
+    const fns = moveFns(f.txs[1]!).filter((x) => x.includes("::"));
+    assert.deepEqual(fns.slice(0, 1), ["user::unstake"]);
+    assert.ok(fns.includes("redeem::redeem") && fns.some((x) => x.includes("burn")), fns.join(","));
+  });
+
   it("close(1) on an existing (unstaked) obligation -> one PTB with the real repay / withdraw calls", async () => {
     const w = fakeWorld({ obligations: [{ id: OB_ID, keyId: KEY_ID, locked: false }], coll: 2.5e12, debt: 4.5e9 });
     const f = await realPtbFactory();
@@ -828,5 +915,192 @@ describe("ScallopAdapter x real SDK tx builder (offline)", () => {
     ]);
     const kinds = moveFns(f.txs[0]!);
     assert.ok(kinds.includes("SplitCoins") && kinds.includes("TransferObjects"), kinds.join(","));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Supply-only lending (SupplyAdapter)
+// ---------------------------------------------------------------------------
+
+describe("scallop supply math", () => {
+  const flags = { whitelisted: true, deprecated: false };
+  it("spool liveness: whitelisted, not deprecated, emitting, not full", () => {
+    assert.equal(spoolIsLive(spoolFix(), NOW, flags), true);
+    assert.equal(spoolIsLive(spoolFix(), NOW, { ...flags, deprecated: true }), false);
+    assert.equal(spoolIsLive(spoolFix(), NOW, { ...flags, whitelisted: false }), false);
+    assert.equal(spoolIsLive(spoolFix({ endDate: new Date(NOW - 1) }), NOW, flags), false);
+    assert.equal(spoolIsLive(spoolFix({ distributedPoint: 1e15 }), NOW, flags), false);
+    assert.equal(spoolIsLive(spoolFix({ rewardApr: Infinity }), NOW, flags), false);
+    assert.equal(spoolIsLive(spoolFix({ stakedAmount: 1e14 }), NOW, flags), false);
+    assert.equal(spoolIsLive(null, NOW, flags), false);
+  });
+  it("pending spool reward (SDK formula) and holdings -> underlying", () => {
+    // staked 1e6 * (2e9 - 1e9)/1e9 + 500 points = 1_000_500
+    assert.equal(spoolPendingReward(spoolFix(), [{ id: "a", staked: 1e6, index: 1e9, points: 500 }]), 1_000_500n);
+    const h = { sCoin: 1_000n, marketCoin: 10n, staked: [{ accountId: "a", units: 90n }] };
+    assert.equal(holdingUnits(h), 1_100n);
+    assert.equal(underlyingOf(1_000_000n, 1.05), 1_050_000n);
+    const half = planWithdraw(h, 0.5);
+    assert.deepEqual(half, { sCoin: 500n, marketCoin: 5n, unstake: [{ accountId: "a", units: 45n }], units: 550n });
+    assert.equal(planWithdraw(h, 1).units, 1_100n);
+    assert.throws(() => planWithdraw(h, 0));
+  });
+  it("SupplyMarket: pool APR, spool reward only when staking, withdrawable = cash, caps, IRM", () => {
+    const m = buildScallopSupplyMarket({
+      marketId: "USDC",
+      asset: USDC,
+      pool: pool({ conversionRate: 1.05 }),
+      spool: spoolFix(),
+      spoolRewardToken: "SUI",
+      extra: [{ token: "M", apr: 0.01 }],
+      paused: false,
+      myDepositUsd: 123,
+      nowMs: NOW,
+    });
+    assert.equal(m.protocol, "scallop");
+    assert.equal(m.supplyAprBase, 0.03);
+    assert.deepEqual(m.rewards, [{ token: "SUI", apr: 0.04, endsAtMs: NOW + 30 * 86_400_000 }, { token: "M", apr: 0.01 }]);
+    assert.equal(m.withdrawableUsd, 3_000_000);
+    assert.equal(m.totalSupplyUsd, 5_000_000);
+    assert.equal(m.totalBorrowUsd, 2_000_000);
+    assert.equal(m.supplyCapRemainingUsd, 5_000_000);
+    assert.ok(m.irm);
+    assert.equal(m.myDepositUsd, 123);
+    const noSpool = buildScallopSupplyMarket({ marketId: "USDC", asset: USDC, pool: pool(), extra: [], paused: true, nowMs: NOW });
+    assert.deepEqual(noSpool.rewards, []);
+    assert.equal(noSpool.paused, true);
+  });
+});
+
+describe("ScallopAdapter as SupplyAdapter", () => {
+  const SUP = { asset: USDC };
+  const mk = (w: ReturnType<typeof fakeWorld>, cfg: { stakeInSpool?: boolean } = {}, extra = {}) =>
+    new ScallopAdapter({ env: w.env, sdk: w.sdk, pairs: [], supply: [{ ...SUP, ...cfg }], now: () => NOW, ...extra });
+
+  it("supply-only construction; markets() empty; supplyMarkets with spool + extra supply rewards + my deposit", async () => {
+    const w = fakeWorld({ sCoin: 1_000_000_000n, stakeAccounts: [{ id: "0xacc", staked: 1e9, index: 2e9, points: 0 }], poolOver: { conversionRate: 1.05 } });
+    const q: RewardRateQuery[] = [];
+    const a = mk(w, {}, { extraRewards: async (x: RewardRateQuery) => (q.push(x), [{ token: "M", apr: 0.01 }]) });
+    assert.deepEqual(await a.markets(), []);
+    const [m] = await a.supplyMarkets();
+    assert.equal(m!.marketId, "USDC");
+    assert.deepEqual(m!.rewards.map((r) => r.token), ["SUI", "M"]);
+    assert.equal(q[0]!.side, "supply");
+    assert.equal(q[0]!.marketId, "USDC");
+    assert.ok(Math.abs(m!.myDepositUsd! - 2_100) < 1e-6, `${m!.myDepositUsd}`); // (1e9 sCoin + 1e9 staked) * 1.05 / 1e6
+    const pos = (await a.supplyPosition("USDC"))!;
+    assert.equal(pos.units, 2_100_000_000n);
+    assert.equal(pos.rewardsUnclaimed.length, 0); // index == currentPointIndex, no points
+  });
+
+  it("no spool rewards when staking is off, the spool is deprecated or unlisted", async () => {
+    assert.deepEqual((await mk(fakeWorld(), { stakeInSpool: false }).supplyMarkets())[0]!.rewards, []);
+    assert.deepEqual((await mk(fakeWorld({ deprecated: ["susdc"] })).supplyMarkets())[0]!.rewards, []);
+    assert.deepEqual((await mk(fakeWorld({ spoolListed: false })).supplyMarkets())[0]!.rewards, []);
+  });
+
+  it("deposit(): one PTB mint -> stake (existing account / new account) or mint -> sCoin", async () => {
+    const w1 = fakeWorld({ stakeAccounts: [{ id: "0xacc", staked: 5, index: 0, points: 0 }] });
+    const r1 = await mk(w1).deposit("USDC", 1_000_000n, w1.ctx);
+    assert.ok(r1.ok, r1.detail);
+    assert.deepEqual(order(w1.calls), ["supply", "stake"]);
+    assert.equal(w1.calls[1]!.args[0], "0xacc");
+    const w2 = fakeWorld();
+    assert.ok((await mk(w2).deposit("USDC", 1_000_000n, w2.ctx)).ok);
+    assert.deepEqual(order(w2.calls), ["supply", "createStakeAccount", "stake"]);
+    const w3 = fakeWorld({ deprecated: ["susdc"] });
+    const r3 = await mk(w3).deposit("USDC", 1_000_000n, w3.ctx);
+    assert.deepEqual(order(w3.calls), ["supply", "mintSCoin"]);
+    assert.match(r3.detail!, /held as susdc/);
+    assert.equal(r3.txs[0]!.simulated, true);
+  });
+
+  it("deposit(): refuses on short wallet, paused pool (no supply limit), supply cap", async () => {
+    const poor = fakeWorld({ balance: 5n });
+    assert.match((await mk(poor).deposit("USDC", 1_000_000n, poor.ctx)).detail!, /wallet/);
+    const off = fakeWorld({ poolOver: { maxSupplyCoin: 0 } });
+    assert.match((await mk(off).deposit("USDC", 1_000_000n, off.ctx)).detail!, /paused/);
+    const full = fakeWorld({ poolOver: { maxSupplyCoin: 5_000_000.5 } });
+    assert.match((await mk(full).deposit("USDC", 1_000_000n, full.ctx)).detail!, /headroom/);
+  });
+
+  it("withdraw(): unstake + burn sCoin + legacy MarketCoin -> merge -> redeem; fraction; noop; cash refusal", async () => {
+    const holdings = { sCoin: 2_000_000n, marketCoin: 100n, stakeAccounts: [{ id: "0xacc", staked: 1_000_000, index: 2e9, points: 0 }] };
+    const w = fakeWorld(holdings);
+    const r = await mk(w).withdraw("USDC", 1, w.ctx);
+    assert.ok(r.ok, r.detail);
+    assert.deepEqual(order(w.calls), ["unstake", "burnSCoin", "withdraw"]);
+    assert.deepEqual(w.calls[0]!.args, ["0xacc", 1_000_000, "susdc"]);
+    const kinds = w.lastTx.tx!.getData().commands.map((c) => c.$kind);
+    assert.ok(kinds.includes("MergeCoins") && kinds.includes("TransferObjects"));
+    const h = fakeWorld(holdings);
+    await mk(h).withdraw("USDC", 0.5, h.ctx);
+    assert.deepEqual(h.calls[0]!.args, ["0xacc", 500_000, "susdc"]);
+    const none = fakeWorld();
+    const n = await mk(none).withdraw("USDC", 1, none.ctx);
+    assert.ok(n.ok);
+    assert.equal(n.txs.length, 0);
+    const dry = fakeWorld({ ...holdings, poolOver: { supplyAmount: 2e12, borrowAmount: 2e12 } });
+    assert.match((await mk(dry).withdraw("USDC", 1, dry.ctx)).detail!, /pool cash/);
+  });
+
+  it("simulateWithdraw(): true / false on revert or no liquidity / THROWS on read errors", async () => {
+    const holdings = { sCoin: 2_000_000n };
+    const ok = fakeWorld(holdings);
+    assert.equal(await mk(ok).simulateWithdraw("USDC", ok.ctx), true);
+    const bad = fakeWorld({ ...holdings, simFail: true });
+    assert.equal(await mk(bad).simulateWithdraw("USDC", bad.ctx), false);
+    const dry = fakeWorld({ ...holdings, poolOver: { supplyAmount: 2e12, borrowAmount: 2e12 } });
+    assert.equal(await mk(dry).simulateWithdraw("USDC", dry.ctx), false);
+    const rpc = fakeWorld({ ...holdings, simThrow: new Error("rpc down") });
+    await assert.rejects(mk(rpc).simulateWithdraw("USDC", rpc.ctx), /rpc down/);
+    const readErr = fakeWorld(holdings);
+    (readErr.sdk.query as { getMarketPools: unknown }).getMarketPools = async () => Promise.reject(new Error("read failed"));
+    await assert.rejects(mk(readErr).simulateWithdraw("USDC", readErr.ctx), /read failed/);
+  });
+
+  it("claimRewards(): spool claims of configured markets, never deprecated; restrict by id; unknown id fails", async () => {
+    const acc = { id: "0xacc", staked: 1e6, index: 1e9, points: 500 };
+    const w = fakeWorld({ stakeAccounts: [acc] });
+    const a = mk(w);
+    const r = await a.claimRewards(w.ctx);
+    assert.ok(r.ok, r.detail);
+    assert.deepEqual(order(w.calls), ["claim"]);
+    assert.deepEqual(w.calls[0]!.args, ["0xacc", "susdc"]);
+    assert.deepEqual(r.claimed, [{ token: "SUI", amount: 1_000_500n, decimals: 9 }]);
+    const pos = (await a.supplyPosition("USDC"))!;
+    assert.equal(pos.rewardsUnclaimed[0]!.amount, 1_000_500n);
+    const dep = fakeWorld({ stakeAccounts: [acc], deprecated: ["susdc"] });
+    const rd = await mk(dep).claimRewards(dep.ctx);
+    assert.ok(rd.ok);
+    assert.equal(dep.calls.length, 0);
+    const only = fakeWorld({ stakeAccounts: [acc] });
+    assert.equal((await mk(only).claimRewards(only.ctx, "USDC")).claimed.length, 1);
+    assert.equal((await mk(only).claimRewards(only.ctx, "nope")).ok, false);
+  });
+
+  it("BroadcastUnconfirmedError -> 'may have landed' with the digest, never 'nothing happened'", async () => {
+    const w = fakeWorld({ sCoin: 2_000_000n, simThrow: new BroadcastUnconfirmedError("sui", "0xdigest", "scallop withdraw", "timeout") });
+    const r = await mk(w).withdraw("USDC", 1, w.ctx);
+    assert.equal(r.ok, false);
+    assert.deepEqual(r.txs, [{ chain: "sui", id: "0xdigest", description: "scallop withdraw", simulated: false, unconfirmed: true }]);
+    assert.match(r.detail!, /may have landed as 0xdigest/);
+    const c = fakeWorld({ stakeAccounts: [{ id: "0xacc", staked: 1e6, index: 1e9, points: 500 }], simThrow: new BroadcastUnconfirmedError("sui", "0xd2", "claim", "5xx") });
+    const rc = await mk(c).claimRewards(c.ctx);
+    assert.equal(rc.txs[0]!.unconfirmed, true);
+    assert.equal(rc.claimed.length, 1);
+  });
+
+  it("verifyConfig() covers supply markets", async () => {
+    const w = fakeWorld();
+    const rep = await mk(w).verifyConfig();
+    assert.ok(rep.ok, JSON.stringify(rep.checks.filter((c) => !c.ok)));
+    assert.ok(rep.checks.some((c) => c.name === "supply:USDC:lending_pool" && c.ok));
+  });
+
+  it("constructor: needs pairs or supply; unique supply ids", () => {
+    const w = fakeWorld();
+    assert.throws(() => new ScallopAdapter({ env: w.env, sdk: w.sdk, pairs: [] }), /no pairs or supply/);
+    assert.throws(() => new ScallopAdapter({ env: w.env, sdk: w.sdk, pairs: [], supply: [SUP, SUP] }), /duplicate supply/);
   });
 });
